@@ -1,0 +1,15 @@
+[package]
+name = "labyrinth"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ab_glyph.workspace = true
+math = { path = "../math" }
+mesh = { path = "../mesh" }
+renderer = { path = "../renderer" }
+winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Gdi"] }

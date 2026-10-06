@@ -1,0 +1,22 @@
+/target/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.credentials
+
+# Logs, dumps, and local tool state
+*.log
+*.dmp
+*.swp
+*.swo
+
+# Operating-system files
+.DS_Store
+Thumbs.db
