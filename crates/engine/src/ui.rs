@@ -16,6 +16,12 @@ pub struct UiLabelId(usize);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct UiContainerId(usize);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UiPanelId(usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UiGraphId(usize);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UiRect {
     pub x: f32,
@@ -118,12 +124,15 @@ struct UiSlider {
     knob_color: Color,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct UiButton {
     layout: UiLayout,
     parent: Option<UiContainerId>,
     child_index: usize,
     toggled: bool,
+    text: String,
+    text_size: f32,
+    text_color: Color,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +162,20 @@ struct UiContainer {
     children: Vec<UiChild>,
 }
 
+#[derive(Clone, Debug)]
+struct UiPanel {
+    layout: UiLayout,
+    color: Color,
+}
+
+#[derive(Clone, Debug)]
+struct UiGraph {
+    layout: UiLayout,
+    values: Vec<f32>,
+    color: Color,
+    background: Color,
+}
+
 #[derive(Debug)]
 pub struct UiCanvas {
     window: UiLayout,
@@ -160,12 +183,14 @@ pub struct UiCanvas {
     buttons: Vec<UiButton>,
     labels: Vec<UiLabel>,
     containers: Vec<UiContainer>,
+    panels: Vec<UiPanel>,
+    graphs: Vec<UiGraph>,
     font: Option<FontAsset>,
 }
 
 impl UiCanvas {
     pub fn new(window: UiRect) -> Self {
-        Self { window: UiLayout::absolute(window), sliders: Vec::new(), buttons: Vec::new(), labels: Vec::new(), containers: Vec::new(), font: None }
+        Self { window: UiLayout::absolute(window), sliders: Vec::new(), buttons: Vec::new(), labels: Vec::new(), containers: Vec::new(), panels: Vec::new(), graphs: Vec::new(), font: None }
     }
 
     pub fn set_font(&mut self, font: FontAsset) {
@@ -185,6 +210,25 @@ impl UiCanvas {
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Container(id))).unwrap_or(0);
         self.containers.push(UiContainer { layout, parent, child_index, auto_layout: Some(auto_layout), children: Vec::new() });
         id
+    }
+
+    pub fn add_panel(&mut self, layout: UiLayout, color: Color) -> UiPanelId {
+        let id = UiPanelId(self.panels.len());
+        self.panels.push(UiPanel { layout, color });
+        id
+    }
+
+    pub fn add_graph(&mut self, layout: UiLayout, color: Color, background: Color) -> UiGraphId {
+        let id = UiGraphId(self.graphs.len());
+        self.graphs.push(UiGraph { layout, values: Vec::new(), color, background });
+        id
+    }
+
+    pub fn set_graph_values(&mut self, graph: UiGraphId, values: &[f32]) -> bool {
+        let Some(graph) = self.graphs.get_mut(graph.0) else { return false };
+        graph.values.clear();
+        graph.values.extend_from_slice(values);
+        true
     }
 
     pub fn add_slider(&mut self, rect: UiRect, min: f32, max: f32, value: f32) -> UiSliderId {
@@ -226,12 +270,26 @@ impl UiCanvas {
     pub fn add_toggle_button_layout(&mut self, parent: Option<UiContainerId>, layout: UiLayout, toggled: bool) -> UiButtonId {
         let id = UiButtonId(self.buttons.len());
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Button(id))).unwrap_or(0);
-        self.buttons.push(UiButton { layout, parent, child_index, toggled });
+        self.buttons.push(UiButton { layout, parent, child_index, toggled, text: String::new(), text_size: 11.0, text_color: Color::WHITE });
         id
+    }
+
+    pub fn set_button_text(&mut self, button: UiButtonId, text: impl Into<String>, size: f32, color: Color) -> bool {
+        let Some(button) = self.buttons.get_mut(button.0) else { return false };
+        button.text = text.into();
+        button.text_size = size.max(1.0);
+        button.text_color = color;
+        true
     }
 
     pub fn button_toggled(&self, button: UiButtonId) -> Option<bool> {
         self.buttons.get(button.0).map(|button| button.toggled)
+    }
+
+    pub fn set_button_toggled(&mut self, button: UiButtonId, toggled: bool) -> bool {
+        let Some(button) = self.buttons.get_mut(button.0) else { return false };
+        button.toggled = toggled;
+        true
     }
 
     pub fn add_label(&mut self, position: Vec2, text: impl Into<String>, size: f32, color: Color) -> UiLabelId {
@@ -243,6 +301,12 @@ impl UiCanvas {
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Label(id))).unwrap_or(0);
         self.labels.push(UiLabel { layout, parent, child_index, text: text.into(), size: size.max(1.0), color });
         id
+    }
+
+    pub fn set_label_text(&mut self, label: UiLabelId, text: impl Into<String>) -> bool {
+        let Some(label) = self.labels.get_mut(label.0) else { return false };
+        label.text = text.into();
+        true
     }
 
     pub fn update(&mut self, input: &InputState, width: u32, height: u32) {
@@ -277,6 +341,12 @@ impl UiCanvas {
         let mut vertices = Vec::with_capacity(30);
         add_rect(&mut vertices, window, Color::rgba(0.03, 0.04, 0.06, 0.94), width, height);
         add_rect(&mut vertices, UiRect::new(window.x, window.y, window.width, 26.0), Color::rgba(0.1, 0.12, 0.17, 1.0), width, height);
+        for panel in &self.panels {
+            add_rect(&mut vertices, panel.layout.resolve(root), panel.color, width, height);
+        }
+        for graph in &self.graphs {
+            add_graph(&mut vertices, graph, graph.layout.resolve(root), width, height);
+        }
         for (index, slider) in self.sliders.iter().enumerate() {
             let rect = self.control_rect(UiChild::Slider(UiSliderId(index)), root);
             let track = UiRect::new(rect.x, rect.y + rect.height * 0.35, rect.width, rect.height * 0.3);
@@ -291,9 +361,14 @@ impl UiCanvas {
             add_rect(&mut vertices, self.control_rect(UiChild::Button(UiButtonId(index)), root), color, width, height);
         }
         if let Some(font) = &self.font {
+            for (index, button) in self.buttons.iter().enumerate() {
+                if !button.text.is_empty() {
+                    add_text(&mut vertices, font.font(), &button.text, button.text_size, button.text_color, self.control_rect(UiChild::Button(UiButtonId(index)), root), (width, height));
+                }
+            }
             for (index, label) in self.labels.iter().enumerate() {
                 let rect = self.control_rect(UiChild::Label(UiLabelId(index)), root);
-                add_label(&mut vertices, font.font(), label, rect, width, height);
+                add_label(&mut vertices, font.font(), label, rect, (width, height));
             }
         }
         vertices
@@ -313,7 +388,7 @@ impl UiCanvas {
                 self.item_rect(item.parent, item.child_index, item.layout, root)
             }
             UiChild::Button(id) => {
-                let item = self.buttons[id.0];
+                let item = &self.buttons[id.0];
                 self.item_rect(item.parent, item.child_index, item.layout, root)
             }
             UiChild::Label(id) => {
@@ -413,11 +488,43 @@ impl UiCanvas {
     }
 }
 
-fn add_label(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, label: &UiLabel, rect: UiRect, width: u32, height: u32) {
-    let scaled = font.as_scaled(PxScale::from(label.size));
+fn add_label(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, label: &UiLabel, rect: UiRect, viewport: (u32, u32)) {
+    add_text(vertices, font, &label.text, label.size, label.color, rect, viewport);
+}
+
+fn add_graph(vertices: &mut Vec<UiVertex>, graph: &UiGraph, rect: UiRect, width: u32, height: u32) {
+    add_rect(vertices, rect, graph.background, width, height);
+    if graph.values.len() < 2 {
+        return;
+    }
+    let maximum = graph.values.iter().copied().fold(16.7, f32::max).max(0.001);
+    let step = rect.width / (graph.values.len() - 1) as f32;
+    for (index, values) in graph.values.windows(2).enumerate() {
+        let start = Vec2::new(rect.x + index as f32 * step, rect.y + rect.height - (values[0] / maximum).clamp(0.0, 1.0) * rect.height);
+        let end = Vec2::new(rect.x + (index + 1) as f32 * step, rect.y + rect.height - (values[1] / maximum).clamp(0.0, 1.0) * rect.height);
+        add_line(vertices, start, end, graph.color, 2.0, width, height);
+    }
+}
+
+fn add_line(vertices: &mut Vec<UiVertex>, start: Vec2, end: Vec2, color: Color, thickness: f32, width: u32, height: u32) {
+    let delta = end - start;
+    let length = delta.length().max(0.001);
+    let normal = Vec2::new(-delta.y, delta.x) / length * (thickness * 0.5);
+    let corners = [start + normal, start - normal, end - normal, end + normal];
+    let to_ndc = |point: Vec2| [point.x / width as f32 * 2.0 - 1.0, 1.0 - point.y / height as f32 * 2.0];
+    let color = color.to_array();
+    let first = UiVertex { position: to_ndc(corners[0]), color };
+    let second = UiVertex { position: to_ndc(corners[1]), color };
+    let third = UiVertex { position: to_ndc(corners[2]), color };
+    let fourth = UiVertex { position: to_ndc(corners[3]), color };
+    vertices.extend_from_slice(&[first, second, third, first, third, fourth]);
+}
+
+fn add_text(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, text: &str, size: f32, color: Color, rect: UiRect, viewport: (u32, u32)) {
+    let scaled = font.as_scaled(PxScale::from(size));
     let mut cursor_x = rect.x;
-    let baseline = rect.y + (rect.height - label.size).max(0.0) * 0.5 + scaled.ascent();
-    for character in label.text.chars() {
+    let baseline = rect.y + (rect.height - size).max(0.0) * 0.5 + scaled.ascent();
+    for character in text.chars() {
         let mut glyph = scaled.scaled_glyph(character);
         glyph.position = point(cursor_x, baseline);
         cursor_x += scaled.h_advance(glyph.id);
@@ -427,8 +534,8 @@ fn add_label(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, label: &UiL
             if coverage <= 0.0 {
                 return;
             }
-            let color = Color::rgba(label.color.red, label.color.green, label.color.blue, label.color.alpha * coverage);
-            add_rect(vertices, UiRect::new(bounds.min.x + x as f32, bounds.min.y + y as f32, 1.0, 1.0), color, width, height);
+            let color = Color::rgba(color.red, color.green, color.blue, color.alpha * coverage);
+            add_rect(vertices, UiRect::new(bounds.min.x + x as f32, bounds.min.y + y as f32, 1.0, 1.0), color, viewport.0, viewport.1);
         });
     }
 }

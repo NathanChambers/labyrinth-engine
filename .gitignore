@@ -1,4 +1,8 @@
 /target/
+/target-debug-alt/
+/target-debug-large/
+/target-debug-gi/
+/captures/
 
 # Local environment and credentials
 .env

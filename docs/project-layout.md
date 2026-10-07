@@ -1,6 +1,6 @@
 # Project layout
 
-The workspace grows by working vertical slices. The graphics milestone has five packages:
+The workspace grows by working vertical slices. The graphics milestone currently has four engine packages and two example consumers:
 
 ```text
 labyrinth-engine/
@@ -9,16 +9,18 @@ labyrinth-engine/
 │   ├── engine/              # Public game-facing package: labyrinth, primitives, windowing
 │   ├── math/                # Shared math value types and transforms
 │   ├── mesh/                # Shared CPU mesh contract
-│   └── renderer/            # GPU rendering
+│   ├── renderer/            # GPU rendering and readback
+│   └── scripting/           # Rhai capture-plan compiler and capabilities
 ├── examples/
-│   └── primitives/          # Thin windowed demo consumer and its assets
+│   ├── primitives/          # Basic mesh, camera, lighting, and UI smoke test
+│   └── lighting/            # Outdoor/interior lighting experiment scene
 └── docs/
 ```
 
 ```text
-math ──> renderer ──> engine ──> primitives example
+math ──> renderer ──> engine ──> examples
 math ──> engine
-mesh ──> renderer ──> engine ──> primitives example
+mesh ──> renderer ──> engine ──> examples
   └────────────────────────────> engine primitives
 ```
 
@@ -33,13 +35,12 @@ The following boundaries remain proposals from the runtime, Rhai, modding, and A
 | Package or contract | Intended responsibility |
 | --- | --- |
 | `world` | Authoritative entity and component state; validated commands and scoped queries |
-| `scripting` | Rhai behavior, capabilities, execution limits, and staged reload |
 | `runtime` | Fixed update sequencing and integration of world, scripts, and renderer |
 | `interfaces/behavior` | Versioned Rhai host API exposed to mods |
 | `interfaces/tooling` | Scoped editor and runtime context for agent tools |
 | `tools/cli` | Project validation, targeted tests, and diagnostics |
 
-When introduced, `world` and `scripting` should remain independent. `runtime` coordinates them and translates between world IDs and script transfer values. Scripts and tools do not receive mutable world internals. The editor will own selection and viewport state and combine it with a read-only runtime projection. Stale revision checks should prevent a tool request from changing the wrong state.
+The implemented scripting package currently compiles restricted debug capture plans. Broader gameplay scripting remains separate from the future world and runtime packages. Scripts and tools do not receive mutable world internals. The editor will own selection and viewport state and combine it with a read-only runtime projection. Stale revision checks should prevent a tool request from changing the wrong state.
 
 Add asset, audio, physics, and editor packages when a working interaction needs them. Keep application-specific assets beside their application; `FontAsset` owns loading and sharing parsed font data without owning project files. Keep backend-specific implementations behind the rendering boundary. Avoid a general `common` or `types` crate that collects unrelated helpers.
 

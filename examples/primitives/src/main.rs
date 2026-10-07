@@ -126,7 +126,7 @@ impl PrimitiveDemo {
             context.ui.set_slider_value(slider, self.light_angle);
         }
         let light_id = self.light.ok_or("light was not initialized")?;
-        let light = context.scene.get_light_mut(light_id).ok_or("light was removed before update")?;
+        let light = context.scene.get_directional_light_mut(light_id).ok_or("light was removed before update")?;
         let angle = self.light_angle.to_radians();
         light.direction = Vec3::new(angle.cos() * 0.7, 1.0, angle.sin() * 0.7).normalize();
         Ok(())
@@ -160,6 +160,7 @@ fn main() -> Result<(), String> {
             "--dx12" => settings.graphics_api = GraphicsApi::DirectX12,
             "--opengl" => settings.graphics_api = GraphicsApi::OpenGl,
             "--metal" => settings.graphics_api = GraphicsApi::Metal,
+            argument if argument.starts_with("--capture-script=") => settings.debug_script = Some(argument.trim_start_matches("--capture-script=").into()),
             _ => return Err(format!("unknown option: {argument}")),
         }
     }

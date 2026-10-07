@@ -14,12 +14,21 @@ The example starts windowed at 1280 × 720. Use `--borderless` or `--fullscreen`
 
 Vulkan is the default graphics API. The renderer also accepts `--dx12`, `--opengl`, or `--metal` on platforms where those backends are available. macOS normally needs `--metal` unless a Vulkan portability implementation is installed. Exclusive fullscreen falls back to borderless when no usable mode is available, including on Wayland.
 
+The lighting example accepts a debug capture script:
+
+```text
+cargo run -p lighting -- --windowed --capture-script=examples/lighting/scripts/capture.rhai
+```
+
+Images are written below `captures/`. The script can set a custom resolution, move the active camera, wait between actions, save individual PNG frames or use `capture.sequence(prefix, count, interval)`, and call `capture.exit()` to end the run.
+
 ## Current boundaries
 
 - `crates/engine` is the public `labyrinth` package. It owns the window event loop, lifecycle, and display mode.
 - `crates/mesh` owns the stable CPU mesh contract shared by primitive generators, future asset importers, and the renderer.
 - `crates/math` owns shared vector, matrix, quaternion, and transform value types.
 - `crates/renderer` owns GPU setup, camera, depth buffer, shader, resize, presentation, and transformed mesh-instance uploads. It consumes geometry without knowing whether it came from primitives or imported assets.
+- `crates/scripting` compiles restricted Rhai debug capture plans. `crates/engine` executes them and `crates/renderer` performs custom-resolution readback.
 - `crates/engine` exposes reusable plane, quad, cube, sphere, cylinder, cone, and torus generators.
 - `examples/primitives` composes engine primitives into the demo scene and passes the resulting meshes through the public package.
 
@@ -27,4 +36,4 @@ The [project layout](docs/project-layout.md) separates current packages from pro
 
 ## Next directions
 
-Rhai is the planned language for game behavior and untrusted mods. Mods will receive explicit host capabilities and execution limits. Tooling should let an editor share a scoped, versioned view of the selected scene area with an AI agent, then run a targeted test and return structured diagnostics. These systems are design intentions; they are not part of the graphics example yet.
+Rhai is implemented for restricted debug capture plans and remains the planned language for game behavior and untrusted mods. Mods will receive explicit host capabilities and execution limits. Tooling should let an editor share a scoped, versioned view of the selected scene area with an AI agent, then run a targeted test and return structured diagnostics.

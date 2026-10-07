@@ -25,6 +25,32 @@ pub struct DirectionalLight {
     pub intensity: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointLight {
+    pub position: Vec3,
+    pub color: Color,
+    pub intensity: f32,
+    pub range: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpotLight {
+    pub position: Vec3,
+    pub direction: Vec3,
+    pub color: Color,
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_angle: f32,
+    pub outer_angle: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Light {
+    Directional(DirectionalLight),
+    Point(PointLight),
+    Spot(SpotLight),
+}
+
 impl Default for DirectionalLight {
     fn default() -> Self {
         Self { direction: Vec3::new(0.45, 1.0, 0.35), color: Color::WHITE, intensity: 1.0 }

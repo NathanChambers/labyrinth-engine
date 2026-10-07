@@ -1,5 +1,5 @@
-use math::{Camera, DirectionalLight, Transform};
-use mesh::{Mesh, MeshInstance};
+use math::{Camera, DirectionalLight, Light, PointLight, SpotLight, Transform};
+use mesh::{Material, Mesh, MeshInstance};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MeshId(usize);
@@ -14,13 +14,29 @@ pub struct LightId(usize);
 pub struct Scene {
     meshes: Vec<MeshInstance>,
     cameras: Vec<Camera>,
-    lights: Vec<DirectionalLight>,
+    lights: Vec<Light>,
 }
 
 impl Scene {
     pub fn spawn_mesh(&mut self, mesh: Mesh, transform: Transform) -> MeshId {
         let id = MeshId(self.meshes.len());
         self.meshes.push(MeshInstance::new(mesh, transform));
+        id
+    }
+
+    pub fn spawn_static_mesh(&mut self, mesh: Mesh, transform: Transform) -> MeshId {
+        let id = MeshId(self.meshes.len());
+        let mut instance = MeshInstance::new(mesh, transform);
+        instance.probe_dynamic = false;
+        self.meshes.push(instance);
+        id
+    }
+
+    pub fn spawn_mesh_with_material(&mut self, mesh: Mesh, transform: Transform, material: Material) -> MeshId {
+        let id = MeshId(self.meshes.len());
+        let mut instance = MeshInstance::new(mesh, transform);
+        instance.material = material;
+        self.meshes.push(instance);
         id
     }
 
@@ -32,7 +48,19 @@ impl Scene {
 
     pub fn spawn_light(&mut self, light: DirectionalLight) -> LightId {
         let id = LightId(self.lights.len());
-        self.lights.push(light);
+        self.lights.push(Light::Directional(light));
+        id
+    }
+
+    pub fn spawn_point_light(&mut self, light: PointLight) -> LightId {
+        let id = LightId(self.lights.len());
+        self.lights.push(Light::Point(light));
+        id
+    }
+
+    pub fn spawn_spot_light(&mut self, light: SpotLight) -> LightId {
+        let id = LightId(self.lights.len());
+        self.lights.push(Light::Spot(light));
         id
     }
 
@@ -48,12 +76,19 @@ impl Scene {
         self.cameras.get_mut(camera.0)
     }
 
-    pub fn get_light(&self, light: LightId) -> Option<&DirectionalLight> {
+    pub fn get_light(&self, light: LightId) -> Option<&Light> {
         self.lights.get(light.0)
     }
 
-    pub fn get_light_mut(&mut self, light: LightId) -> Option<&mut DirectionalLight> {
-        self.lights.get_mut(light.0)
+    pub fn get_directional_light_mut(&mut self, light: LightId) -> Option<&mut DirectionalLight> {
+        match self.lights.get_mut(light.0) {
+            Some(Light::Directional(light)) => Some(light),
+            _ => None,
+        }
+    }
+
+    pub fn lights(&self) -> &[Light] {
+        &self.lights
     }
 
     pub fn instances(&self) -> &[MeshInstance] {

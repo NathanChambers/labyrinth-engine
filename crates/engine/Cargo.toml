@@ -8,7 +8,10 @@ license.workspace = true
 ab_glyph.workspace = true
 math = { path = "../math" }
 mesh = { path = "../mesh" }
+png.workspace = true
 renderer = { path = "../renderer" }
+rhai = { workspace = true }
+scripting = { path = "../scripting" }
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]

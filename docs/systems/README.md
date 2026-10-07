@@ -12,5 +12,8 @@ Each implemented engine system gets one page named for its responsibility. Use [
 | [Mesh](mesh.md) | `crates/mesh` | Implemented |
 | [Primitives](primitives.md) | `crates/engine` | Implemented |
 | [Rendering](rendering.md) | `crates/renderer` | Implemented |
+| [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Placement and debug visualization implemented |
+| [Scripting](scripting.md) | `crates/scripting` | Implemented for debug capture |
+| [Debug Capture](capture.md) | `crates/engine`, `crates/renderer` | Implemented |
 
-System pages describe observed behavior and link to source paths. When a change alters ownership, a public contract, lifecycle, or cross-system flow, update the affected page and map together. World, Rhai scripting, runtime coordination, editor tooling, and project tools remain proposals in [project-layout.md](../project-layout.md).
+System pages describe observed behavior and link to source paths. When a change alters ownership, a public contract, lifecycle, or cross-system flow, update the affected page and map together. World, broader gameplay scripting, runtime coordination, editor tooling, and project tools remain proposals in [project-layout.md](../project-layout.md).

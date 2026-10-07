@@ -1,5 +1,21 @@
 use bytemuck::{Pod, Zeroable};
+use math::Color;
 use math::Transform;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Material {
+    pub base_color: Color,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emission: Color,
+    pub emission_strength: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self { base_color: Color::WHITE, metallic: 0.0, roughness: 0.5, emission: Color::BLACK, emission_strength: 0.0 }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -78,11 +94,13 @@ impl Mesh {
 pub struct MeshInstance {
     pub mesh: Mesh,
     pub transform: Transform,
+    pub material: Material,
+    pub probe_dynamic: bool,
 }
 
 impl MeshInstance {
     pub fn new(mesh: Mesh, transform: Transform) -> Self {
-        Self { mesh, transform }
+        Self { mesh, transform, material: Material::default(), probe_dynamic: true }
     }
 }
 
