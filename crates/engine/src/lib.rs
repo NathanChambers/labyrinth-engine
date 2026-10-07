@@ -30,7 +30,7 @@ pub use gizmo::{GizmoCanvas, GizmoVertex};
 pub use input::InputState;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
 pub use mesh::{Material, Mesh, MeshInstance, MeshVertex};
-pub use renderer::{GraphicsApi, RenderDebugMode, RenderSettings, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererSkyLighting};
+pub use renderer::{GraphicsApi, RenderDebugMode, RenderSettings, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererSkyLighting, ShadowQuality};
 pub use scene::{CameraId, LightId, MeshId, Scene};
 pub use time::{Time, TimeScaleId};
 pub use ui::{UiAnchor, UiAutoLayout, UiButtonId, UiCanvas, UiContainerId, UiFlexDirection, UiGraphId, UiLabelId, UiLayout, UiPanelId, UiPivot, UiRect, UiSliderId};
@@ -296,14 +296,31 @@ where
                         Ok(())
                     });
                     if let Some((shadows_enabled, irradiance_enabled, gizmos_enabled)) = self.context.debug_capture.as_ref().and_then(DebugCapture::render_effects) {
-                        self.context.render_settings = RenderSettings { shadows_enabled, irradiance_enabled };
+                        self.context.render_settings = RenderSettings { shadows_enabled, irradiance_enabled, ..self.context.render_settings };
                         self.context.gizmos_enabled = gizmos_enabled;
+                    }
+                    if let Some(ambient_occlusion_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::ambient_occlusion) {
+                        self.context.render_settings.ambient_occlusion_enabled = ambient_occlusion_enabled;
+                    }
+                    if let Some(direct_light_visibility_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::direct_light_visibility) {
+                        self.context.render_settings.direct_light_visibility_enabled = direct_light_visibility_enabled;
+                    }
+                    if let Some(quality) = self.context.debug_capture.as_ref().and_then(DebugCapture::shadow_quality) {
+                        let quality = match quality {
+                            0 => ShadowQuality::Low,
+                            1 => ShadowQuality::Medium,
+                            3 => ShadowQuality::Ultra,
+                            _ => ShadowQuality::High,
+                        };
+                        self.context.render_settings = self.context.render_settings.with_shadow_quality(quality);
                     }
                     if let Some(mode) = self.context.debug_capture.as_ref().and_then(DebugCapture::render_mode) {
                         self.context.render_debug_mode = match mode {
                             scripting::CaptureRenderMode::Lit => RenderDebugMode::LitMaterials,
                             scripting::CaptureRenderMode::Unlit => RenderDebugMode::UnlitMaterials,
                             scripting::CaptureRenderMode::Wireframe => RenderDebugMode::Wireframe,
+                            scripting::CaptureRenderMode::ShadowVisibility => RenderDebugMode::ShadowVisibility,
+                            scripting::CaptureRenderMode::GiOnly => RenderDebugMode::GiOnly,
                         };
                     }
                     if let Some(ui_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::ui_enabled) {

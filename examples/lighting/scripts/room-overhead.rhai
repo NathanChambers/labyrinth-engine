@@ -1,0 +1,10 @@
+capture.configure(1280, 720, "room-overhead", false);
+capture.set_render_effects(true, false, false);
+capture.set_ambient_occlusion(false);
+capture.wait(1.0);
+capture.set_camera([0.0, 15.0, 0.0], [0.0, 0.0, 0.0]);
+capture.screenshot("overhead");
+capture.wait(0.5);
+capture.set_camera([8.0, 12.0, 8.0], [0.0, 0.0, 0.0]);
+capture.screenshot("overhead_diagonal");
+capture.exit();

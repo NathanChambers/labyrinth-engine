@@ -1,0 +1,11 @@
+capture.configure(1280, 720, "room-shadow-visibility", false);
+capture.set_render_effects(true, false, false);
+capture.set_ambient_occlusion(false);
+capture.set_render_mode("shadow_visibility");
+capture.wait(1.0);
+capture.set_camera([0.0, 4.0, 13.0], [0.0, 1.0, 0.0]);
+capture.screenshot("perspective_visibility");
+capture.wait(0.5);
+capture.set_camera([0.0, 15.0, 0.0], [0.0, 0.0, 0.0]);
+capture.screenshot("overhead_visibility");
+capture.exit();

@@ -1,0 +1,14 @@
+capture.configure(1280, 720, "room-direct-visibility-compare", false);
+capture.set_render_effects(true, false, false);
+capture.set_ambient_occlusion(false);
+capture.set_render_mode("lit");
+capture.set_direct_light_visibility(false);
+capture.wait(1.0);
+capture.set_camera([0.0, 4.0, 13.0], [0.0, 1.0, 0.0]);
+capture.screenshot("direct_lighting_without_visibility");
+capture.set_direct_light_visibility(true);
+capture.wait(0.5);
+capture.screenshot("direct_lighting_with_visibility");
+capture.set_render_mode("shadow_visibility");
+capture.screenshot("visibility_mask");
+capture.exit();

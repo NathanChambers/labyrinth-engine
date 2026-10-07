@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use math::{Camera, Vec3, lerp_vec3};
-use renderer::Renderer;
+use renderer::{CapturedDepthBuffer, Renderer};
 use scripting::{CameraPose, CaptureAction, CapturePlan, CaptureRenderMode, compile_capture_script};
 
 use crate::scene::{CameraId, Scene};
@@ -16,6 +16,9 @@ pub struct DebugCapture {
     pending_capture: Option<String>,
     pending_report: Option<String>,
     render_effects: Option<(bool, bool, bool)>,
+    ambient_occlusion: Option<bool>,
+    direct_light_visibility: Option<bool>,
+    shadow_quality: Option<u8>,
     render_mode: Option<CaptureRenderMode>,
     ui_enabled: Option<bool>,
     exit_requested: bool,
@@ -40,6 +43,9 @@ impl DebugCapture {
             pending_capture: None,
             pending_report: None,
             render_effects: None,
+            ambient_occlusion: None,
+            direct_light_visibility: None,
+            shadow_quality: None,
             render_mode: None,
             ui_enabled: None,
             exit_requested: false,
@@ -58,6 +64,18 @@ impl DebugCapture {
             match &self.plan.actions[self.action_index] {
                 CaptureAction::SetRenderEffects { shadows, irradiance, gizmos } => {
                     self.render_effects = Some((*shadows, *irradiance, *gizmos));
+                    self.action_index += 1;
+                }
+                CaptureAction::SetAmbientOcclusion(enabled) => {
+                    self.ambient_occlusion = Some(*enabled);
+                    self.action_index += 1;
+                }
+                CaptureAction::SetDirectLightVisibility(enabled) => {
+                    self.direct_light_visibility = Some(*enabled);
+                    self.action_index += 1;
+                }
+                CaptureAction::SetShadowQuality(quality) => {
+                    self.shadow_quality = Some(*quality);
                     self.action_index += 1;
                 }
                 CaptureAction::SetRenderMode(mode) => {
@@ -139,6 +157,10 @@ impl DebugCapture {
         let file_name = safe_file_name(&name)?;
         let path = directory.join(format!("{file_name}.png"));
         write_png(&path, &frame)?;
+        write_depth_capture(&directory, file_name, "scene_depth", &frame.scene_depth, Some((camera.near_clip, camera.far_clip)))?;
+        write_depth_capture(&directory, file_name, "directional_shadow", &frame.directional_shadow, None)?;
+        write_depth_capture(&directory, file_name, "spot_shadow", &frame.spot_shadow, None)?;
+        write_depth_capture(&directory, file_name, "point_shadow", &frame.point_shadow, None)?;
         eprintln!("Capture written to {}", path.display());
         Ok(())
     }
@@ -196,6 +218,18 @@ impl DebugCapture {
         self.render_mode
     }
 
+    pub fn shadow_quality(&self) -> Option<u8> {
+        self.shadow_quality
+    }
+
+    pub fn ambient_occlusion(&self) -> Option<bool> {
+        self.ambient_occlusion
+    }
+
+    pub fn direct_light_visibility(&self) -> Option<bool> {
+        self.direct_light_visibility
+    }
+
     pub fn ui_enabled(&self) -> Option<bool> {
         self.ui_enabled
     }
@@ -239,4 +273,39 @@ fn write_png(path: &Path, frame: &renderer::CapturedFrame) -> Result<(), String>
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(|error| format!("failed to write PNG header: {error}"))?;
     writer.write_image_data(&frame.rgba8).map_err(|error| format!("failed to write PNG pixels: {error}"))
+}
+
+fn write_depth_capture(directory: &Path, base_name: &str, buffer_name: &str, buffer: &CapturedDepthBuffer, camera_clip: Option<(f32, f32)>) -> Result<(), String> {
+    for (layer, values) in buffer.layers.iter().enumerate() {
+        let suffix = if buffer.layers.len() == 1 { String::new() } else { format!("_{layer}") };
+        let preview_path = directory.join(format!("{base_name}_{buffer_name}{suffix}.png"));
+        write_depth_preview(&preview_path, buffer.width, buffer.height, values, camera_clip)?;
+    }
+    Ok(())
+}
+
+fn write_depth_preview(path: &Path, width: u32, height: u32, values: &[f32], camera_clip: Option<(f32, f32)>) -> Result<(), String> {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for value in values.iter().take((width * height) as usize) {
+        let value = if let Some((near, far)) = camera_clip {
+            let near = near.max(0.001);
+            let far = far.max(near + 0.001);
+            let depth = value.clamp(0.0, 1.0);
+            let linear_distance = near * far / (far - depth * (far - near));
+            ((linear_distance - near) / (far - near)).clamp(0.0, 1.0)
+        } else if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let value = (1.0 - value).powf(0.35);
+        let byte = (value * 255.0).round() as u8;
+        pixels.extend_from_slice(&[byte, byte, byte, 255]);
+    }
+    let file = fs::File::create(path).map_err(|error| format!("failed to create depth preview: {error}"))?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| format!("failed to write depth preview header: {error}"))?;
+    writer.write_image_data(&pixels).map_err(|error| format!("failed to write depth preview pixels: {error}"))
 }

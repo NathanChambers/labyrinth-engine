@@ -1,0 +1,12 @@
+capture.configure(1280, 720, "room-gi-compare", false);
+capture.set_ambient_occlusion(false);
+capture.set_render_mode("lit");
+capture.set_render_effects(true, false, false);
+capture.wait(1.0);
+capture.set_camera([8.0, 12.0, 8.0], [0.0, 0.0, 0.0]);
+capture.screenshot("gi_off");
+capture.set_render_effects(true, true, false);
+capture.wait(1.5);
+capture.set_camera([8.0, 12.0, 8.0], [0.0, 0.0, 0.0]);
+capture.screenshot("gi_on");
+capture.exit();

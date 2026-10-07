@@ -2,7 +2,7 @@ use std::path::Path;
 
 use labyrinth::{
     Application, Camera, CameraId, Color, DirectionalLight, Easing, EulerRot, FontAsset, GraphicsApi, IrradianceVolumeDesc, IrradianceVolumeId, KeyCode, LightId, Material, MeshId, PointLight, Quat,
-    RenderDebugMode, RenderSettings, RendererSkyLighting, RuntimeContext, SpotLight, Transform, UiAnchor, UiAutoLayout, UiButtonId, UiGraphId, UiLabelId, UiLayout, UiPanelId, UiSliderId, Vec2, Vec3,
+    RenderDebugMode, RendererSkyLighting, RuntimeContext, ShadowQuality, SpotLight, Transform, UiAnchor, UiAutoLayout, UiButtonId, UiGraphId, UiLabelId, UiLayout, UiPanelId, UiSliderId, Vec2, Vec3,
     WindowMode, WindowSettings, ease, ping_pong, primitives, run,
 };
 
@@ -18,9 +18,15 @@ struct LightingDemo {
     light_slider: Option<UiSliderId>,
     light_lock: Option<UiButtonId>,
     time_slider: Option<UiSliderId>,
+    shadow_quality_slider: Option<UiSliderId>,
+    shadow_bias_slider: Option<UiSliderId>,
+    shadow_filter_slider: Option<UiSliderId>,
     large_scene: bool,
     gi_test_scene: bool,
     open_world: bool,
+    shadow_test_scene: bool,
+    room_test_scene: bool,
+    shadow_isolation: bool,
     lit_materials_button: Option<UiButtonId>,
     unlit_materials_button: Option<UiButtonId>,
     wireframe_button: Option<UiButtonId>,
@@ -46,15 +52,23 @@ impl LightingDemo {
     fn setup_scene(&mut self, context: &mut RuntimeContext) {
         if self.gi_test_scene {
             self.spawn_gi_test_scene(context);
+        } else if self.shadow_test_scene {
+            self.spawn_shadow_test_scene(context);
         } else if self.open_world {
             self.spawn_open_world_scene(context);
+        } else if self.room_test_scene {
+            self.spawn_room_test_scene(context);
         } else if self.large_scene {
             self.spawn_large_lighting_scene(context);
         } else {
             context.scene.spawn_static_mesh(primitives::plane(20.0, Color::WHITE), Transform::IDENTITY);
             self.spawn_lighting_test_room(context);
         }
-        self.irradiance_volume = Some(context.irradiance_volumes.add(if self.gi_test_scene {
+        self.irradiance_volume = Some(context.irradiance_volumes.add(if self.room_test_scene {
+            IrradianceVolumeDesc { minimum: Vec3::new(-15.0, 0.0, -15.0), maximum: Vec3::new(15.0, 6.0, 15.0), resolution: [10, 4, 10], enabled: true }
+        } else if self.shadow_test_scene {
+            IrradianceVolumeDesc { minimum: Vec3::new(-8.0, 0.0, -8.0), maximum: Vec3::new(8.0, 6.0, 8.0), resolution: [4, 2, 4], enabled: false }
+        } else if self.gi_test_scene {
             IrradianceVolumeDesc { minimum: Vec3::new(-5.0, 0.0, -5.0), maximum: Vec3::new(5.0, 5.0, 5.0), resolution: [16, 5, 12], enabled: true }
         } else if self.open_world {
             IrradianceVolumeDesc { minimum: Vec3::new(-64.0, 0.0, -64.0), maximum: Vec3::new(64.0, 12.0, 64.0), resolution: [12, 4, 12], enabled: true }
@@ -63,22 +77,31 @@ impl LightingDemo {
         } else {
             IrradianceVolumeDesc { minimum: Vec3::new(-3.0, 0.12, -3.0), maximum: Vec3::new(3.0, 3.0, 3.0), resolution: [8, 4, 8], enabled: true }
         }));
-        let object_depth = if self.gi_test_scene { -3.2 } else { 0.0 };
-        let object_x = if self.gi_test_scene { 1.5 } else { 1.2 };
-        self.cube = Some(context.scene.spawn_mesh(primitives::cube([0.0, 0.0, 0.0], 1.2, Color::rgb(0.9, 0.08, 0.06)), Transform::from_position(Vec3::new(-object_x, 0.6, object_depth))));
-        if let Some(cube_id) = self.cube
-            && let Some(cube) = context.scene.get_mesh_mut(cube_id)
-        {
-            cube.material = Material { metallic: 0.3, roughness: 0.2, ..Material::default() };
-        }
-        self.sphere = Some(context.scene.spawn_mesh(primitives::sphere([0.0, 0.0, 0.0], 0.7, Color::rgb(0.08, 0.75, 0.18), 24, 16), Transform::from_position(Vec3::new(object_x, 0.7, object_depth))));
-        if let Some(sphere_id) = self.sphere
-            && let Some(sphere) = context.scene.get_mesh_mut(sphere_id)
-        {
-            sphere.material = Material { metallic: 0.2, roughness: 0.16, ..Material::default() };
+        if !self.room_test_scene {
+            let object_depth = if self.gi_test_scene { -3.2 } else { 0.0 };
+            let object_x = if self.gi_test_scene { 1.5 } else { 1.2 };
+            self.cube = Some(context.scene.spawn_mesh(primitives::cube([0.0, 0.0, 0.0], 1.2, Color::rgb(0.9, 0.08, 0.06)), Transform::from_position(Vec3::new(-object_x, 0.6, object_depth))));
+            if let Some(cube_id) = self.cube
+                && let Some(cube) = context.scene.get_mesh_mut(cube_id)
+            {
+                cube.material = Material { metallic: 0.3, roughness: 0.2, ..Material::default() };
+            }
+            self.sphere =
+                Some(context.scene.spawn_mesh(primitives::sphere([0.0, 0.0, 0.0], 0.7, Color::rgb(0.08, 0.75, 0.18), 24, 16), Transform::from_position(Vec3::new(object_x, 0.7, object_depth))));
+            if let Some(sphere_id) = self.sphere
+                && let Some(sphere) = context.scene.get_mesh_mut(sphere_id)
+            {
+                sphere.material = Material { metallic: 0.2, roughness: 0.16, ..Material::default() };
+            }
         }
         self.camera = Some(context.scene.spawn_camera(Camera { clear_color: Color::rgb(0.06, 0.08, 0.12), ..Camera::default() }));
-        if self.gi_test_scene {
+        if self.shadow_test_scene {
+            if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
+                camera.transform.position = Vec3::new(0.0, 3.8, 9.5);
+            }
+            self.camera_yaw = 0.0;
+            self.camera_pitch = -0.2;
+        } else if self.gi_test_scene {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 2.4, 7.0);
             }
@@ -90,6 +113,12 @@ impl LightingDemo {
             }
             self.camera_yaw = 0.0;
             self.camera_pitch = -0.22;
+        } else if self.room_test_scene {
+            if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
+                camera.transform.position = Vec3::new(0.0, 4.0, 13.0);
+            }
+            self.camera_yaw = 0.0;
+            self.camera_pitch = -0.2;
         } else if self.large_scene {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 2.8, 12.0);
@@ -97,7 +126,13 @@ impl LightingDemo {
             self.camera_yaw = 0.0;
             self.camera_pitch = -0.18;
         }
-        if self.gi_test_scene {
+        if self.room_test_scene {
+            context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.08, 0.09, 0.11), intensity: 0.04 };
+            self.point_light = Some(context.scene.spawn_point_light(PointLight { position: Vec3::new(0.0, 4.0, 0.0), color: Color::WHITE, intensity: 2.0, range: 24.0 }));
+        } else if self.shadow_test_scene {
+            context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.12, 0.14, 0.18), intensity: 0.08 };
+            self.light = Some(context.scene.spawn_light(DirectionalLight { direction: Vec3::new(-0.55, 0.85, -0.35).normalize(), color: Color::WHITE, intensity: 1.8 }));
+        } else if self.gi_test_scene {
             context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.18, 0.2, 0.22), intensity: 0.08 };
             self.light = Some(context.scene.spawn_light(DirectionalLight { intensity: 0.12, ..DirectionalLight::default() }));
             self.point_light = Some(context.scene.spawn_point_light(PointLight { position: Vec3::new(-2.2, 1.4, -2.0), color: Color::WHITE, intensity: 3.5, range: 4.0 }));
@@ -134,6 +169,36 @@ impl LightingDemo {
         self.spawn_box(context, Vec3::new(-5.0, 2.5, 1.0), Vec3::new(0.2, 5.0, 12.0), wall_color);
         self.spawn_box(context, Vec3::new(5.0, 2.5, 1.0), Vec3::new(0.2, 5.0, 12.0), wall_color);
         self.spawn_box(context, Vec3::new(0.0, 5.0, 1.0), Vec3::new(10.0, 0.2, 12.0), wall_color);
+    }
+
+    fn spawn_shadow_test_scene(&mut self, context: &mut RuntimeContext) {
+        context.scene.spawn_static_mesh(primitives::plane(24.0, Color::rgb(0.42, 0.45, 0.48)), Transform::IDENTITY);
+        self.spawn_box(context, Vec3::new(-3.0, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0), Color::rgb(0.85, 0.08, 0.06));
+        self.spawn_box(context, Vec3::new(-1.8, 1.2, -1.0), Vec3::new(1.6, 2.4, 1.6), Color::rgb(0.08, 0.75, 0.18));
+        context.scene.spawn_static_mesh(primitives::sphere([0.0, 0.0, 0.0], 1.0, Color::rgb(0.08, 0.35, 0.95), 32, 20), Transform::from_position(Vec3::new(1.0, 1.0, -1.0)));
+        self.spawn_box(context, Vec3::new(4.0, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0), Color::rgb(0.9, 0.55, 0.08));
+        self.spawn_box(context, Vec3::new(4.0, 2.75, -1.0), Vec3::new(2.0, 1.5, 2.0), Color::rgb(0.65, 0.2, 0.8));
+        self.spawn_box(context, Vec3::new(0.0, 2.0, -5.0), Vec3::new(12.0, 4.0, 0.25), Color::rgb(0.58, 0.62, 0.66));
+    }
+
+    fn spawn_room_test_scene(&mut self, context: &mut RuntimeContext) {
+        let floor = Color::rgb(0.28, 0.3, 0.34);
+        let wall = Color::rgb(0.48, 0.5, 0.54);
+        context.scene.spawn_static_mesh(primitives::plane(32.0, floor), Transform::IDENTITY);
+        self.spawn_box(context, Vec3::new(-1.6, 0.75, 0.0), Vec3::new(1.5, 1.5, 1.5), Color::rgb(0.04, 0.85, 0.12));
+        self.spawn_box(context, Vec3::new(1.6, 0.75, 0.0), Vec3::new(1.5, 1.5, 1.5), Color::rgb(0.9, 0.04, 0.03));
+        // Central room: the split north wall leaves one doorway centered on the hallway entrance.
+        self.spawn_box(context, Vec3::new(-5.0, 2.0, 0.0), Vec3::new(0.3, 4.0, 10.0), wall);
+        self.spawn_box(context, Vec3::new(5.0, 2.0, 0.0), Vec3::new(0.3, 4.0, 10.0), wall);
+        self.spawn_box(context, Vec3::new(0.0, 2.0, -5.0), Vec3::new(10.0, 4.0, 0.3), wall);
+        self.spawn_box(context, Vec3::new(-3.335, 2.0, 5.0), Vec3::new(3.33, 4.0, 0.3), wall);
+        self.spawn_box(context, Vec3::new(3.335, 2.0, 5.0), Vec3::new(3.33, 4.0, 0.3), wall);
+
+        // Outer four-sided room wraps the center room, leaving one continuous ring hallway.
+        self.spawn_box(context, Vec3::new(-13.0, 2.0, 0.0), Vec3::new(0.3, 4.0, 26.0), wall);
+        self.spawn_box(context, Vec3::new(13.0, 2.0, 0.0), Vec3::new(0.3, 4.0, 26.0), wall);
+        self.spawn_box(context, Vec3::new(0.0, 2.0, -13.0), Vec3::new(26.0, 4.0, 0.3), wall);
+        self.spawn_box(context, Vec3::new(0.0, 2.0, 13.0), Vec3::new(26.0, 4.0, 0.3), wall);
     }
 
     fn spawn_large_lighting_scene(&mut self, context: &mut RuntimeContext) {
@@ -224,11 +289,11 @@ impl LightingDemo {
         let font = FontAsset::from_file(font_path)?;
         context.ui.set_font(font.clone());
         self.font = Some(font);
-        let panel_layout = UiLayout::anchored(Vec2::new(320.0, 260.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0));
+        let panel_layout = UiLayout::anchored(Vec2::new(320.0, 370.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0));
         context.ui.set_window_layout(panel_layout);
         context.ui.add_label_layout(None, UiLayout::anchored(Vec2::new(200.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(34.0, 24.0)), "Lighting", 16.0, Color::WHITE);
 
-        let stack = context.ui.add_container(None, UiLayout::anchored(Vec2::new(320.0, 234.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 50.0)), UiAutoLayout::column(10.0, 4.0));
+        let stack = context.ui.add_container(None, UiLayout::anchored(Vec2::new(320.0, 344.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 50.0)), UiAutoLayout::column(8.0, 4.0));
         let light_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
         context.ui.add_label_layout(
             Some(light_row),
@@ -280,9 +345,42 @@ impl LightingDemo {
         self.irradiance_button =
             Some(context.ui.add_toggle_button_layout(Some(effects_row), UiLayout::anchored(Vec2::new(54.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 2.0)), true));
         context.ui.set_button_text(self.irradiance_button.unwrap(), "GI", 11.0, Color::WHITE);
-        self.gizmos_button =
-            Some(context.ui.add_toggle_button_layout(Some(effects_row), UiLayout::anchored(Vec2::new(62.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 2.0)), !self.open_world));
+        self.gizmos_button = Some(context.ui.add_toggle_button_layout(
+            Some(effects_row),
+            UiLayout::anchored(Vec2::new(62.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 2.0)),
+            !self.open_world && !self.shadow_test_scene,
+        ));
         context.ui.set_button_text(self.gizmos_button.unwrap(), "Gizmos", 10.0, Color::WHITE);
+        let shadow_quality_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
+        context.ui.add_label_layout(
+            Some(shadow_quality_row),
+            UiLayout::anchored(Vec2::new(112.0, 22.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 4.0)),
+            "Shadow quality",
+            13.0,
+            Color::rgb(0.75, 0.8, 0.9),
+        );
+        self.shadow_quality_slider =
+            Some(context.ui.add_slider_layout(Some(shadow_quality_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 3.0, 2.0));
+        let shadow_bias_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
+        context.ui.add_label_layout(
+            Some(shadow_bias_row),
+            UiLayout::anchored(Vec2::new(112.0, 22.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 4.0)),
+            "Shadow bias",
+            13.0,
+            Color::rgb(0.75, 0.8, 0.9),
+        );
+        self.shadow_bias_slider =
+            Some(context.ui.add_slider_layout(Some(shadow_bias_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 1.0, 0.2));
+        let shadow_filter_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
+        context.ui.add_label_layout(
+            Some(shadow_filter_row),
+            UiLayout::anchored(Vec2::new(112.0, 22.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 4.0)),
+            "Shadow filter",
+            13.0,
+            Color::rgb(0.75, 0.8, 0.9),
+        );
+        self.shadow_filter_slider =
+            Some(context.ui.add_slider_layout(Some(shadow_filter_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 2.5, 1.5));
         self.performance_label = Some(context.ui.add_label_layout(
             None,
             UiLayout::anchored(Vec2::new(300.0, 20.0), UiAnchor::TOP_RIGHT, UiAnchor::TOP_RIGHT, Vec2::new(-36.0, 34.0)),
@@ -311,11 +409,13 @@ impl LightingDemo {
         let Some(label) = self.performance_label else { return };
         let stats = context.performance_stats;
         let text = format!(
-            "L {:.2} I {:.2} P {:.2} U {:.2} ms | {}/{} | samples {}+{} | regions {}",
+            "L {:.2} I {:.2} P {:.2} U {:.2} ms | shadows {}/{} | probes {}/{} | samples {}+{} | regions {}",
             stats.light_update_ms,
             stats.instance_update_ms,
             stats.probe_update_ms,
             stats.irradiance_upload_ms,
+            stats.dirty_shadow_lights,
+            stats.scheduled_shadow_lights,
             stats.probes_updated,
             stats.probe_budget,
             stats.static_sample_count,
@@ -362,7 +462,24 @@ impl LightingDemo {
     fn update_render_effects(&mut self, context: &mut RuntimeContext) {
         let shadows_enabled = self.shadows_button.and_then(|button| context.ui.button_toggled(button)).unwrap_or(true);
         let irradiance_enabled = self.irradiance_button.and_then(|button| context.ui.button_toggled(button)).unwrap_or(true);
-        context.render_settings = RenderSettings { shadows_enabled, irradiance_enabled };
+        let quality_index = self.shadow_quality_slider.and_then(|slider| context.ui.slider_value(slider)).unwrap_or(2.0).round() as u32;
+        let quality = match quality_index {
+            0 => ShadowQuality::Low,
+            1 => ShadowQuality::Medium,
+            3 => ShadowQuality::Ultra,
+            _ => ShadowQuality::High,
+        };
+        let mut settings = context.render_settings.with_shadow_quality(quality);
+        settings.shadows_enabled = shadows_enabled;
+        settings.irradiance_enabled = irradiance_enabled;
+        if let Some(value) = self.shadow_bias_slider.and_then(|slider| context.ui.slider_value(slider)) {
+            settings.shadow_depth_bias = 0.00001 + value * 0.0001;
+            settings.shadow_normal_bias = 0.00002 + value * 0.00005;
+        }
+        if let Some(value) = self.shadow_filter_slider.and_then(|slider| context.ui.slider_value(slider)) {
+            settings.shadow_filter_radius = value;
+        }
+        context.render_settings = settings;
         context.gizmos_enabled = self.gizmos_button.and_then(|button| context.ui.button_toggled(button)).unwrap_or(true);
     }
 
@@ -372,14 +489,16 @@ impl LightingDemo {
         if let Some(light) = self.light {
             context.active_lights.push(light);
         }
-        if let Some(light) = self.fill_light {
-            context.active_lights.push(light);
-        }
-        if let Some(light) = self.point_light {
-            context.active_lights.push(light);
-        }
-        if let Some(light) = self.spot_light {
-            context.active_lights.push(light);
+        if !self.shadow_isolation {
+            if let Some(light) = self.fill_light {
+                context.active_lights.push(light);
+            }
+            if let Some(light) = self.point_light {
+                context.active_lights.push(light);
+            }
+            if let Some(light) = self.spot_light {
+                context.active_lights.push(light);
+            }
         }
         let camera_id = self.camera.ok_or("camera was not created")?;
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was not stored")?;
@@ -434,7 +553,10 @@ impl LightingDemo {
     }
 
     fn update_light(&mut self, context: &mut RuntimeContext, delta_seconds: f32) -> Result<(), String> {
-        let locked = self.light_lock.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false);
+        if self.room_test_scene {
+            return Ok(());
+        }
+        let locked = self.shadow_test_scene || self.light_lock.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false);
         let light_angle = self.light_slider.and_then(|slider| context.ui.slider_value(slider)).unwrap_or(0.0);
         self.light_angle = if locked { light_angle } else { (light_angle + delta_seconds * 30.0).rem_euclid(360.0) };
         if let Some(slider) = self.light_slider {
@@ -451,15 +573,19 @@ impl LightingDemo {
 impl Application for LightingDemo {
     fn setup(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         self.setup_scene(context);
-        context.gizmos_enabled = !self.open_world;
+        context.gizmos_enabled = !self.open_world && !self.shadow_test_scene;
         self.setup_ui(context)?;
         self.setup_active_entities(context)
     }
 
     fn update(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         let delta_seconds = context.time.delta_seconds();
-        self.update_cube(context, delta_seconds)?;
-        self.update_sphere(context, delta_seconds)?;
+        if !self.shadow_test_scene && !self.room_test_scene {
+            self.update_cube(context, delta_seconds)?;
+        }
+        if !self.shadow_test_scene && !self.room_test_scene {
+            self.update_sphere(context, delta_seconds)?;
+        }
         self.update_camera(context, delta_seconds)?;
         self.update_render_mode(context);
         self.update_render_effects(context);
@@ -473,6 +599,9 @@ fn main() -> Result<(), String> {
     let mut large_scene = false;
     let mut gi_test_scene = false;
     let mut open_world = false;
+    let mut shadow_test_scene = false;
+    let mut room_test_scene = false;
+    let mut shadow_isolation = false;
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--windowed" => settings.mode = WindowMode::Windowed,
@@ -485,6 +614,9 @@ fn main() -> Result<(), String> {
             "--large-scene" => large_scene = true,
             "--gi-test" => gi_test_scene = true,
             "--open-world" => open_world = true,
+            "--shadow-test" => shadow_test_scene = true,
+            "--room-test" => room_test_scene = true,
+            "--shadow-isolation" => shadow_isolation = true,
             argument if argument.starts_with("--capture-script=") => settings.debug_script = Some(argument.trim_start_matches("--capture-script=").into()),
             _ => return Err(format!("unknown option: {argument}")),
         }
@@ -504,6 +636,9 @@ fn main() -> Result<(), String> {
             light_slider: None,
             light_lock: None,
             time_slider: None,
+            shadow_quality_slider: None,
+            shadow_bias_slider: None,
+            shadow_filter_slider: None,
             lit_materials_button: None,
             unlit_materials_button: None,
             wireframe_button: None,
@@ -526,6 +661,9 @@ fn main() -> Result<(), String> {
             large_scene,
             gi_test_scene,
             open_world,
+            shadow_test_scene,
+            room_test_scene,
+            shadow_isolation,
         },
     )
 }

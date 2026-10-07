@@ -11,6 +11,8 @@ pub enum CaptureRenderMode {
     Lit,
     Unlit,
     Wireframe,
+    ShadowVisibility,
+    GiOnly,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +32,9 @@ impl Default for CaptureSettings {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaptureAction {
     SetRenderEffects { shadows: bool, irradiance: bool, gizmos: bool },
+    SetAmbientOcclusion(bool),
+    SetDirectLightVisibility(bool),
+    SetShadowQuality(u8),
     SetRenderMode(CaptureRenderMode),
     SetUiEnabled(bool),
     SetCamera(CameraPose),
@@ -91,6 +96,29 @@ impl ScriptBuilder {
         self.plan.actions.push(CaptureAction::SetRenderEffects { shadows, irradiance, gizmos });
     }
 
+    fn set_ambient_occlusion(&mut self, enabled: bool) {
+        if self.capabilities.capture {
+            self.plan.actions.push(CaptureAction::SetAmbientOcclusion(enabled));
+        }
+    }
+
+    fn set_direct_light_visibility(&mut self, enabled: bool) {
+        if self.capabilities.capture {
+            self.plan.actions.push(CaptureAction::SetDirectLightVisibility(enabled));
+        }
+    }
+
+    fn set_shadow_quality(&mut self, quality: i64) -> Result<(), Box<rhai::EvalAltResult>> {
+        if !self.capabilities.capture {
+            return Ok(());
+        }
+        if !(0..=3).contains(&quality) {
+            return Err("shadow quality must be 0 (low), 1 (medium), 2 (high), or 3 (ultra)".into());
+        }
+        self.plan.actions.push(CaptureAction::SetShadowQuality(quality as u8));
+        Ok(())
+    }
+
     fn set_render_mode(&mut self, mode: String) -> Result<(), Box<rhai::EvalAltResult>> {
         if !self.capabilities.capture {
             return Ok(());
@@ -99,7 +127,9 @@ impl ScriptBuilder {
             "lit" => CaptureRenderMode::Lit,
             "unlit" => CaptureRenderMode::Unlit,
             "wireframe" => CaptureRenderMode::Wireframe,
-            _ => return Err("render mode must be lit, unlit, or wireframe".into()),
+            "shadow_visibility" | "shadows" => CaptureRenderMode::ShadowVisibility,
+            "gi_only" | "gi" => CaptureRenderMode::GiOnly,
+            _ => return Err("render mode must be lit, unlit, wireframe, shadow_visibility, or gi_only".into()),
         };
         self.plan.actions.push(CaptureAction::SetRenderMode(mode));
         Ok(())
@@ -181,6 +211,9 @@ pub fn compile_capture_script_with_capabilities(source: &str, capabilities: Scri
     engine.register_fn("configure", ScriptBuilder::configure);
     engine.register_fn("set_camera", ScriptBuilder::set_camera);
     engine.register_fn("set_render_effects", ScriptBuilder::set_render_effects);
+    engine.register_fn("set_ambient_occlusion", ScriptBuilder::set_ambient_occlusion);
+    engine.register_fn("set_direct_light_visibility", ScriptBuilder::set_direct_light_visibility);
+    engine.register_fn("set_shadow_quality", ScriptBuilder::set_shadow_quality);
     engine.register_fn("set_render_mode", ScriptBuilder::set_render_mode);
     engine.register_fn("set_ui_enabled", ScriptBuilder::set_ui_enabled);
     engine.register_fn("move_camera", ScriptBuilder::move_camera);
@@ -215,6 +248,7 @@ mod tests {
         let plan = compile_capture_script(
             r#"
                 capture.configure(640, 360, "captures/test", false);
+                capture.set_shadow_quality(0);
                 capture.set_camera([3.0, 2.0, 4.0], [0.0, 0.5, 0.0]);
                 capture.screenshot("start");
                 capture.wait(0.25);
@@ -226,7 +260,8 @@ mod tests {
         )
         .expect("script should compile");
         assert_eq!(plan.settings.width, 640);
-        assert_eq!(plan.actions.len(), 11);
+        assert_eq!(plan.actions.len(), 12);
+        assert!(matches!(plan.actions[0], CaptureAction::SetShadowQuality(0)));
         assert!(matches!(plan.actions.last(), Some(CaptureAction::Exit)));
     }
 }
