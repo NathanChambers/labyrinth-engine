@@ -80,6 +80,13 @@ impl Scene {
         self.lights.get(light.0)
     }
 
+    pub fn get_point_light_mut(&mut self, light: LightId) -> Option<&mut PointLight> {
+        match self.lights.get_mut(light.0) {
+            Some(Light::Point(light)) => Some(light),
+            _ => None,
+        }
+    }
+
     pub fn get_directional_light_mut(&mut self, light: LightId) -> Option<&mut DirectionalLight> {
         match self.lights.get_mut(light.0) {
             Some(Light::Directional(light)) => Some(light),

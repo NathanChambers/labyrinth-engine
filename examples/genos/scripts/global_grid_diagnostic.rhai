@@ -1,0 +1,11 @@
+capture.configure(1280, 720, "genos-global-grid", false);
+capture.set_render_effects(false, true, false);
+capture.set_camera([12.5, 2.1, 27.0], [12.5, 1.2, 18.0]);
+capture.set_render_mode("gi_only");
+capture.screenshot("corridor_global_grid");
+capture.set_render_mode("lit");
+capture.screenshot("corridor_global_grid_lit");
+capture.set_render_mode("gi_only");
+capture.set_camera([12.5, 5.0, 24.0], [12.5, 0.0, 20.0]);
+capture.screenshot("overhead_global_grid");
+capture.exit();

@@ -25,7 +25,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 pub use capture::DebugCapture;
 pub use font::FontAsset;
-pub use gi::{IrradianceVolume, IrradianceVolumeDesc, IrradianceVolumeId, IrradianceVolumes};
+pub use gi::{IrradianceClipmapDesc, IrradianceClipmapLevel, IrradianceMode, IrradianceVolume, IrradianceVolumeDesc, IrradianceVolumeId, IrradianceVolumes};
 pub use gizmo::{GizmoCanvas, GizmoVertex};
 pub use input::InputState;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
@@ -78,11 +78,22 @@ pub struct RuntimeContext {
     pub active_camera: Option<CameraId>,
     pub active_lights: Vec<LightId>,
     pub irradiance_volumes: IrradianceVolumes,
+    pub irradiance_mode: IrradianceMode,
+    pub irradiance_clipmap: IrradianceClipmapDesc,
     pub irradiance_update_budget: usize,
     pub sky_lighting: RendererSkyLighting,
     pub performance_stats: RendererPerformanceStats,
     pub gizmos: GizmoCanvas,
     pub gizmos_enabled: bool,
+    pub normal_gizmos_enabled: bool,
+    pub light_gizmos_enabled: bool,
+    pub gi_global_gizmos_enabled: bool,
+    pub gi_gizmos_enabled: bool,
+    pub gi_trace_gizmos_enabled: bool,
+    pub gi_selected_radiance_cell: [u32; 3],
+    pub gi_selected_radiance_field_far: bool,
+    pub sdf_occupancy_gizmos_enabled: bool,
+    pub freeze_gi_radiance: bool,
     pub ui_enabled: bool,
     pub render_debug_mode: RenderDebugMode,
     pub render_settings: RenderSettings,
@@ -99,11 +110,22 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         active_camera: None,
         active_lights: Vec::new(),
         irradiance_volumes: IrradianceVolumes::default(),
+        irradiance_mode: IrradianceMode::default(),
+        irradiance_clipmap: IrradianceClipmapDesc::default(),
         irradiance_update_budget: 8,
         sky_lighting: RendererSkyLighting::default(),
         performance_stats: RendererPerformanceStats::default(),
         gizmos: GizmoCanvas::default(),
-        gizmos_enabled: true,
+        gizmos_enabled: false,
+        normal_gizmos_enabled: false,
+        light_gizmos_enabled: false,
+        gi_global_gizmos_enabled: false,
+        gi_gizmos_enabled: false,
+        gi_trace_gizmos_enabled: false,
+        gi_selected_radiance_cell: [4, 1, 4],
+        gi_selected_radiance_field_far: false,
+        sdf_occupancy_gizmos_enabled: false,
+        freeze_gi_radiance: false,
         ui_enabled: true,
         render_debug_mode: RenderDebugMode::default(),
         render_settings: RenderSettings::default(),
@@ -134,16 +156,30 @@ struct Runner<A> {
     failure: Option<String>,
 }
 
-fn renderer_irradiance_volumes(volumes: &IrradianceVolumes) -> Vec<RendererIrradianceVolume> {
-    volumes
-        .iter()
-        .map(|(_, volume)| RendererIrradianceVolume {
-            minimum: volume.desc.minimum.to_array(),
-            maximum: volume.desc.maximum.to_array(),
-            resolution: volume.desc.resolution,
-            enabled: volume.desc.enabled,
-        })
-        .collect()
+fn renderer_irradiance_volumes(volumes: &IrradianceVolumes, mode: IrradianceMode, clipmap: IrradianceClipmapDesc, camera: &Camera) -> Vec<RendererIrradianceVolume> {
+    let clipmap_level_count = if matches!(mode, IrradianceMode::Clipmap | IrradianceMode::Combined) { clipmap.active_level_count() } else { 0 };
+    let authored_limit = if mode == IrradianceMode::Combined { 4 - clipmap_level_count } else { 4 };
+    let mut renderer_volumes = if matches!(mode, IrradianceMode::Volumes | IrradianceMode::Combined) {
+        volumes
+            .iter()
+            .filter(|(_, volume)| volume.desc.enabled)
+            .take(authored_limit)
+            .map(|(_, volume)| RendererIrradianceVolume {
+                minimum: volume.desc.minimum.to_array(),
+                maximum: volume.desc.maximum.to_array(),
+                resolution: volume.desc.resolution,
+                enabled: volume.desc.enabled,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if matches!(mode, IrradianceMode::Clipmap | IrradianceMode::Combined) {
+        for volume in clipmap.volumes_at(camera.transform.position).into_iter().take(clipmap_level_count) {
+            renderer_volumes.push(RendererIrradianceVolume { minimum: volume.minimum.to_array(), maximum: volume.maximum.to_array(), resolution: volume.resolution, enabled: true });
+        }
+    }
+    renderer_volumes
 }
 
 impl<A> Runner<A> {
@@ -196,7 +232,7 @@ where
             None => return self.fail(event_loop, "no active camera is assigned".into()),
         };
         let lights = self.context.active_lights.iter().filter_map(|id| self.context.scene.get_light(*id)).copied().collect::<Vec<_>>();
-        let irradiance_volumes = renderer_irradiance_volumes(&self.context.irradiance_volumes);
+        let irradiance_volumes = renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera);
         let renderer = match Renderer::new(window.clone(), self.settings.graphics_api, camera, &lights, self.context.scene.instances(), &irradiance_volumes) {
             Ok(renderer) => renderer,
             Err(error) => return self.fail(event_loop, error),
@@ -335,21 +371,38 @@ where
                     let ui_vertices = if self.context.ui_enabled { self.context.ui.vertices(size.width.max(1), size.height.max(1)) } else { Vec::new() };
                     let capture_without_gizmos = self.context.debug_capture.as_ref().is_some_and(DebugCapture::has_pending_capture);
                     self.context.gizmos.clear();
+                    let camera = self.context.active_camera.and_then(|id| self.context.scene.get_camera(id));
+                    let clipmaps = camera
+                        .map(|camera| self.context.irradiance_clipmap.volumes_at(camera.transform.position).into_iter().take(self.context.irradiance_clipmap.active_level_count()).collect::<Vec<_>>())
+                        .unwrap_or_default();
                     if !capture_without_gizmos && self.context.gizmos_enabled {
-                        self.context.irradiance_volumes.draw_debug_gizmos(&mut self.context.gizmos);
-                        self.context.gizmos.lights(self.context.scene.lights());
-                        self.context.gizmos.mesh_normals(self.context.scene.instances(), 0.18);
+                        if self.context.gi_global_gizmos_enabled {
+                            self.context.irradiance_volumes.draw_debug_gizmos_for_mode(&mut self.context.gizmos, self.context.irradiance_mode, &clipmaps);
+                        }
+                        if self.context.light_gizmos_enabled {
+                            self.context.gizmos.lights(self.context.scene.lights());
+                        }
+                        if self.context.normal_gizmos_enabled {
+                            self.context.gizmos.mesh_normals(self.context.scene.instances(), 0.18);
+                        }
                     }
                     let gizmo_vertices =
                         self.context.gizmos.vertices().iter().map(|vertex| RendererGizmoVertex { position: vertex.position.to_array(), color: vertex.color.to_array() }).collect::<Vec<_>>();
-                    let irradiance_volumes = renderer_irradiance_volumes(&self.context.irradiance_volumes);
+                    let irradiance_volumes =
+                        camera.map(|camera| renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera)).unwrap_or_default();
                     let result = result.and_then(|_| renderer.update_lights(&lights)).and_then(|_| renderer.update_instances(self.context.scene.instances())).and_then(|_| {
                         renderer.set_irradiance_update_budget(self.context.irradiance_update_budget);
                         renderer.update_render_settings(self.context.render_settings);
                         renderer.update_sky_lighting(self.context.sky_lighting);
-                        renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights);
+                        renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights, self.context.irradiance_mode == IrradianceMode::AabbSdf);
                         self.context.performance_stats = renderer.performance_stats();
                         renderer.update_render_debug_mode(self.context.render_debug_mode);
+                        renderer.set_surface_probe_gizmos_enabled(self.context.gi_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
+                        renderer.set_gi_radiance_frozen(self.context.freeze_gi_radiance);
+                        renderer.set_world_radiance_gizmos_enabled(self.context.gi_global_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
+                        renderer.set_world_radiance_trace_gizmos_enabled(self.context.gi_trace_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
+                        renderer.set_selected_radiance_cell(self.context.gi_selected_radiance_cell, self.context.gi_selected_radiance_field_far);
+                        renderer.set_sdf_occupancy_gizmos_enabled(self.context.sdf_occupancy_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.update_gizmos(&gizmo_vertices);
                         renderer.update_ui(&ui_vertices);
                         renderer.render()

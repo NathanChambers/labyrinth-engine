@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::mem;
 use std::ops::Range;
@@ -21,9 +21,20 @@ const SHADOW_MAP_SIZE: u32 = 4096;
 const SPOT_SHADOW_MAP_SIZE: u32 = 2048;
 const SHADOW_CASCADE_COUNT: usize = 3;
 const MAX_IRRADIANCE_VOLUMES: usize = 4;
-const MAX_IRRADIANCE_PROBES: usize = 1024;
+const MAX_IRRADIANCE_PROBES: usize = 4096;
+const PROBE_SURFACE_SAMPLE_SCALE: f32 = 1.25;
 const VISIBILITY_REBUILD_INTERVAL: u32 = 4;
-const GPU_TIMESTAMP_COUNT: u32 = 10;
+const GPU_TIMESTAMP_COUNT: u32 = 12;
+const SDF_CLIPMAP_RESOLUTION: [u32; 3] = [64, 32, 64];
+const SDF_CLIPMAP_EXTENT: Vec3 = Vec3::new(32.0, 16.0, 32.0);
+const SDF_MAX_DISTANCE: f32 = 16.0;
+const RADIANCE_FIELD_RESOLUTION: [u32; 3] = [8, 4, 8];
+const SURFACE_PROBE_STRIDE: u32 = 16;
+const SURFACE_PROBE_CAPACITY: u32 = 131_072;
+const RADIANCE_NEAR_FIELD_EXTENT: Vec3 = Vec3::new(16.0, 8.0, 16.0);
+const RADIANCE_FAR_FIELD_EXTENT: Vec3 = SDF_CLIPMAP_EXTENT;
+const RADIANCE_FIELD_DIRECTIONS: usize = 6;
+const RADIANCE_FIELD_REFRESH_INTERVAL: u32 = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -238,7 +249,9 @@ pub struct RenderSettings {
     pub shadows_enabled: bool,
     pub contact_shadows_enabled: bool,
     pub ambient_occlusion_enabled: bool,
+    pub ambient_intensity: f32,
     pub irradiance_enabled: bool,
+    pub surface_probes_enabled: bool,
     pub shadow_cascade_count: u32,
     pub shadow_resolution: u32,
     pub shadow_depth_bias: f32,
@@ -255,7 +268,9 @@ impl Default for RenderSettings {
             shadows_enabled: true,
             contact_shadows_enabled: false,
             ambient_occlusion_enabled: false,
+            ambient_intensity: 0.02,
             irradiance_enabled: true,
+            surface_probes_enabled: true,
             shadow_cascade_count: SHADOW_CASCADE_COUNT as u32,
             shadow_resolution: SHADOW_MAP_SIZE,
             shadow_depth_bias: 0.00005,
@@ -294,6 +309,7 @@ struct RendererMeshVertex {
     material_base_color: [f32; 4],
     material_params: [f32; 4],
     material_emission: [f32; 4],
+    surface_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -320,6 +336,7 @@ impl GraphicsApi {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_projection: [[f32; 4]; 4],
+    inverse_view_projection: [[f32; 4]; 4],
     view: [[f32; 4]; 4],
     shadow_view_projection: [[[f32; 4]; 4]; SHADOW_CASCADE_COUNT],
     shadow_cascade_splits: [f32; 4],
@@ -339,6 +356,15 @@ struct CameraUniform {
     shadow_settings: [f32; 4],
     viewport_size: [f32; 4],
     shadow_flags: [u32; 4],
+    ambient_light: [f32; 4],
+    gi_settings: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SurfaceProbeUniform {
+    screen_resolution: [u32; 4],
+    cache_settings: [u32; 4],
 }
 
 #[repr(C)]
@@ -357,7 +383,92 @@ struct IrradianceUniform {
     volumes: [IrradianceVolumeUniform; MAX_IRRADIANCE_VOLUMES],
     probes: [[f32; 4]; MAX_IRRADIANCE_PROBES],
     directions: [[f32; 4]; MAX_IRRADIANCE_PROBES],
+    probe_positions: [[f32; 4]; MAX_IRRADIANCE_PROBES],
     volume_count: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SdfClipmapUniform {
+    minimum: [f32; 4],
+    maximum: [f32; 4],
+    resolution: [u32; 4],
+    settings: [u32; 4],
+    grid_offset: [u32; 4],
+    sky_radiance: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RadianceFieldUniform {
+    minimum: [f32; 4],
+    maximum: [f32; 4],
+    resolution: [u32; 4],
+    grid_offset: [u32; 4],
+    scroll_shift: [i32; 4],
+    settings: [u32; 4],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct SdfGeometry {
+    bounds: GeometryBounds,
+    albedo: Vec3,
+    emission: Vec3,
+}
+
+struct SdfClipmap {
+    minimum: Vec3,
+    maximum: Vec3,
+    voxel_size: Vec3,
+    values: Vec<[f32; 4]>,
+    emission_values: Vec<[f32; 4]>,
+    geometry_bounds: Vec<SdfGeometry>,
+    geometry_bvh: SdfGeometryBvh,
+    grid_offset: [u32; 3],
+}
+
+struct SdfGeometryBvh {
+    geometries: Vec<SdfGeometry>,
+    geometry_indices: Vec<usize>,
+    nodes: Vec<SdfBvhNode>,
+}
+
+#[derive(Clone, Copy)]
+struct SdfBvhNode {
+    bounds: GeometryBounds,
+    left: usize,
+    right: usize,
+    start: usize,
+    count: usize,
+}
+
+struct WorldRadianceField {
+    extent: Vec3,
+    resolution: [u32; 3],
+    minimum: Vec3,
+    maximum: Vec3,
+    cell_size: Vec3,
+    grid_offset: [u32; 3],
+    frame_index: u32,
+    refresh_frames_remaining: u32,
+    needs_full_refresh: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SdfTextureRegion {
+    origin: [u32; 3],
+    size: [u32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct SdfLogicalRegion {
+    start: [u32; 3],
+    size: [u32; 3],
+}
+
+struct SdfClipmapUpdate {
+    texture_regions: Vec<SdfTextureRegion>,
+    voxels_updated: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -379,6 +490,10 @@ pub struct RendererPerformanceStats {
     pub frame_cpu_ms: f32,
     pub light_update_ms: f32,
     pub instance_update_ms: f32,
+    pub sdf_build_cpu_ms: f32,
+    pub sdf_upload_ms: f32,
+    pub sdf_voxels_updated: u32,
+    pub gi_history_valid_percent: f32,
     pub probe_update_ms: f32,
     pub irradiance_upload_ms: f32,
     pub visibility_rebuild_ms: f32,
@@ -389,6 +504,7 @@ pub struct RendererPerformanceStats {
     pub region_count: u32,
     pub gpu_shadow_ms: f32,
     pub gpu_scene_ms: f32,
+    pub gpu_sdf_gi_ms: f32,
     pub gpu_gizmo_ms: f32,
     pub gpu_ui_ms: f32,
     pub gpu_total_ms: f32,
@@ -457,18 +573,43 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    radiance_field_pipeline: wgpu::ComputePipeline,
+    surface_probe_update_pipeline: wgpu::ComputePipeline,
+    surface_probe_maintenance_pipeline: wgpu::ComputePipeline,
     depth_prepass_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
+    gi_gizmo_pipeline: wgpu::RenderPipeline,
+    sdf_occupancy_gizmo_pipeline: wgpu::RenderPipeline,
+    gi_gizmo_bind_group: wgpu::BindGroup,
+    gi_gizmo_selection_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    mesh_topology_signature: u64,
+    instance_signatures: Vec<u64>,
     wireframe_index_buffer: wgpu::Buffer,
     wireframe_index_count: u32,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     irradiance_buffer: wgpu::Buffer,
-    irradiance_cache: IrradianceUniform,
+    irradiance_cache: Box<IrradianceUniform>,
     irradiance_volume_layout: Vec<RendererIrradianceVolume>,
+    sdf_clipmap: SdfClipmap,
+    sdf_geometry_cache: Vec<SdfGeometry>,
+    sdf_uniform_buffer: wgpu::Buffer,
+    _sdf_texture: wgpu::Texture,
+    _sdf_emission_texture: wgpu::Texture,
+    near_radiance_field: WorldRadianceField,
+    far_radiance_field: WorldRadianceField,
+    near_radiance_field_uniform_buffer: wgpu::Buffer,
+    far_radiance_field_uniform_buffer: wgpu::Buffer,
+    _near_radiance_field_buffer: wgpu::Buffer,
+    _far_radiance_field_buffer: wgpu::Buffer,
+    _radiance_field_trace_debug_buffer: wgpu::Buffer,
+    surface_probe_uniform_buffer: wgpu::Buffer,
+    _surface_probe_buffer: wgpu::Buffer,
+    sdf_gi_enabled: bool,
+    gi_radiance_frozen: bool,
     irradiance_probe_ages: [u32; MAX_IRRADIANCE_PROBES],
     irradiance_update_budget: usize,
     sky_lighting: RendererSkyLighting,
@@ -480,6 +621,7 @@ pub struct Renderer {
     static_probe_signature: u64,
     shadow_bounds: GeometryBounds,
     performance_stats: RendererPerformanceStats,
+    frame_index: u32,
     shadow_scheduler: ShadowScheduler,
     shadow_resources: ShadowResourceTable,
     shadow_pipeline: wgpu::RenderPipeline,
@@ -506,6 +648,10 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     _depth_sample_texture: wgpu::Texture,
     depth_sample_view: wgpu::TextureView,
+    _surface_normal_texture: wgpu::Texture,
+    surface_normal_view: wgpu::TextureView,
+    _surface_id_texture: wgpu::Texture,
+    surface_id_view: wgpu::TextureView,
     depth_bind_group_layout: wgpu::BindGroupLayout,
     depth_bind_group: wgpu::BindGroup,
     _depth_sampler: wgpu::Sampler,
@@ -520,6 +666,12 @@ pub struct Renderer {
     gizmo_vertex_buffer: wgpu::Buffer,
     gizmo_vertex_capacity: usize,
     gizmo_vertex_count: u32,
+    surface_probe_gizmos_enabled: bool,
+    world_radiance_gizmos_enabled: bool,
+    world_radiance_trace_gizmos_enabled: bool,
+    selected_radiance_cell: [u32; 3],
+    selected_radiance_field_far: bool,
+    sdf_occupancy_gizmos_enabled: bool,
     render_debug_mode: RenderDebugMode,
     render_settings: RenderSettings,
     gpu_timestamps: Option<GpuTimestampState>,
@@ -643,7 +795,7 @@ impl Renderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Uint32],
                 })],
                 compilation_options: Default::default(),
             },
@@ -734,7 +886,7 @@ impl Renderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Uint32],
                 })],
                 compilation_options: Default::default(),
             },
@@ -761,16 +913,109 @@ impl Renderer {
         let sky_lighting = RendererSkyLighting::default();
         let visibility_bounds = geometry_bounds(instances);
         let visibility_grid = VisibilityGrid::from_bounds(&visibility_bounds);
+        let sdf_geometries = sdf_geometries(instances);
+        let sdf_clipmap = SdfClipmap::new(camera.transform.position, &sdf_geometries);
+        let sdf_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("AABB SDF geometry and albedo clipmap"),
+            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let sdf_view = sdf_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
+        let sdf_emission_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("AABB SDF emission clipmap"),
+            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let sdf_emission_view = sdf_emission_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
+        let near_radiance_field = WorldRadianceField::new(camera.transform.position, RADIANCE_NEAR_FIELD_EXTENT, RADIANCE_FIELD_RESOLUTION);
+        let far_radiance_field = WorldRadianceField::new(camera.transform.position, RADIANCE_FAR_FIELD_EXTENT, RADIANCE_FIELD_RESOLUTION);
+        let radiance_field_uniform = RadianceFieldUniform::zeroed();
+        let near_radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("near world radiance field uniform"),
+            contents: bytemuck::bytes_of(&radiance_field_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let far_radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("far world radiance field uniform"),
+            contents: bytemuck::bytes_of(&radiance_field_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let radiance_field_values = vec![[0.0_f32; 4]; RADIANCE_FIELD_RESOLUTION.iter().product::<u32>() as usize * RADIANCE_FIELD_DIRECTIONS];
+        let near_radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("near world radiance field directional lobes"),
+            contents: bytemuck::cast_slice(&radiance_field_values),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let far_radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("far world radiance field directional lobes"),
+            contents: bytemuck::cast_slice(&radiance_field_values),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let radiance_field_trace_debug_values = vec![[[0.0_f32; 4]; 4]; RADIANCE_FIELD_RESOLUTION.iter().product::<u32>() as usize * RADIANCE_FIELD_DIRECTIONS * 2];
+        let radiance_field_trace_debug_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world radiance field trace diagnostics"),
+            contents: bytemuck::cast_slice(&radiance_field_trace_debug_values),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let gi_gizmo_selection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("selected GI radiance cell"),
+            contents: bytemuck::cast_slice(&[4_u32, 1, 4, 0]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let surface_probe_uniform = SurfaceProbeUniform {
+            screen_resolution: [width.div_ceil(SURFACE_PROBE_STRIDE), height.div_ceil(SURFACE_PROBE_STRIDE), width, height],
+            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, 0],
+        };
+        let surface_probe_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("surface probe update settings"),
+            contents: bytemuck::bytes_of(&surface_probe_uniform),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let surface_probe_data = vec![[0u32; 16]; SURFACE_PROBE_CAPACITY as usize];
+        let surface_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("persistent world surface probes"),
+            contents: bytemuck::cast_slice(&surface_probe_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &sdf_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&sdf_clipmap.values),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 16), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
+            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+        );
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &sdf_emission_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&sdf_clipmap.emission_values),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 16), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
+            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+        );
+        let sdf_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SDF clipmap uniform"),
+            contents: bytemuck::bytes_of(&sdf_clipmap.uniform(false, sky_lighting)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let (static_probe_samples, dynamic_probe_samples) = build_probe_samples(instances, true);
         let static_probe_signature = static_probe_signature(instances);
-        let initial_irradiance = irradiance_uniform(irradiance_volumes, &static_probe_samples, &dynamic_probe_samples, lights, sky_lighting, &visibility_grid);
+        let initial_irradiance = Box::new(irradiance_uniform(irradiance_volumes, &static_probe_samples, &dynamic_probe_samples, lights, sky_lighting, &visibility_grid, true));
         let irradiance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("irradiance probes"),
-            contents: bytemuck::bytes_of(&initial_irradiance),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            contents: bytemuck::bytes_of(initial_irradiance.as_ref()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let (depth_texture, depth_view) = create_depth_texture(&device, width, height);
         let (depth_sample_texture, depth_sample_view) = create_depth_sample_texture(&device, width, height);
+        let (surface_normal_texture, surface_normal_view) = create_surface_normal_texture(&device, width, height);
+        let (surface_id_texture, surface_id_view) = create_surface_id_texture(&device, width, height);
         let depth_sampler =
             device.create_sampler(&wgpu::SamplerDescriptor { label: Some("scene depth sampler"), mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest, ..Default::default() });
         let depth_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -778,11 +1023,23 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let depth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -791,6 +1048,8 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_sample_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&depth_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&surface_normal_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_id_view) },
             ],
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -798,7 +1057,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
@@ -812,7 +1071,7 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -829,6 +1088,66 @@ impl Renderer {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry { binding: 7, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -843,6 +1162,97 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&spot_shadow_sampler) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&point_shadow_array_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&spot_shadow_sampler) },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&sdf_view) },
+                wgpu::BindGroupEntry { binding: 9, resource: sdf_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sdf_emission_view) },
+                wgpu::BindGroupEntry { binding: 11, resource: near_radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: near_radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: far_radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: far_radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: surface_probe_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: surface_probe_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
+            ],
+        });
+        let gi_gizmo_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GI gizmo read-only layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 21,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let gi_gizmo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GI gizmo read-only resources"),
+            layout: &gi_gizmo_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&sdf_view) },
+                wgpu::BindGroupEntry { binding: 9, resource: sdf_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: near_radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: near_radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: far_radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: far_radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: surface_probe_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 21, resource: gi_gizmo_selection_buffer.as_entire_binding() },
             ],
         });
 
@@ -855,7 +1265,7 @@ impl Renderer {
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Uint32],
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene pipeline"),
@@ -877,6 +1287,35 @@ impl Renderer {
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
+            cache: None,
+        });
+        let radiance_field_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("world radiance field compute pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&depth_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let radiance_field_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("world radiance field update pipeline"),
+            layout: Some(&radiance_field_pipeline_layout),
+            module: &shader,
+            entry_point: Some("update_world_radiance_field"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let surface_probe_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("screen seeded surface probe update pipeline"),
+            layout: Some(&radiance_field_pipeline_layout),
+            module: &shader,
+            entry_point: Some("update_surface_probes"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let surface_probe_maintenance_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("surface probe aging pipeline"),
+            layout: Some(&radiance_field_pipeline_layout),
+            module: &shader,
+            entry_point: Some("age_surface_probes"),
+            compilation_options: Default::default(),
             cache: None,
         });
         let wireframe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -918,7 +1357,15 @@ impl Renderer {
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            fragment: None,
+            fragment: Some(wgpu::FragmentState {
+                module: &depth_shader,
+                entry_point: Some("fragment_main"),
+                targets: &[
+                    Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                    Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Uint, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                ],
+                compilation_options: Default::default(),
+            }),
             multiview_mask: None,
             cache: None,
         });
@@ -982,6 +1429,57 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let gi_gizmo_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("GI cache gizmo shader"), source: wgpu::ShaderSource::Wgsl(include_str!("gi_gizmo.wgsl").into()) });
+        let gi_gizmo_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("GI cache gizmo pipeline layout"),
+            bind_group_layouts: &[Some(&gi_gizmo_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let gi_gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("GI cache gizmo pipeline"),
+            layout: Some(&gi_gizmo_pipeline_layout),
+            vertex: wgpu::VertexState { module: &gi_gizmo_shader, entry_point: Some("vertex_main"), buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &gi_gizmo_shader,
+                entry_point: Some("fragment_main"),
+                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sdf_occupancy_gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SDF occupancy gizmo pipeline"),
+            layout: Some(&gi_gizmo_pipeline_layout),
+            vertex: wgpu::VertexState { module: &gi_gizmo_shader, entry_point: Some("occupancy_vertex_main"), buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &gi_gizmo_shader,
+                entry_point: Some("fragment_main"),
+                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vertices"),
@@ -1014,11 +1512,18 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            radiance_field_pipeline,
+            surface_probe_update_pipeline,
+            surface_probe_maintenance_pipeline,
             depth_prepass_pipeline,
             wireframe_pipeline,
+            gi_gizmo_pipeline,
+            sdf_occupancy_gizmo_pipeline,
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
+            mesh_topology_signature: mesh_topology_signature(instances),
+            instance_signatures: instances.iter().map(mesh_instance_signature).collect(),
             wireframe_index_buffer,
             wireframe_index_count: wireframe_indices.len() as u32,
             camera_buffer,
@@ -1026,6 +1531,22 @@ impl Renderer {
             irradiance_buffer,
             irradiance_cache: initial_irradiance,
             irradiance_volume_layout: irradiance_volumes.to_vec(),
+            sdf_clipmap,
+            sdf_geometry_cache: sdf_geometries,
+            sdf_uniform_buffer,
+            _sdf_texture: sdf_texture,
+            _sdf_emission_texture: sdf_emission_texture,
+            near_radiance_field,
+            far_radiance_field,
+            near_radiance_field_uniform_buffer,
+            far_radiance_field_uniform_buffer,
+            _near_radiance_field_buffer: near_radiance_field_buffer,
+            _far_radiance_field_buffer: far_radiance_field_buffer,
+            _radiance_field_trace_debug_buffer: radiance_field_trace_debug_buffer,
+            surface_probe_uniform_buffer,
+            _surface_probe_buffer: surface_probe_buffer,
+            sdf_gi_enabled: false,
+            gi_radiance_frozen: false,
             irradiance_probe_ages: [0; MAX_IRRADIANCE_PROBES],
             irradiance_update_budget: 8,
             sky_lighting,
@@ -1037,6 +1558,7 @@ impl Renderer {
             static_probe_signature,
             shadow_bounds,
             performance_stats: RendererPerformanceStats::default(),
+            frame_index: 0,
             shadow_scheduler: {
                 let mut scheduler = ShadowScheduler::default();
                 scheduler.rebuild(lights, camera, RenderSettings::default().shadow_budget);
@@ -1067,6 +1589,10 @@ impl Renderer {
             depth_view,
             _depth_sample_texture: depth_sample_texture,
             depth_sample_view,
+            _surface_normal_texture: surface_normal_texture,
+            surface_normal_view,
+            _surface_id_texture: surface_id_texture,
+            surface_id_view,
             depth_bind_group_layout,
             depth_bind_group,
             _depth_sampler: depth_sampler,
@@ -1078,9 +1604,17 @@ impl Renderer {
             ui_vertex_capacity: 6,
             ui_vertex_count: 0,
             gizmo_pipeline,
+            gi_gizmo_bind_group,
+            gi_gizmo_selection_buffer,
             gizmo_vertex_buffer,
             gizmo_vertex_capacity: 2,
             gizmo_vertex_count: 0,
+            surface_probe_gizmos_enabled: false,
+            world_radiance_gizmos_enabled: false,
+            world_radiance_trace_gizmos_enabled: false,
+            selected_radiance_cell: [4, 1, 4],
+            selected_radiance_field_far: false,
+            sdf_occupancy_gizmos_enabled: false,
             render_debug_mode: RenderDebugMode::default(),
             render_settings: RenderSettings::default(),
             gpu_timestamps,
@@ -1089,13 +1623,56 @@ impl Renderer {
 
     pub fn update_instances(&mut self, instances: &[MeshInstance]) -> Result<(), String> {
         let update_start = Instant::now();
-        let (vertices, indices) = flatten_instances(instances)?;
-        if indices.len() as u32 != self.index_count || vertices.len() * mem::size_of::<RendererMeshVertex>() != self.vertex_buffer.size() as usize {
-            return Err("mesh topology cannot change after renderer initialization".into());
+        if instances.is_empty() || instances.iter().any(|instance| instance.mesh.is_empty()) {
+            return Err("renderer requires nonempty mesh instances".into());
         }
-        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        let wireframe_indices = wireframe_indices(&indices);
-        self.queue.write_buffer(&self.wireframe_index_buffer, 0, bytemuck::cast_slice(&wireframe_indices));
+        let topology_signature = mesh_topology_signature(instances);
+        let instance_signatures = instances.iter().map(mesh_instance_signature).collect::<Vec<_>>();
+        let topology_changed = topology_signature != self.mesh_topology_signature
+            || instances.iter().map(|instance| instance.mesh.indices().len()).sum::<usize>() as u32 != self.index_count
+            || instances.iter().map(|instance| instance.mesh.vertices().len()).sum::<usize>() * mem::size_of::<RendererMeshVertex>() != self.vertex_buffer.size() as usize;
+        let instances_changed = instance_signatures != self.instance_signatures;
+        if !topology_changed && !instances_changed {
+            self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
+            return Ok(());
+        }
+        if topology_changed {
+            let (vertices, indices) = flatten_instances(instances)?;
+            self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+            self.index_buffer =
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: bytemuck::cast_slice(&indices), usage: wgpu::BufferUsages::INDEX });
+            self.index_count = indices.len() as u32;
+            self.mesh_topology_signature = topology_signature;
+            self.instance_signatures = instance_signatures;
+            let wireframe_indices = wireframe_indices(&indices);
+            self.wireframe_index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("wireframe indices"),
+                contents: bytemuck::cast_slice(&wireframe_indices),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            });
+            self.wireframe_index_count = wireframe_indices.len() as u32;
+            (self.shadow_draw_ranges, self.shadow_caster_bounds) = shadow_draw_data(instances);
+            self.shadow_bounds = combined_geometry_bounds(&geometry_bounds(instances));
+            self.visibility_bounds.clear();
+            self.visibility_rebuild_cooldown = 0;
+        } else {
+            let mut vertex_offset = 0_usize;
+            for (instance_index, instance) in instances.iter().enumerate() {
+                if instance_signatures[instance_index] != self.instance_signatures[instance_index] {
+                    let vertices = flatten_instance(instance, instance_index);
+                    let byte_offset = (vertex_offset * mem::size_of::<RendererMeshVertex>()) as u64;
+                    self.queue.write_buffer(&self.vertex_buffer, byte_offset, bytemuck::cast_slice(&vertices));
+                }
+                vertex_offset += instance.mesh.vertices().len();
+            }
+            self.instance_signatures = instance_signatures;
+            self.shadow_caster_bounds = geometry_bounds(instances);
+            self.shadow_bounds = combined_geometry_bounds(&self.shadow_caster_bounds);
+        }
         self.shadow_scheduler.mark_all_dirty();
         let signature = static_probe_signature(instances);
         if signature != self.static_probe_signature {
@@ -1106,6 +1683,7 @@ impl Renderer {
         } else {
             self.dynamic_probe_samples = build_dynamic_probe_samples(instances);
         }
+        self.sdf_geometry_cache = sdf_geometries(instances);
         self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
         Ok(())
     }
@@ -1120,20 +1698,34 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
         let (depth_texture, depth_view) = create_depth_texture(&self.device, width, height);
         let (depth_sample_texture, depth_sample_view) = create_depth_sample_texture(&self.device, width, height);
+        let (surface_normal_texture, surface_normal_view) = create_surface_normal_texture(&self.device, width, height);
+        let (surface_id_texture, surface_id_view) = create_surface_id_texture(&self.device, width, height);
         self._depth_texture = depth_texture;
         self.depth_view = depth_view;
         self._depth_sample_texture = depth_sample_texture;
         self.depth_sample_view = depth_sample_view;
+        self._surface_normal_texture = surface_normal_texture;
+        self.surface_normal_view = surface_normal_view;
+        self._surface_id_texture = surface_id_texture;
+        self.surface_id_view = surface_id_view;
         self.depth_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene depth bind group"),
             layout: &self.depth_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.depth_sample_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._depth_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.surface_normal_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.surface_id_view) },
             ],
         });
+        let surface_probe_uniform = SurfaceProbeUniform {
+            screen_resolution: [width.div_ceil(SURFACE_PROBE_STRIDE), height.div_ceil(SURFACE_PROBE_STRIDE), width, height],
+            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, self.packed_surface_probe_frame_index()],
+        };
+        self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&surface_probe_uniform));
         let camera_uniform = camera_uniform(width, height, &self.camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+        self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
     }
 
     pub fn update_camera(&mut self, camera: &Camera) -> Result<(), String> {
@@ -1164,6 +1756,10 @@ impl Renderer {
             return Err(format!("renderer supports at most {MAX_DIRECTIONAL_LIGHTS} directional lights"));
         }
         let previous_lights = self.lights.clone();
+        if previous_lights != lights {
+            self.near_radiance_field.refresh_temporally();
+            self.far_radiance_field.refresh_temporally();
+        }
         self.lights.clear();
         self.lights.extend_from_slice(lights);
         if shadow_geometry_changed(&previous_lights, &self.lights) {
@@ -1200,7 +1796,57 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn update_irradiance_volumes(&mut self, volumes: &[RendererIrradianceVolume], instances: &[MeshInstance], lights: &[Light]) {
+    pub fn update_irradiance_volumes(&mut self, volumes: &[RendererIrradianceVolume], instances: &[MeshInstance], lights: &[Light], sdf_gi_enabled: bool) {
+        if sdf_gi_enabled != self.sdf_gi_enabled {
+            self.sdf_gi_enabled = sdf_gi_enabled;
+            self.near_radiance_field.invalidate();
+            self.far_radiance_field.invalidate();
+        }
+        self.performance_stats.sdf_build_cpu_ms = 0.0;
+        self.performance_stats.sdf_upload_ms = 0.0;
+        self.performance_stats.sdf_voxels_updated = 0;
+        self.performance_stats.gi_history_valid_percent = 0.0;
+        if !sdf_gi_enabled || !self.render_settings.irradiance_enabled {
+            self.performance_stats.gpu_sdf_gi_ms = 0.0;
+        }
+        if sdf_gi_enabled && !self.render_settings.irradiance_enabled {
+            self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(false, self.sky_lighting)));
+            self.performance_stats.probe_update_ms = 0.0;
+            self.performance_stats.irradiance_upload_ms = 0.0;
+            self.performance_stats.visibility_rebuild_ms = 0.0;
+            self.performance_stats.probes_updated = 0;
+            return;
+        }
+        if sdf_gi_enabled {
+            let sdf_build_start = Instant::now();
+            let geometry_changed = self.sdf_clipmap.geometry_bounds != self.sdf_geometry_cache;
+            let sdf_update = self.sdf_clipmap.update(self.camera.transform.position, &self.sdf_geometry_cache);
+            self.performance_stats.sdf_build_cpu_ms = sdf_build_start.elapsed().as_secs_f32() * 1000.0;
+            if geometry_changed {
+                self.near_radiance_field.refresh_temporally();
+                self.far_radiance_field.refresh_temporally();
+            }
+            if let Some(sdf_update) = sdf_update {
+                self.performance_stats.sdf_voxels_updated = sdf_update.voxels_updated;
+                let sdf_upload_start = Instant::now();
+                for region in sdf_update.texture_regions {
+                    upload_sdf_region(&self.queue, &self._sdf_texture, &self.sdf_clipmap.values, region);
+                }
+                upload_sdf_region(&self.queue, &self._sdf_emission_texture, &self.sdf_clipmap.emission_values, SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION });
+                self.performance_stats.sdf_upload_ms = sdf_upload_start.elapsed().as_secs_f32() * 1000.0;
+            }
+            let near_radiance_field_uniform = self.near_radiance_field.uniform(self.camera.transform.position);
+            let far_radiance_field_uniform = self.far_radiance_field.uniform(self.camera.transform.position);
+            self.queue.write_buffer(&self.near_radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&near_radiance_field_uniform));
+            self.queue.write_buffer(&self.far_radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&far_radiance_field_uniform));
+            self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(true, self.sky_lighting)));
+            self.performance_stats.probe_update_ms = 0.0;
+            self.performance_stats.irradiance_upload_ms = 0.0;
+            self.performance_stats.visibility_rebuild_ms = 0.0;
+            self.performance_stats.probes_updated = 0;
+            return;
+        }
+        self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(false, self.sky_lighting)));
         if !self.render_settings.irradiance_enabled {
             self.performance_stats.probe_update_ms = 0.0;
             self.performance_stats.irradiance_upload_ms = 0.0;
@@ -1217,14 +1863,20 @@ impl Renderer {
         if geometry_bounds != self.visibility_bounds && self.visibility_rebuild_cooldown == 0 {
             self.visibility_grid = VisibilityGrid::from_bounds(&geometry_bounds);
             self.visibility_bounds = geometry_bounds;
+            refresh_probe_locations(self.irradiance_cache.as_mut(), volumes, &self.visibility_grid);
             self.irradiance_probe_ages.fill(u32::MAX);
             self.visibility_rebuild_cooldown = VISIBILITY_REBUILD_INTERVAL;
             visibility_rebuild_ms = visibility_start.elapsed().as_secs_f32() * 1000.0;
         }
         if volumes != self.irradiance_volume_layout.as_slice() {
-            self.irradiance_cache = irradiance_uniform(volumes, &self.static_probe_samples, &self.dynamic_probe_samples, lights, self.sky_lighting, &self.visibility_grid);
+            let old_cache = self.irradiance_cache.clone();
+            let old_ages = self.irradiance_probe_ages;
+            let mut new_cache = Box::new(irradiance_uniform(volumes, &self.static_probe_samples, &self.dynamic_probe_samples, lights, self.sky_lighting, &self.visibility_grid, false));
+            let mut new_ages = [u32::MAX; MAX_IRRADIANCE_PROBES];
+            preserve_overlapping_probes(&old_cache, &old_ages, &mut new_cache, &mut new_ages);
+            self.irradiance_cache = new_cache;
+            self.irradiance_probe_ages = new_ages;
             self.irradiance_volume_layout = volumes.to_vec();
-            self.irradiance_probe_ages = [0; MAX_IRRADIANCE_PROBES];
         }
 
         let active_volumes = volumes.iter().filter(|volume| volume.enabled).take(MAX_IRRADIANCE_VOLUMES).collect::<Vec<_>>();
@@ -1247,7 +1899,9 @@ impl Renderer {
                     if *was_updated {
                         continue;
                     }
-                    let position = probe_position_for_index(&active_volumes, index, &self.visibility_grid);
+                    let Some(location) = probe_location_for_index(&active_volumes, index, &self.visibility_grid) else { continue };
+                    self.irradiance_cache.probe_positions[index] = [location.position.x, location.position.y, location.position.z, 1.0];
+                    let position = location.position;
                     let distance_score = 4.0 / (1.0 + self.camera.transform.position.distance_squared(position));
                     let score = self.irradiance_probe_ages[index] as f32 * 0.15 + distance_score;
                     if score > best_score {
@@ -1256,7 +1910,9 @@ impl Renderer {
                     }
                 }
                 let Some(index) = best_index else { break };
-                let position = probe_position_for_index(&active_volumes, index, &self.visibility_grid);
+                let Some(location) = probe_location_for_index(&active_volumes, index, &self.visibility_grid) else { continue };
+                self.irradiance_cache.probe_positions[index] = [location.position.x, location.position.y, location.position.z, 1.0];
+                let position = location.position;
                 let (color, sky_visibility, direction) = probe_irradiance(position, &self.static_probe_samples, &self.dynamic_probe_samples, lights, &self.visibility_grid, self.sky_lighting);
                 let blend = if self.irradiance_probe_ages[index] == u32::MAX { 1.0 } else { 0.25 };
                 let previous_color = Vec3::new(self.irradiance_cache.probes[index][0], self.irradiance_cache.probes[index][1], self.irradiance_cache.probes[index][2]);
@@ -1273,11 +1929,16 @@ impl Renderer {
             }
         }
         let upload_start = Instant::now();
-        self.queue.write_buffer(&self.irradiance_buffer, 0, bytemuck::bytes_of(&self.irradiance_cache));
+        self.queue.write_buffer(&self.irradiance_buffer, 0, bytemuck::bytes_of(self.irradiance_cache.as_ref()));
         self.performance_stats = RendererPerformanceStats {
             frame_cpu_ms: self.performance_stats.frame_cpu_ms,
+            sdf_build_cpu_ms: self.performance_stats.sdf_build_cpu_ms,
+            sdf_upload_ms: self.performance_stats.sdf_upload_ms,
+            sdf_voxels_updated: self.performance_stats.sdf_voxels_updated,
+            gi_history_valid_percent: self.performance_stats.gi_history_valid_percent,
             gpu_shadow_ms: self.performance_stats.gpu_shadow_ms,
             gpu_scene_ms: self.performance_stats.gpu_scene_ms,
+            gpu_sdf_gi_ms: self.performance_stats.gpu_sdf_gi_ms,
             gpu_gizmo_ms: self.performance_stats.gpu_gizmo_ms,
             gpu_ui_ms: self.performance_stats.gpu_ui_ms,
             gpu_total_ms: self.performance_stats.gpu_total_ms,
@@ -1333,16 +1994,17 @@ impl Renderer {
         let to_ms = |start: usize, end: usize| {
             if values[end] < values[start] { 0.0 } else { (values[end] - values[start]) as f32 * timestamps.timestamp_period / 1_000_000.0 }
         };
-        let scene_ms = to_ms(4, 5);
-        let gizmo_ms = if self.gizmo_vertex_count > 0 { to_ms(6, 7) } else { 0.0 };
-        let ui_ms = if self.ui_vertex_count > 0 { to_ms(8, 9) } else { 0.0 };
+        let scene_ms = to_ms(6, 7);
+        let sdf_gi_ms = if self.sdf_gi_enabled && self.render_settings.irradiance_enabled { to_ms(4, 5) } else { 0.0 };
+        let gizmo_ms = if self.gizmo_vertex_count > 0 { to_ms(8, 9) } else { 0.0 };
+        let ui_ms = if self.ui_vertex_count > 0 { to_ms(10, 11) } else { 0.0 };
         let mut shadow_ms = 0.0;
         if self.render_settings.shadows_enabled {
             if self.lights.iter().any(|light| matches!(light, Light::Directional(_))) {
-                shadow_ms += to_ms(0, 1);
+                shadow_ms += to_ms(2, 3);
             }
             if self.lights.iter().any(|light| matches!(light, Light::Spot(_))) {
-                shadow_ms += to_ms(2, 3);
+                shadow_ms += to_ms(0, 1);
             }
         }
         drop(mapped);
@@ -1351,7 +2013,8 @@ impl Renderer {
         self.performance_stats.gpu_scene_ms = scene_ms;
         self.performance_stats.gpu_gizmo_ms = gizmo_ms;
         self.performance_stats.gpu_ui_ms = ui_ms;
-        self.performance_stats.gpu_total_ms = shadow_ms + scene_ms + gizmo_ms + ui_ms;
+        self.performance_stats.gpu_sdf_gi_ms = sdf_gi_ms;
+        self.performance_stats.gpu_total_ms = shadow_ms + scene_ms + sdf_gi_ms + gizmo_ms + ui_ms;
         Ok(())
     }
 
@@ -1365,6 +2028,9 @@ impl Renderer {
         }
         self.sky_lighting = sky_lighting;
         self.irradiance_probe_ages.fill(u32::MAX);
+        self.near_radiance_field.refresh_temporally();
+        self.far_radiance_field.refresh_temporally();
+        self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, sky_lighting)));
     }
 
     pub fn update_render_debug_mode(&mut self, mode: RenderDebugMode) {
@@ -1378,7 +2044,12 @@ impl Renderer {
             return;
         }
         let cascade_count_changed = self.render_settings.shadow_cascade_count != settings.shadow_cascade_count;
+        let gi_reenabled = !self.render_settings.irradiance_enabled && settings.irradiance_enabled && self.sdf_gi_enabled;
         self.render_settings = settings;
+        if gi_reenabled {
+            self.near_radiance_field.invalidate();
+            self.far_radiance_field.invalidate();
+        }
         self.shadow_scheduler.rebuild(&self.lights, &self.camera, settings.shadow_budget);
         self.rebuild_shadow_resources();
         self.update_shadow_scheduler_stats();
@@ -1436,6 +2107,37 @@ impl Renderer {
         self.gizmo_vertex_count = vertices.len() as u32;
     }
 
+    pub fn set_surface_probe_gizmos_enabled(&mut self, enabled: bool) {
+        self.surface_probe_gizmos_enabled = enabled;
+    }
+
+    pub fn set_gi_radiance_frozen(&mut self, frozen: bool) {
+        self.gi_radiance_frozen = frozen;
+    }
+
+    fn packed_surface_probe_frame_index(&self) -> u32 {
+        (self.frame_index & 0x7fff_ffff) | if self.gi_radiance_frozen { 0x8000_0000 } else { 0 }
+    }
+
+    pub fn set_world_radiance_gizmos_enabled(&mut self, enabled: bool) {
+        self.world_radiance_gizmos_enabled = enabled;
+    }
+
+    pub fn set_world_radiance_trace_gizmos_enabled(&mut self, enabled: bool) {
+        self.world_radiance_trace_gizmos_enabled = enabled;
+    }
+
+    pub fn set_selected_radiance_cell(&mut self, cell: [u32; 3], far_field: bool) {
+        self.selected_radiance_cell = [cell[0].min(7), cell[1].min(3), cell[2].min(7)];
+        self.selected_radiance_field_far = far_field;
+        let selection = [self.selected_radiance_cell[0], self.selected_radiance_cell[1], self.selected_radiance_cell[2], u32::from(far_field)];
+        self.queue.write_buffer(&self.gi_gizmo_selection_buffer, 0, bytemuck::cast_slice(&selection));
+    }
+
+    pub fn set_sdf_occupancy_gizmos_enabled(&mut self, enabled: bool) {
+        self.sdf_occupancy_gizmos_enabled = enabled;
+    }
+
     pub fn capture(&mut self, camera: &Camera, width: u32, height: u32) -> Result<CapturedFrame, String> {
         let width = width.max(1);
         let height = height.max(1);
@@ -1457,16 +2159,26 @@ impl Renderer {
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (depth_texture, depth_view) = create_depth_texture(&self.device, width, height);
         let (depth_sample_texture, depth_sample_view) = create_depth_sample_texture(&self.device, width, height);
+        let (_surface_normal_texture, surface_normal_view) = create_surface_normal_texture(&self.device, width, height);
+        let (_surface_id_texture, surface_id_view) = create_surface_id_texture(&self.device, width, height);
         let capture_depth_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("capture depth bind group"),
             layout: &self.depth_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_sample_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._depth_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&surface_normal_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_id_view) },
             ],
         });
         let capture_uniform = camera_uniform(width, height, camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&capture_uniform));
+        self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
+        let capture_probe_uniform = SurfaceProbeUniform {
+            screen_resolution: [width.div_ceil(SURFACE_PROBE_STRIDE), height.div_ceil(SURFACE_PROBE_STRIDE), width, height],
+            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, self.packed_surface_probe_frame_index()],
+        };
+        self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&capture_probe_uniform));
 
         let bytes_per_pixel = 4_u32;
         let unpadded_bytes_per_row = width * bytes_per_pixel;
@@ -1499,16 +2211,22 @@ impl Renderer {
         self.render_point_shadow_pass(&mut encoder);
         encoder.pop_debug_group();
         encoder.push_debug_group("GPU capture scene pass");
-        self.render_depth_prepass(&mut encoder, &depth_view);
+        self.render_depth_prepass(&mut encoder, &depth_view, &surface_normal_view, &surface_id_view);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &depth_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &depth_sample_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
+        if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
+            self.render_world_radiance_field_pass(&mut encoder, &capture_depth_bind_group, width, height);
+        }
         self.render_scene_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group);
         encoder.pop_debug_group();
         if self.gizmo_vertex_count > 0 {
             self.render_gizmo_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group);
+        }
+        if self.should_draw_gi_gizmos() {
+            self.render_gi_gizmo_pass(&mut encoder, &color_view, &depth_view);
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: &color_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -1546,7 +2264,6 @@ impl Renderer {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-
         let slice = readback.slice(..);
         let (sender, receiver) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -1595,6 +2312,7 @@ impl Renderer {
 
         let current_camera_uniform = camera_uniform(self.config.width, self.config.height, &self.camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&current_camera_uniform));
+        self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
         Ok(CapturedFrame { width, height, rgba8, scene_depth, directional_shadow, spot_shadow, point_shadow })
     }
 
@@ -1625,6 +2343,13 @@ impl Renderer {
         };
 
         let color_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let probe_uniform = SurfaceProbeUniform {
+            screen_resolution: [self.config.width.div_ceil(SURFACE_PROBE_STRIDE), self.config.height.div_ceil(SURFACE_PROBE_STRIDE), self.config.width, self.config.height],
+            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, self.packed_surface_probe_frame_index()],
+        };
+        self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&probe_uniform));
+        self.frame_index = self.frame_index.wrapping_add(1);
+        self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene encoder") });
         encoder.push_debug_group("GPU shadow passes");
         self.render_shadow_pass(&mut encoder);
@@ -1632,22 +2357,31 @@ impl Renderer {
         self.render_point_shadow_pass(&mut encoder);
         encoder.pop_debug_group();
         encoder.push_debug_group("GPU scene pass");
-        self.render_depth_prepass(&mut encoder, &self.depth_view);
+        self.render_depth_prepass(&mut encoder, &self.depth_view, &self.surface_normal_view, &self.surface_id_view);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &self._depth_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &self._depth_sample_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
         );
+        if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
+            self.render_world_radiance_field_pass(&mut encoder, &self.depth_bind_group, self.config.width, self.config.height);
+        }
         self.render_scene_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group);
         encoder.pop_debug_group();
         if self.gizmo_vertex_count > 0 {
             self.render_gizmo_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group);
+        }
+        if self.should_draw_gi_gizmos() {
+            self.render_gi_gizmo_pass(&mut encoder, &color_view, &self.depth_view);
         }
         if self.ui_vertex_count > 0 {
             self.render_ui_pass(&mut encoder, &color_view);
         }
         self.resolve_gpu_timestamps(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
+        if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
+            self.performance_stats.gi_history_valid_percent = 100.0;
+        }
         self.queue.present(frame);
         if !self.has_presented {
             eprintln!("First frame presented");
@@ -1664,10 +2398,23 @@ impl Renderer {
         encoder.copy_buffer_to_buffer(&timestamps.resolve_buffer, 0, &timestamps.readback_buffer, 0, u64::from(GPU_TIMESTAMP_COUNT) * 8);
     }
 
-    fn render_depth_prepass(&self, encoder: &mut wgpu::CommandEncoder, depth_view: &wgpu::TextureView) {
+    fn render_depth_prepass(&self, encoder: &mut wgpu::CommandEncoder, depth_view: &wgpu::TextureView, normal_view: &wgpu::TextureView, surface_id_view: &wgpu::TextureView) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene depth prepass"),
-            color_attachments: &[],
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: normal_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: surface_id_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                }),
+            ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
@@ -1708,8 +2455,8 @@ impl Renderer {
             }),
             timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::RenderPassTimestampWrites {
                 query_set: &timestamps.query_set,
-                beginning_of_pass_write_index: Some(4),
-                end_of_pass_write_index: Some(5),
+                beginning_of_pass_write_index: Some(6),
+                end_of_pass_write_index: Some(7),
             }),
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1726,6 +2473,25 @@ impl Renderer {
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
+    }
+
+    fn render_world_radiance_field_pass(&self, encoder: &mut wgpu::CommandEncoder, depth_bind_group: &wgpu::BindGroup, width: u32, height: u32) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("world radiance field update"),
+            timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
+                query_set: &timestamps.query_set,
+                beginning_of_pass_write_index: Some(4),
+                end_of_pass_write_index: Some(5),
+            }),
+        });
+        pass.set_pipeline(&self.radiance_field_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, depth_bind_group, &[]);
+        pass.dispatch_workgroups(RADIANCE_FIELD_RESOLUTION[0].div_ceil(4), RADIANCE_FIELD_RESOLUTION[1].div_ceil(4), RADIANCE_FIELD_RESOLUTION[2].div_ceil(4));
+        pass.set_pipeline(&self.surface_probe_update_pipeline);
+        pass.dispatch_workgroups(width.div_ceil(SURFACE_PROBE_STRIDE * 8), height.div_ceil(SURFACE_PROBE_STRIDE * 8), 1);
+        pass.set_pipeline(&self.surface_probe_maintenance_pipeline);
+        pass.dispatch_workgroups(SURFACE_PROBE_CAPACITY.div_ceil(64), 1, 1);
     }
 
     fn render_shadow_pass(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -1862,8 +2628,8 @@ impl Renderer {
             depth_stencil_attachment: None,
             timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::RenderPassTimestampWrites {
                 query_set: &timestamps.query_set,
-                beginning_of_pass_write_index: Some(8),
-                end_of_pass_write_index: Some(9),
+                beginning_of_pass_write_index: Some(10),
+                end_of_pass_write_index: Some(11),
             }),
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1889,8 +2655,8 @@ impl Renderer {
             }),
             timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::RenderPassTimestampWrites {
                 query_set: &timestamps.query_set,
-                beginning_of_pass_write_index: Some(6),
-                end_of_pass_write_index: Some(7),
+                beginning_of_pass_write_index: Some(8),
+                end_of_pass_write_index: Some(9),
             }),
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1900,6 +2666,50 @@ impl Renderer {
         pass.set_bind_group(1, depth_bind_group, &[]);
         pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
         pass.draw(0..self.gizmo_vertex_count, 0..1);
+    }
+
+    fn render_gi_gizmo_pass(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, depth_view: &wgpu::TextureView) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("GI cache gizmo pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.gi_gizmo_pipeline);
+        pass.set_bind_group(0, &self.gi_gizmo_bind_group, &[]);
+        let surface_probe_count = SURFACE_PROBE_CAPACITY;
+        let radiance_field_count = RADIANCE_FIELD_RESOLUTION.iter().product::<u32>() * 2;
+        if self.surface_probe_gizmos_enabled {
+            pass.draw(0..8, 0..surface_probe_count);
+        }
+        if self.world_radiance_gizmos_enabled {
+            pass.draw(0..8, surface_probe_count..surface_probe_count + radiance_field_count);
+        }
+        if self.world_radiance_trace_gizmos_enabled {
+            let trace_start = surface_probe_count + radiance_field_count;
+            pass.draw(0..28, trace_start..trace_start + RADIANCE_FIELD_DIRECTIONS as u32);
+            pass.draw(0..2, trace_start + RADIANCE_FIELD_DIRECTIONS as u32..trace_start + RADIANCE_FIELD_DIRECTIONS as u32 + 12);
+        }
+        if self.sdf_occupancy_gizmos_enabled {
+            pass.set_pipeline(&self.sdf_occupancy_gizmo_pipeline);
+            pass.draw(0..36, 0..SDF_CLIPMAP_RESOLUTION.iter().product());
+        }
+    }
+
+    fn should_draw_gi_gizmos(&self) -> bool {
+        let has_debug_gizmos = self.surface_probe_gizmos_enabled || self.world_radiance_gizmos_enabled || self.world_radiance_trace_gizmos_enabled || self.sdf_occupancy_gizmos_enabled;
+        has_debug_gizmos && self.sdf_gi_enabled && self.render_settings.irradiance_enabled
     }
 }
 
@@ -1976,6 +2786,7 @@ fn camera_uniform(width: u32, height: u32, camera: &Camera, lights: &[Light], mo
     }
     CameraUniform {
         view_projection: camera.view_projection(aspect).to_cols_array_2d(),
+        inverse_view_projection: camera.view_projection(aspect).inverse().to_cols_array_2d(),
         view: camera.transform.matrix().inverse().to_cols_array_2d(),
         shadow_view_projection: shadow_view_projections.map(|matrix| matrix.to_cols_array_2d()),
         shadow_cascade_splits: cascade_splits_for_count(camera, settings.shadow_cascade_count),
@@ -2016,6 +2827,8 @@ fn camera_uniform(width: u32, height: u32, camera: &Camera, lights: &[Light], mo
             u32::from(settings.ambient_occlusion_enabled),
             u32::from(settings.direct_light_visibility_enabled),
         ],
+        ambient_light: [settings.ambient_intensity.max(0.0), 0.0, 0.0, 0.0],
+        gi_settings: [u32::from(settings.surface_probes_enabled), 0, 0, 0],
     }
 }
 
@@ -2129,6 +2942,32 @@ pub fn point_shadow_view_projections(position: Vec3, range: f32) -> [Mat4; 6] {
     faces.map(|(direction, up)| projection * Mat4::look_at_rh(position, position + direction, up))
 }
 
+fn mesh_topology_signature(instances: &[MeshInstance]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    instances.len().hash(&mut hasher);
+    for instance in instances {
+        instance.mesh.vertices().len().hash(&mut hasher);
+        instance.mesh.indices().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytemuck::cast_slice::<_, u8>(instance.mesh.vertices()).hash(&mut hasher);
+    instance.mesh.indices().hash(&mut hasher);
+    instance.transform.position.to_array().map(|value| value.to_bits()).hash(&mut hasher);
+    instance.transform.rotation.to_array().map(|value| value.to_bits()).hash(&mut hasher);
+    instance.transform.scale.to_array().map(|value| value.to_bits()).hash(&mut hasher);
+    instance.material.base_color.to_array().map(|value| value.to_bits()).hash(&mut hasher);
+    instance.material.metallic.to_bits().hash(&mut hasher);
+    instance.material.roughness.to_bits().hash(&mut hasher);
+    instance.material.emission.to_array().map(|value| value.to_bits()).hash(&mut hasher);
+    instance.material.emission_strength.to_bits().hash(&mut hasher);
+    instance.probe_dynamic.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn flatten_instances(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>, Vec<u32>), String> {
     if instances.is_empty() || instances.iter().any(|instance| instance.mesh.is_empty()) {
         return Err("renderer requires nonempty mesh instances".into());
@@ -2137,9 +2976,21 @@ fn flatten_instances(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVert
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut vertex_offset = 0_u32;
-    for instance in instances {
-        let transform = instance.transform;
-        vertices.extend(instance.mesh.vertices().iter().map(|vertex| {
+    for (instance_index, instance) in instances.iter().enumerate() {
+        vertices.extend(flatten_instance(instance, instance_index));
+        indices.extend(instance.mesh.indices().iter().map(|index| index + vertex_offset));
+        vertex_offset += instance.mesh.vertices().len() as u32;
+    }
+    Ok((vertices, indices))
+}
+
+fn flatten_instance(instance: &MeshInstance, instance_index: usize) -> Vec<RendererMeshVertex> {
+    let transform = instance.transform;
+    instance
+        .mesh
+        .vertices()
+        .iter()
+        .map(|vertex| {
             let position = transform.transform_point(Vec3::from_array(vertex.position));
             let normal = transform.transform_vector(Vec3::from_array(vertex.normal)).normalize_or_zero();
             RendererMeshVertex {
@@ -2149,12 +3000,10 @@ fn flatten_instances(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVert
                 material_base_color: instance.material.base_color.to_array(),
                 material_params: [instance.material.metallic.clamp(0.0, 1.0), instance.material.roughness.clamp(0.04, 1.0), 0.5, instance.material.emission_strength.max(0.0)],
                 material_emission: instance.material.emission.to_array(),
+                surface_id: instance_index as u32 + 1,
             }
-        }));
-        indices.extend(instance.mesh.indices().iter().map(|index| index + vertex_offset));
-        vertex_offset += instance.mesh.vertices().len() as u32;
-    }
-    Ok((vertices, indices))
+        })
+        .collect()
 }
 
 fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -2217,6 +3066,36 @@ fn create_depth_sample_texture(device: &wgpu::Device, width: u32, height: u32) -
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_surface_normal_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene surface normal target"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_surface_id_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene surface id target"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2305,11 +3184,13 @@ fn irradiance_uniform(
     lights: &[Light],
     sky_lighting: RendererSkyLighting,
     visibility_grid: &VisibilityGrid,
+    evaluate_probes: bool,
 ) -> IrradianceUniform {
     let mut uniform = IrradianceUniform {
         volumes: [IrradianceVolumeUniform { minimum: [0.0; 4], maximum: [0.0; 4], resolution: [1, 1, 1, 0], probe_offset: 0, _padding: [0; 7] }; MAX_IRRADIANCE_VOLUMES],
         probes: [[0.0; 4]; MAX_IRRADIANCE_PROBES],
         directions: [[0.0; 4]; MAX_IRRADIANCE_PROBES],
+        probe_positions: [[0.0; 4]; MAX_IRRADIANCE_PROBES],
         volume_count: [0, 0, 0, 0],
     };
     let mut probe_offset = 0usize;
@@ -2329,11 +3210,19 @@ fn irradiance_uniform(
         for z in 0..resolution[2] {
             for y in 0..resolution[1] {
                 for x in 0..resolution[0] {
-                    let position = visibility_grid.relocated_probe_position(probe_position(*volume, [x, y, z]));
-                    let (color, sky_visibility, direction) = probe_irradiance(position, static_samples, dynamic_samples, lights, visibility_grid, sky_lighting);
                     let index = probe_offset + z as usize * resolution[0] as usize * resolution[1] as usize + y as usize * resolution[0] as usize + x as usize;
-                    uniform.probes[index] = [color.x, color.y, color.z, sky_visibility];
-                    uniform.directions[index] = [direction.x, direction.y, direction.z, direction.w];
+                    if let Some(location) = visibility_grid.probe_location(probe_position(*volume, [x, y, z])) {
+                        uniform.probe_positions[index] = [location.position.x, location.position.y, location.position.z, 1.0];
+                        if evaluate_probes {
+                            let (color, sky_visibility, direction) = probe_irradiance(location.position, static_samples, dynamic_samples, lights, visibility_grid, sky_lighting);
+                            uniform.probes[index] = [color.x, color.y, color.z, sky_visibility];
+                            uniform.directions[index] = [direction.x, direction.y, direction.z, direction.w];
+                        } else {
+                            uniform.probes[index] = [0.015, 0.015, 0.015, 0.0];
+                        }
+                    } else {
+                        uniform.probes[index] = [0.015, 0.015, 0.015, 0.0];
+                    }
                 }
             }
         }
@@ -2343,6 +3232,31 @@ fn irradiance_uniform(
     uniform
 }
 
+fn refresh_probe_locations(uniform: &mut IrradianceUniform, volumes: &[RendererIrradianceVolume], visibility_grid: &VisibilityGrid) {
+    uniform.probe_positions.fill([0.0; 4]);
+    uniform.probes.fill([0.015, 0.015, 0.015, 0.0]);
+    uniform.directions.fill([0.0; 4]);
+    let mut probe_offset = 0usize;
+    for volume in volumes.iter().filter(|volume| volume.enabled).take(MAX_IRRADIANCE_VOLUMES) {
+        let resolution = [volume.resolution[0].max(1), volume.resolution[1].max(1), volume.resolution[2].max(1)];
+        let probe_count = resolution[0] as usize * resolution[1] as usize * resolution[2] as usize;
+        if probe_offset + probe_count > MAX_IRRADIANCE_PROBES {
+            break;
+        }
+        for z in 0..resolution[2] {
+            for y in 0..resolution[1] {
+                for x in 0..resolution[0] {
+                    let index = probe_offset + z as usize * resolution[0] as usize * resolution[1] as usize + y as usize * resolution[0] as usize + x as usize;
+                    if let Some(location) = visibility_grid.probe_location(probe_position(*volume, [x, y, z])) {
+                        uniform.probe_positions[index] = [location.position.x, location.position.y, location.position.z, 1.0];
+                    }
+                }
+            }
+        }
+        probe_offset += probe_count;
+    }
+}
+
 fn probe_position(volume: RendererIrradianceVolume, coordinate: [u32; 3]) -> Vec3 {
     let resolution = [volume.resolution[0].max(1), volume.resolution[1].max(1), volume.resolution[2].max(1)];
     let denominator = [resolution[0].saturating_sub(1).max(1), resolution[1].saturating_sub(1).max(1), resolution[2].saturating_sub(1).max(1)];
@@ -2350,7 +3264,29 @@ fn probe_position(volume: RendererIrradianceVolume, coordinate: [u32; 3]) -> Vec
     Vec3::from_array(volume.minimum) + (Vec3::from_array(volume.maximum) - Vec3::from_array(volume.minimum)) * fraction
 }
 
-fn probe_position_for_index(volumes: &[&RendererIrradianceVolume], index: usize, visibility_grid: &VisibilityGrid) -> Vec3 {
+fn preserve_overlapping_probes(old_cache: &IrradianceUniform, old_ages: &[u32; MAX_IRRADIANCE_PROBES], new_cache: &mut IrradianceUniform, new_ages: &mut [u32; MAX_IRRADIANCE_PROBES]) {
+    let mut old_probe_indices = HashMap::new();
+    for (index, position) in old_cache.probe_positions.iter().enumerate() {
+        if position[3] > 0.0 {
+            old_probe_indices.insert(probe_position_key(*position), index);
+        }
+    }
+    for (new_index, position) in new_cache.probe_positions.iter().enumerate() {
+        if position[3] <= 0.0 {
+            continue;
+        }
+        let Some(old_index) = old_probe_indices.get(&probe_position_key(*position)).copied() else { continue };
+        new_cache.probes[new_index] = old_cache.probes[old_index];
+        new_cache.directions[new_index] = old_cache.directions[old_index];
+        new_ages[new_index] = old_ages[old_index];
+    }
+}
+
+fn probe_position_key(position: [f32; 4]) -> (i32, i32, i32, i32) {
+    ((position[0] * 1000.0).round() as i32, (position[1] * 1000.0).round() as i32, (position[2] * 1000.0).round() as i32, position[3].round() as i32)
+}
+
+fn probe_location_for_index(volumes: &[&RendererIrradianceVolume], index: usize, visibility_grid: &VisibilityGrid) -> Option<ProbeLocation> {
     let mut local_index = index;
     for volume in volumes {
         let resolution = [volume.resolution[0].max(1), volume.resolution[1].max(1), volume.resolution[2].max(1)];
@@ -2359,17 +3295,462 @@ fn probe_position_for_index(volumes: &[&RendererIrradianceVolume], index: usize,
             let x = local_index % resolution[0] as usize;
             let y = local_index / resolution[0] as usize % resolution[1] as usize;
             let z = local_index / (resolution[0] as usize * resolution[1] as usize);
-            return visibility_grid.relocated_probe_position(probe_position(**volume, [x as u32, y as u32, z as u32]));
+            return visibility_grid.probe_location(probe_position(**volume, [x as u32, y as u32, z as u32]));
         }
         local_index -= probe_count;
     }
-    Vec3::ZERO
+    None
 }
 
 #[derive(Clone, Copy, PartialEq)]
 struct GeometryBounds {
     minimum: Vec3,
     maximum: Vec3,
+}
+
+impl SdfGeometryBvh {
+    fn new(geometries: &[SdfGeometry]) -> Self {
+        let mut bvh = Self { geometries: geometries.to_vec(), geometry_indices: (0..geometries.len()).collect(), nodes: Vec::new() };
+        if !geometries.is_empty() {
+            bvh.build_node(0, geometries.len());
+        }
+        bvh
+    }
+
+    fn build_node(&mut self, start: usize, end: usize) -> usize {
+        let first_geometry = self.geometries[self.geometry_indices[start]];
+        let mut bounds = first_geometry.bounds;
+        let mut centroid_minimum = (first_geometry.bounds.minimum + first_geometry.bounds.maximum) * 0.5;
+        let mut centroid_maximum = centroid_minimum;
+        for geometry_index in &self.geometry_indices[start + 1..end] {
+            let geometry = self.geometries[*geometry_index];
+            bounds.minimum = bounds.minimum.min(geometry.bounds.minimum);
+            bounds.maximum = bounds.maximum.max(geometry.bounds.maximum);
+            let centroid = (geometry.bounds.minimum + geometry.bounds.maximum) * 0.5;
+            centroid_minimum = centroid_minimum.min(centroid);
+            centroid_maximum = centroid_maximum.max(centroid);
+        }
+        let node_index = self.nodes.len();
+        self.nodes.push(SdfBvhNode { bounds, left: 0, right: 0, start, count: end - start });
+        if end - start <= 8 {
+            return node_index;
+        }
+        let centroid_extent = centroid_maximum - centroid_minimum;
+        let axis = if centroid_extent.x >= centroid_extent.y && centroid_extent.x >= centroid_extent.z {
+            0
+        } else if centroid_extent.y >= centroid_extent.z {
+            1
+        } else {
+            2
+        };
+        self.geometry_indices[start..end].sort_unstable_by(|left, right| {
+            let left_bounds = self.geometries[*left].bounds;
+            let right_bounds = self.geometries[*right].bounds;
+            let left_center = (left_bounds.minimum + left_bounds.maximum)[axis];
+            let right_center = (right_bounds.minimum + right_bounds.maximum)[axis];
+            left_center.partial_cmp(&right_center).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let middle = start + (end - start) / 2;
+        let left = self.build_node(start, middle);
+        let right = self.build_node(middle, end);
+        self.nodes[node_index].left = left;
+        self.nodes[node_index].right = right;
+        self.nodes[node_index].count = 0;
+        node_index
+    }
+
+    fn nearest(&self, position: Vec3, voxel_padding: Vec3) -> (f32, Vec3, Vec3) {
+        if self.nodes.is_empty() {
+            return (SDF_MAX_DISTANCE, Vec3::ZERO, Vec3::ZERO);
+        }
+        let mut nearest_distance = SDF_MAX_DISTANCE;
+        let mut nearest_albedo = Vec3::ZERO;
+        let mut nearest_emission = Vec3::ZERO;
+        let mut stack = [usize::MAX; 64];
+        let mut stack_size = 1;
+        stack[0] = 0;
+        while stack_size > 0 {
+            stack_size -= 1;
+            let node = self.nodes[stack[stack_size]];
+            if signed_distance_to_padded_bounds(position, node.bounds, voxel_padding) > nearest_distance {
+                continue;
+            }
+            if node.count > 0 {
+                for ordered_index in node.start..node.start + node.count {
+                    let geometry = self.geometries[self.geometry_indices[ordered_index]];
+                    let distance = signed_distance_to_padded_bounds(position, geometry.bounds, voxel_padding);
+                    if distance < nearest_distance {
+                        nearest_distance = distance;
+                        nearest_albedo = geometry.albedo;
+                        nearest_emission = geometry.emission;
+                    }
+                }
+                continue;
+            }
+            let left_distance = signed_distance_to_padded_bounds(position, self.nodes[node.left].bounds, voxel_padding);
+            let right_distance = signed_distance_to_padded_bounds(position, self.nodes[node.right].bounds, voxel_padding);
+            if left_distance <= right_distance {
+                if right_distance <= nearest_distance {
+                    stack[stack_size] = node.right;
+                    stack_size += 1;
+                }
+                if left_distance <= nearest_distance {
+                    stack[stack_size] = node.left;
+                    stack_size += 1;
+                }
+            } else {
+                if left_distance <= nearest_distance {
+                    stack[stack_size] = node.left;
+                    stack_size += 1;
+                }
+                if right_distance <= nearest_distance {
+                    stack[stack_size] = node.right;
+                    stack_size += 1;
+                }
+            }
+        }
+        (nearest_distance, nearest_albedo, nearest_emission)
+    }
+}
+
+impl SdfClipmap {
+    fn new(camera_position: Vec3, geometry_bounds: &[SdfGeometry]) -> Self {
+        let voxel_size = SDF_CLIPMAP_EXTENT / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
+        let minimum = Self::snapped_minimum(camera_position, voxel_size);
+        let maximum = minimum + SDF_CLIPMAP_EXTENT;
+        let mut clipmap =
+            Self { minimum, maximum, voxel_size, values: Vec::new(), emission_values: Vec::new(), geometry_bounds: Vec::new(), geometry_bvh: SdfGeometryBvh::new(&[]), grid_offset: [0; 3] };
+        clipmap.rebuild(geometry_bounds);
+        clipmap
+    }
+
+    fn update(&mut self, camera_position: Vec3, geometry_bounds: &[SdfGeometry]) -> Option<SdfClipmapUpdate> {
+        let minimum = Self::snapped_minimum(camera_position, self.voxel_size);
+        let geometry_changed = self.geometry_bounds != geometry_bounds;
+        if self.minimum == minimum && !geometry_changed {
+            return None;
+        }
+        let shift_vector = (minimum - self.minimum) / self.voxel_size;
+        let shift = [shift_vector.x.round() as i32, shift_vector.y.round() as i32, shift_vector.z.round() as i32];
+        self.minimum = minimum;
+        self.maximum = minimum + SDF_CLIPMAP_EXTENT;
+        if geometry_changed || shift.iter().enumerate().any(|(axis, value)| value.unsigned_abs() >= SDF_CLIPMAP_RESOLUTION[axis]) {
+            self.grid_offset = [0; 3];
+            self.rebuild(geometry_bounds);
+            return Some(SdfClipmapUpdate { texture_regions: vec![SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION }], voxels_updated: SDF_CLIPMAP_RESOLUTION.iter().product() });
+        }
+
+        for axis in 0..3 {
+            self.grid_offset[axis] = (self.grid_offset[axis] as i32 + shift[axis]).rem_euclid(SDF_CLIPMAP_RESOLUTION[axis] as i32) as u32;
+        }
+        let logical_regions = scrolling_regions(shift, SDF_CLIPMAP_RESOLUTION);
+        let mut texture_regions = Vec::new();
+        let mut voxels_updated = 0;
+        for region in logical_regions {
+            self.rebuild_logical_region(region);
+            voxels_updated += region.size.iter().product::<u32>();
+            texture_regions.extend(self.texture_regions_for(region));
+        }
+        self.rebuild_conservative_clearance();
+        Some(SdfClipmapUpdate { texture_regions, voxels_updated })
+    }
+
+    fn uniform(&self, enabled: bool, sky_lighting: RendererSkyLighting) -> SdfClipmapUniform {
+        SdfClipmapUniform {
+            minimum: self.minimum.extend(0.0).to_array(),
+            maximum: self.maximum.extend(0.0).to_array(),
+            resolution: [SDF_CLIPMAP_RESOLUTION[0], SDF_CLIPMAP_RESOLUTION[1], SDF_CLIPMAP_RESOLUTION[2], 0],
+            settings: [u32::from(enabled), 0, 0, 0],
+            grid_offset: [self.grid_offset[0], self.grid_offset[1], self.grid_offset[2], 0],
+            sky_radiance: [sky_lighting.color.red * sky_lighting.intensity, sky_lighting.color.green * sky_lighting.intensity, sky_lighting.color.blue * sky_lighting.intensity, 0.0],
+        }
+    }
+
+    fn snapped_minimum(camera_position: Vec3, voxel_size: Vec3) -> Vec3 {
+        let snapped_center =
+            Vec3::new((camera_position.x / voxel_size.x).floor() * voxel_size.x, (camera_position.y / voxel_size.y).floor() * voxel_size.y, (camera_position.z / voxel_size.z).floor() * voxel_size.z);
+        Vec3::new(snapped_center.x - SDF_CLIPMAP_EXTENT.x * 0.5, snapped_center.y - SDF_CLIPMAP_EXTENT.y * 0.875, snapped_center.z - SDF_CLIPMAP_EXTENT.z * 0.5)
+    }
+
+    fn rebuild(&mut self, geometry_bounds: &[SdfGeometry]) {
+        // This field represents the union of per-instance AABBs, not the source mesh surfaces.
+        self.geometry_bounds.clear();
+        self.geometry_bounds.extend_from_slice(geometry_bounds);
+        self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
+        let voxel_count = SDF_CLIPMAP_RESOLUTION.iter().product::<u32>() as usize;
+        self.values = vec![[SDF_MAX_DISTANCE, 0.0, 0.0, 0.0]; voxel_count];
+        self.emission_values = vec![[0.0; 4]; voxel_count];
+        self.rebuild_all_voxels();
+        self.rebuild_conservative_clearance();
+    }
+
+    fn rebuild_conservative_clearance(&mut self) {
+        let resolution = SDF_CLIPMAP_RESOLUTION;
+        let voxel_count = resolution.iter().product::<u32>() as usize;
+        let mut clearance = vec![u16::MAX; voxel_count];
+        let grid_offset = self.grid_offset;
+        let index = |x: u32, y: u32, z: u32| (x + y * resolution[0] + z * resolution[0] * resolution[1]) as usize;
+        let physical_index = |x: u32, y: u32, z: u32| {
+            let px = (x + grid_offset[0]) % resolution[0];
+            let py = (y + grid_offset[1]) % resolution[1];
+            let pz = (z + grid_offset[2]) % resolution[2];
+            index(px, py, pz)
+        };
+        for z in 0..resolution[2] {
+            for y in 0..resolution[1] {
+                for x in 0..resolution[0] {
+                    if self.values[physical_index(x, y, z)][0] <= 0.0 {
+                        clearance[index(x, y, z)] = 0;
+                    }
+                }
+            }
+        }
+        for z in 0..resolution[2] {
+            for y in 0..resolution[1] {
+                for x in 0..resolution[0] {
+                    let value_index = index(x, y, z);
+                    let mut distance = clearance[value_index];
+                    for dz in -1i32..=0 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                if dz == 0 && (dy > 0 || (dy == 0 && dx >= 0)) {
+                                    continue;
+                                }
+                                let nx = x as i32 + dx;
+                                let ny = y as i32 + dy;
+                                let nz = z as i32 + dz;
+                                if nx >= 0 && ny >= 0 && nz >= 0 && nx < resolution[0] as i32 && ny < resolution[1] as i32 && nz < resolution[2] as i32 {
+                                    distance = distance.min(clearance[index(nx as u32, ny as u32, nz as u32)].saturating_add(1));
+                                }
+                            }
+                        }
+                    }
+                    clearance[value_index] = distance;
+                }
+            }
+        }
+        for z in (0..resolution[2]).rev() {
+            for y in (0..resolution[1]).rev() {
+                for x in (0..resolution[0]).rev() {
+                    let value_index = index(x, y, z);
+                    let mut distance = clearance[value_index];
+                    for dz in 0i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                if dz == 0 && (dy < 0 || (dy == 0 && dx <= 0)) {
+                                    continue;
+                                }
+                                let nx = x as i32 + dx;
+                                let ny = y as i32 + dy;
+                                let nz = z as i32 + dz;
+                                if nx >= 0 && ny >= 0 && nz >= 0 && nx < resolution[0] as i32 && ny < resolution[1] as i32 && nz < resolution[2] as i32 {
+                                    distance = distance.min(clearance[index(nx as u32, ny as u32, nz as u32)].saturating_add(1));
+                                }
+                            }
+                        }
+                    }
+                    clearance[value_index] = distance;
+                }
+            }
+        }
+        let half_voxel_diagonal = self.voxel_size.length() * 0.5;
+        let minimum_voxel_size = self.voxel_size.min_element();
+        for z in 0..resolution[2] {
+            for y in 0..resolution[1] {
+                for x in 0..resolution[0] {
+                    let distance = clearance[index(x, y, z)];
+                    let safe_distance = if distance == u16::MAX { SDF_MAX_DISTANCE } else { (distance as f32 * minimum_voxel_size - half_voxel_diagonal).max(0.0) };
+                    self.emission_values[physical_index(x, y, z)][3] = safe_distance;
+                }
+            }
+        }
+    }
+
+    fn rebuild_all_voxels(&mut self) {
+        let row_width = SDF_CLIPMAP_RESOLUTION[0] as usize;
+        let row_count = SDF_CLIPMAP_RESOLUTION[1] as usize * SDF_CLIPMAP_RESOLUTION[2] as usize;
+        let worker_count = std::thread::available_parallelism().map(usize::from).unwrap_or(1).min(row_count);
+        let rows_per_worker = row_count.div_ceil(worker_count);
+        let values_per_worker = rows_per_worker * row_width;
+        let minimum = self.minimum;
+        let voxel_size = self.voxel_size;
+        let geometry_bvh = &self.geometry_bvh;
+        std::thread::scope(|scope| {
+            for (chunk_index, (values, emissions)) in self.values.chunks_mut(values_per_worker).zip(self.emission_values.chunks_mut(values_per_worker)).enumerate() {
+                let first_row = chunk_index * rows_per_worker;
+                scope.spawn(move || {
+                    for local_index in 0..values.len() {
+                        let row = first_row + local_index / row_width;
+                        let x = local_index % row_width;
+                        let y = row % SDF_CLIPMAP_RESOLUTION[1] as usize;
+                        let z = row / SDF_CLIPMAP_RESOLUTION[1] as usize;
+                        let position = minimum + Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) * voxel_size;
+                        let (distance, albedo, emission) = geometry_bvh.nearest(position, voxel_size * 0.5);
+                        values[local_index] = [distance.clamp(-SDF_MAX_DISTANCE, SDF_MAX_DISTANCE), albedo.x, albedo.y, albedo.z];
+                        emissions[local_index] = [emission.x, emission.y, emission.z, 0.0];
+                    }
+                });
+            }
+        });
+    }
+
+    fn rebuild_logical_region(&mut self, region: SdfLogicalRegion) {
+        for z in region.start[2]..region.start[2] + region.size[2] {
+            for y in region.start[1]..region.start[1] + region.size[1] {
+                for x in region.start[0]..region.start[0] + region.size[0] {
+                    let position = self.minimum + Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) * self.voxel_size;
+                    let physical_x = (x + self.grid_offset[0]) % SDF_CLIPMAP_RESOLUTION[0];
+                    let physical_y = (y + self.grid_offset[1]) % SDF_CLIPMAP_RESOLUTION[1];
+                    let physical_z = (z + self.grid_offset[2]) % SDF_CLIPMAP_RESOLUTION[2];
+                    let index = (physical_x + physical_y * SDF_CLIPMAP_RESOLUTION[0] + physical_z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                    let (nearest_distance, albedo, emission) = self.geometry_bvh.nearest(position, self.voxel_size * 0.5);
+                    self.values[index] = [nearest_distance.clamp(-SDF_MAX_DISTANCE, SDF_MAX_DISTANCE), albedo.x, albedo.y, albedo.z];
+                    self.emission_values[index] = [emission.x, emission.y, emission.z, 0.0];
+                }
+            }
+        }
+    }
+
+    fn texture_regions_for(&self, region: SdfLogicalRegion) -> Vec<SdfTextureRegion> {
+        let axes = (0..3).map(|axis| split_wrapped_range(region.start[axis], region.size[axis], self.grid_offset[axis], SDF_CLIPMAP_RESOLUTION[axis])).collect::<Vec<_>>();
+        let mut regions = Vec::new();
+        for &(x, width) in &axes[0] {
+            for &(y, height) in &axes[1] {
+                for &(z, depth) in &axes[2] {
+                    regions.push(SdfTextureRegion { origin: [x, y, z], size: [width, height, depth] });
+                }
+            }
+        }
+        regions
+    }
+}
+
+impl WorldRadianceField {
+    fn new(camera_position: Vec3, extent: Vec3, resolution: [u32; 3]) -> Self {
+        let cell_size = extent / Vec3::new(resolution[0] as f32, resolution[1] as f32, resolution[2] as f32);
+        let minimum = Self::snapped_minimum(camera_position, cell_size, extent);
+        Self { extent, resolution, minimum, maximum: minimum + extent, cell_size, grid_offset: [0; 3], frame_index: 0, refresh_frames_remaining: 0, needs_full_refresh: true }
+    }
+
+    fn uniform(&mut self, camera_position: Vec3) -> RadianceFieldUniform {
+        let minimum = Self::snapped_minimum(camera_position, self.cell_size, self.extent);
+        let shift_vector = (minimum - self.minimum) / self.cell_size;
+        let mut shift = [shift_vector.x.round() as i32, shift_vector.y.round() as i32, shift_vector.z.round() as i32];
+        let full_refresh = self.needs_full_refresh || shift.iter().enumerate().any(|(axis, value)| value.unsigned_abs() >= self.resolution[axis]);
+        if full_refresh {
+            self.grid_offset = [0; 3];
+            shift = self.resolution.map(|value| value as i32);
+            self.needs_full_refresh = false;
+            self.refresh_frames_remaining = 0;
+        } else {
+            for axis in 0..3 {
+                self.grid_offset[axis] = (self.grid_offset[axis] as i32 + shift[axis]).rem_euclid(self.resolution[axis] as i32) as u32;
+            }
+        }
+        self.minimum = minimum;
+        self.maximum = minimum + self.extent;
+        self.frame_index = self.frame_index.wrapping_add(1);
+        let refresh_interval = if self.refresh_frames_remaining > 0 { RADIANCE_FIELD_REFRESH_INTERVAL } else { 0 };
+        self.refresh_frames_remaining = self.refresh_frames_remaining.saturating_sub(1);
+        RadianceFieldUniform {
+            minimum: self.minimum.extend(0.0).to_array(),
+            maximum: self.maximum.extend(0.0).to_array(),
+            resolution: [self.resolution[0], self.resolution[1], self.resolution[2], 0],
+            grid_offset: [self.grid_offset[0], self.grid_offset[1], self.grid_offset[2], 0],
+            scroll_shift: [shift[0], shift[1], shift[2], 0],
+            settings: [self.frame_index, refresh_interval, RADIANCE_FIELD_DIRECTIONS as u32, u32::from(full_refresh)],
+        }
+    }
+
+    fn snapped_minimum(camera_position: Vec3, cell_size: Vec3, extent: Vec3) -> Vec3 {
+        let snapped_center =
+            Vec3::new((camera_position.x / cell_size.x).floor() * cell_size.x, (camera_position.y / cell_size.y).floor() * cell_size.y, (camera_position.z / cell_size.z).floor() * cell_size.z);
+        Vec3::new(snapped_center.x - extent.x * 0.5, snapped_center.y - extent.y * 0.875, snapped_center.z - extent.z * 0.5)
+    }
+
+    fn invalidate(&mut self) {
+        self.needs_full_refresh = true;
+        self.refresh_frames_remaining = 0;
+    }
+
+    fn refresh_temporally(&mut self) {
+        self.refresh_frames_remaining = RADIANCE_FIELD_REFRESH_INTERVAL;
+    }
+}
+
+fn scrolling_regions(shift: [i32; 3], resolution: [u32; 3]) -> Vec<SdfLogicalRegion> {
+    let ranges = (0..3).map(|axis| scrolling_axis_ranges(shift[axis], resolution[axis])).collect::<Vec<_>>();
+    let mut regions = Vec::new();
+    for dirty_x in &ranges[0].0 {
+        regions.push(SdfLogicalRegion { start: [dirty_x.0, 0, 0], size: [dirty_x.1, resolution[1], resolution[2]] });
+    }
+    for retained_x in &ranges[0].1 {
+        for dirty_y in &ranges[1].0 {
+            regions.push(SdfLogicalRegion { start: [retained_x.0, dirty_y.0, 0], size: [retained_x.1, dirty_y.1, resolution[2]] });
+        }
+    }
+    for retained_x in &ranges[0].1 {
+        for retained_y in &ranges[1].1 {
+            for dirty_z in &ranges[2].0 {
+                regions.push(SdfLogicalRegion { start: [retained_x.0, retained_y.0, dirty_z.0], size: [retained_x.1, retained_y.1, dirty_z.1] });
+            }
+        }
+    }
+    regions
+}
+
+fn scrolling_axis_ranges(shift: i32, resolution: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+    if shift == 0 {
+        return (Vec::new(), vec![(0, resolution)]);
+    }
+    let magnitude = shift.unsigned_abs();
+    if shift > 0 { (vec![(resolution - magnitude, magnitude)], vec![(0, resolution - magnitude)]) } else { (vec![(0, magnitude)], vec![(magnitude, resolution - magnitude)]) }
+}
+
+fn split_wrapped_range(start: u32, size: u32, offset: u32, resolution: u32) -> Vec<(u32, u32)> {
+    if size == resolution {
+        return vec![(0, resolution)];
+    }
+    let physical_start = (start + offset) % resolution;
+    let first_size = size.min(resolution - physical_start);
+    let mut ranges = vec![(physical_start, first_size)];
+    if first_size < size {
+        ranges.push((0, size - first_size));
+    }
+    ranges
+}
+
+fn upload_sdf_region(queue: &wgpu::Queue, texture: &wgpu::Texture, values: &[[f32; 4]], region: SdfTextureRegion) {
+    let mut packed_values = Vec::with_capacity((region.size[0] * region.size[1] * region.size[2]) as usize);
+    for z in region.origin[2]..region.origin[2] + region.size[2] {
+        for y in region.origin[1]..region.origin[1] + region.size[1] {
+            let start = (region.origin[0] + y * SDF_CLIPMAP_RESOLUTION[0] + z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+            let end = start + region.size[0] as usize;
+            packed_values.extend_from_slice(&values[start..end]);
+        }
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x: region.origin[0], y: region.origin[1], z: region.origin[2] }, aspect: wgpu::TextureAspect::All },
+        bytemuck::cast_slice(&packed_values),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(region.size[0] * 16), rows_per_image: Some(region.size[1]) },
+        wgpu::Extent3d { width: region.size[0], height: region.size[1], depth_or_array_layers: region.size[2] },
+    );
+}
+
+fn signed_distance_to_bounds(position: Vec3, bounds: GeometryBounds) -> f32 {
+    let center = (bounds.minimum + bounds.maximum) * 0.5;
+    let half_extent = (bounds.maximum - bounds.minimum) * 0.5;
+    let offset = (position - center).abs() - half_extent;
+    offset.max(Vec3::ZERO).length() + offset.max_element().min(0.0)
+}
+
+fn signed_distance_to_padded_bounds(position: Vec3, bounds: GeometryBounds, padding: Vec3) -> f32 {
+    signed_distance_to_bounds(position, GeometryBounds { minimum: bounds.minimum - padding, maximum: bounds.maximum + padding })
+}
+
+#[derive(Clone, Copy)]
+struct ProbeLocation {
+    position: Vec3,
 }
 
 struct VisibilityGrid {
@@ -2507,28 +3888,41 @@ impl VisibilityGrid {
         self.regions[self.index(self.cell_coordinate(position))]
     }
 
-    fn relocated_probe_position(&self, position: Vec3) -> Vec3 {
+    fn surface_region_at(&self, position: Vec3, normal: Vec3) -> u16 {
+        let direction = normal.normalize_or_zero();
+        let offset_distance = direction.abs().dot(self.cell_size).max(self.cell_size.min_element());
+        self.region_at(position + direction * offset_distance)
+    }
+
+    fn probe_location(&self, position: Vec3) -> Option<ProbeLocation> {
+        let region = self.region_at(position);
+        if region == 0 {
+            return None;
+        }
         let minimum_distance = self.cell_size.min_element() * 0.75;
         if self.distance_at(position) > minimum_distance {
-            return position;
+            return Some(ProbeLocation { position });
         }
         let offsets = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
-        let mut best_position = position;
-        let mut best_distance = self.distance_at(position);
+        let mut best_position = None;
+        let mut best_distance = f32::NEG_INFINITY;
         for radius in 1..=3 {
             for offset in offsets {
                 let candidate = position + offset * self.cell_size * radius as f32;
+                if self.region_at(candidate) != region {
+                    continue;
+                }
                 let distance = self.distance_at(candidate);
-                if distance > best_distance {
-                    best_position = candidate;
+                if distance > best_distance && distance > minimum_distance {
+                    best_position = Some(candidate);
                     best_distance = distance;
                 }
             }
-            if best_distance > minimum_distance {
+            if best_position.is_some() {
                 break;
             }
         }
-        best_position
+        best_position.map(|position| ProbeLocation { position })
     }
 
     fn ray_reaches_sky(&self, origin: Vec3, direction: Vec3) -> bool {
@@ -2549,15 +3943,18 @@ impl VisibilityGrid {
         false
     }
 
-    fn ray_reaches_target(&self, origin: Vec3, target: Vec3) -> bool {
-        let ray = target - origin;
+    fn ray_reaches_target(&self, origin: Vec3, target: Vec3, target_normal: Vec3) -> bool {
+        let target_normal = target_normal.normalize_or_zero();
+        let source_side = target_normal.dot(origin - target).signum();
+        let endpoint = target + target_normal * source_side * self.cell_size.max_element() * 0.75;
+        let ray = endpoint - origin;
         let length = ray.length();
         if length <= 0.01 {
             return true;
         }
         let direction = ray / length;
         let minimum_step = self.cell_size.min_element().max(0.01) * 0.5;
-        let target_tolerance = self.cell_size.length().max(minimum_step * 2.0);
+        let target_tolerance = (self.cell_size.min_element() * 1.5).max(minimum_step * 2.0);
         let mut distance_travelled = minimum_step;
         while distance_travelled < length - minimum_step {
             let position = origin + direction * distance_travelled;
@@ -2630,6 +4027,30 @@ fn geometry_bounds(instances: &[MeshInstance]) -> Vec<GeometryBounds> {
         .collect()
 }
 
+fn sdf_geometries(instances: &[MeshInstance]) -> Vec<SdfGeometry> {
+    instances
+        .iter()
+        .filter_map(|instance| {
+            let mut minimum = Vec3::splat(f32::INFINITY);
+            let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+            let mut vertex_color = Vec3::ZERO;
+            for vertex in instance.mesh.vertices() {
+                let position = instance.transform.transform_point(Vec3::from_array(vertex.position));
+                minimum = minimum.min(position);
+                maximum = maximum.max(position);
+                vertex_color += Vec3::from_array([vertex.color[0], vertex.color[1], vertex.color[2]]);
+            }
+            if !minimum.is_finite() || !maximum.is_finite() || instance.mesh.vertices().is_empty() {
+                return None;
+            }
+            vertex_color /= instance.mesh.vertices().len() as f32;
+            let material_color = Vec3::new(instance.material.base_color.red, instance.material.base_color.green, instance.material.base_color.blue);
+            let emission_color = Vec3::new(instance.material.emission.red, instance.material.emission.green, instance.material.emission.blue) * instance.material.emission_strength;
+            Some(SdfGeometry { bounds: GeometryBounds { minimum, maximum }, albedo: vertex_color * material_color, emission: emission_color })
+        })
+        .collect()
+}
+
 fn shadow_draw_data(instances: &[MeshInstance]) -> (Vec<Range<u32>>, Vec<GeometryBounds>) {
     let mut ranges = Vec::with_capacity(instances.len());
     let mut bounds = Vec::with_capacity(instances.len());
@@ -2692,13 +4113,12 @@ fn probe_irradiance(
     let mut irradiance = Vec3::splat(0.015);
     let mut direction_sum = Vec3::ZERO;
     let mut direction_weight = 0.0;
-    let sample_scale = 1.25;
     let probe_region = visibility_grid.region_at(position);
     for sample in static_samples.iter().chain(dynamic_samples.iter()) {
         let world_position = sample.position;
         let world_normal = sample.normal;
         let color = sample.color;
-        let sample_region = visibility_grid.region_at(world_position + world_normal * visibility_grid.cell_size.min_element().max(0.01));
+        let sample_region = visibility_grid.surface_region_at(world_position, world_normal);
         if probe_region != 0 && sample_region != 0 && probe_region != sample_region {
             continue;
         }
@@ -2708,14 +4128,14 @@ fn probe_irradiance(
             continue;
         }
         let source_direction = (world_position - position).normalize_or_zero();
-        let source_visible = visibility_grid.ray_reaches_target(visibility_grid.relocated_probe_position(position), world_position);
+        let source_visible = visibility_grid.ray_reaches_target(position, world_position, world_normal);
         if !source_visible {
             continue;
         }
         for light in lights {
             let light_visible = match light {
-                Light::Point(light) => visibility_grid.ray_reaches_target(light.position, world_position),
-                Light::Spot(light) => visibility_grid.ray_reaches_target(light.position, world_position),
+                Light::Point(light) => visibility_grid.ray_reaches_target(light.position, world_position, world_normal),
+                Light::Spot(light) => visibility_grid.ray_reaches_target(light.position, world_position, world_normal),
                 Light::Directional(_) => true,
             };
             if !light_visible {
@@ -2740,12 +4160,12 @@ fn probe_irradiance(
                 }
             };
             let reflected = Vec3::new(color.x * light_color.red, color.y * light_color.green, color.z * light_color.blue);
-            let contribution = direct * light_intensity * sample_attenuation * sample_scale * sample.weight;
+            let contribution = direct * light_intensity * sample_attenuation * PROBE_SURFACE_SAMPLE_SCALE * sample.weight;
             irradiance += reflected * contribution;
             direction_sum += source_direction * contribution;
             direction_weight += contribution;
         }
-        let emissive_contribution = sample.emission * sample.emission_strength.max(0.0) * sample_scale * sample.weight * sample_attenuation * 2.0;
+        let emissive_contribution = sample.emission * sample.emission_strength.max(0.0) * PROBE_SURFACE_SAMPLE_SCALE * sample.weight * sample_attenuation * 2.0;
         irradiance += emissive_contribution;
         let emissive_weight = emissive_contribution.max_element();
         direction_sum += source_direction * emissive_weight;
@@ -2759,9 +4179,50 @@ fn probe_irradiance(
 
 fn probe_sky_visibility(position: Vec3, visibility_grid: &VisibilityGrid) -> f32 {
     let directions = [Vec3::Y, Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z];
-    let origin = visibility_grid.relocated_probe_position(position);
-    let visible = directions.iter().filter(|direction| visibility_grid.ray_reaches_sky(origin, **direction)).count();
+    let visible = directions.iter().filter(|direction| visibility_grid.ray_reaches_sky(position, **direction)).count();
     visible as f32 / directions.len() as f32
+}
+
+#[cfg(test)]
+mod sdf_clearance_tests {
+    use super::*;
+
+    fn occupied_at(clipmap: &SdfClipmap, position: Vec3) -> bool {
+        let logical = ((position - clipmap.minimum) / clipmap.voxel_size).floor().as_uvec3();
+        let physical_x = (logical.x + clipmap.grid_offset[0]) % SDF_CLIPMAP_RESOLUTION[0];
+        let physical_y = (logical.y + clipmap.grid_offset[1]) % SDF_CLIPMAP_RESOLUTION[1];
+        let physical_z = (logical.z + clipmap.grid_offset[2]) % SDF_CLIPMAP_RESOLUTION[2];
+        let index = (physical_x + physical_y * SDF_CLIPMAP_RESOLUTION[0] + physical_z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+        clipmap.values[index][0] <= 0.0
+    }
+
+    #[test]
+    fn conservative_voxel_field_covers_floors_walls_corners_and_thin_geometry_after_scroll() {
+        let geometries = [
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-4.0, -1.0, 0.0), maximum: Vec3::new(-3.99, 1.0, 0.01) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+        ];
+        let mut clipmap = SdfClipmap::new(Vec3::ZERO, &geometries);
+        let geometry_samples = [Vec3::ZERO, Vec3::new(3.0, 1.0, 0.0), Vec3::new(4.0, 0.0, 4.0), Vec3::new(-4.0, 0.0, 0.0)];
+        assert!(geometry_samples.iter().all(|position| occupied_at(&clipmap, *position)));
+
+        let empty_position = Vec3::new(8.0, 1.0, 8.0);
+        let empty_logical = ((empty_position - clipmap.minimum) / clipmap.voxel_size).floor().as_uvec3();
+        let empty_physical_x = (empty_logical.x + clipmap.grid_offset[0]) % SDF_CLIPMAP_RESOLUTION[0];
+        let empty_physical_y = (empty_logical.y + clipmap.grid_offset[1]) % SDF_CLIPMAP_RESOLUTION[1];
+        let empty_physical_z = (empty_logical.z + clipmap.grid_offset[2]) % SDF_CLIPMAP_RESOLUTION[2];
+        let empty_index = (empty_physical_x + empty_physical_y * SDF_CLIPMAP_RESOLUTION[0] + empty_physical_z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+        let empty_center = clipmap.minimum + (empty_logical.as_vec3() + Vec3::splat(0.5)) * clipmap.voxel_size;
+        let nearest_geometry_distance = geometries.iter().map(|geometry| signed_distance_to_bounds(empty_center, geometry.bounds)).fold(f32::INFINITY, f32::min);
+        let safe_clearance = clipmap.emission_values[empty_index][3];
+        assert!(safe_clearance > 0.0);
+        assert!(safe_clearance <= nearest_geometry_distance);
+
+        clipmap.update(Vec3::splat(0.6), &geometries).expect("camera movement should scroll the SDF");
+        assert!(geometry_samples.iter().all(|position| occupied_at(&clipmap, *position)));
+    }
 }
 
 #[cfg(test)]

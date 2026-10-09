@@ -1,0 +1,18 @@
+capture.configure(960, 540, "genos-gi-motion-probes", false);
+capture.set_render_effects(true, true, false);
+capture.set_camera([12.5, 1.7, 31.0], [12.5, 1.6, 16.0]);
+capture.wait(1.0);
+capture.screenshot("start_lit");
+capture.move_camera([12.5, 1.7, 27.0], [12.5, 1.6, 12.0], 1.0);
+capture.screenshot("mid_lit");
+capture.move_camera([12.5, 1.7, 22.0], [12.5, 1.6, 7.0], 1.0);
+capture.screenshot("end_lit");
+capture.set_render_mode("gi_only");
+capture.screenshot("end_gi_only");
+capture.report("end_moving");
+capture.wait(0.75);
+capture.screenshot("end_settled_gi_only");
+capture.report("end_settled");
+capture.set_render_mode("lit");
+capture.screenshot("end_settled_lit");
+capture.exit();

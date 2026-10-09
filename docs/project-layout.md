@@ -13,7 +13,8 @@ labyrinth-engine/
 │   └── scripting/           # Rhai capture-plan compiler and capabilities
 ├── examples/
 │   ├── primitives/          # Basic mesh, camera, lighting, and UI smoke test
-│   └── lighting/            # Outdoor/interior lighting experiment scene
+│   ├── lighting/            # Outdoor/interior lighting experiment scene
+│   └── genos/               # Genos-inspired building and animated-light stress scene
 └── docs/
 ```
 

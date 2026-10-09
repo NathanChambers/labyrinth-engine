@@ -10,7 +10,7 @@ The scene registry owns renderable mesh, camera, and light values and returns ty
 
 ## Public contract
 
-`spawn_mesh`, `spawn_camera`, and `spawn_light` create `MeshId`, `CameraId`, and `LightId` handles. Applications retain those handles and mutate the associated values through typed accessors. `active_camera` selects one camera; `active_lights` selects zero or more directional lights for rendering.
+`spawn_mesh`, `spawn_camera`, `spawn_light`, `spawn_point_light`, and `spawn_spot_light` create typed handles. Applications retain those handles and mutate the associated values through typed accessors, including point- and directional-light accessors. `active_camera` selects one camera; `active_lights` selects the directional, point, and spot lights used for rendering.
 
 ## Connections
 

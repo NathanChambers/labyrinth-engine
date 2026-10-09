@@ -1,0 +1,14 @@
+capture.configure(1280, 720, "genos-performance", false);
+capture.wait(0.5);
+capture.set_render_effects(true, true, true);
+capture.report("full_scene");
+capture.set_render_effects(true, true, false);
+capture.wait(1.0);
+capture.report("no_gizmos");
+capture.set_render_effects(true, false, false);
+capture.wait(1.0);
+capture.report("no_gi");
+capture.set_render_effects(false, false, false);
+capture.wait(1.0);
+capture.report("no_gi_no_shadows");
+capture.exit();

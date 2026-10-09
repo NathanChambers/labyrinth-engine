@@ -175,15 +175,20 @@ impl DebugCapture {
         let path = directory.join(format!("{file_name}.txt"));
         let stats = renderer.performance_stats();
         let contents = format!(
-            "frame_cpu_ms={:.3}\ngpu_shadow_ms={:.3}\ngpu_scene_ms={:.3}\ngpu_gizmo_ms={:.3}\ngpu_ui_ms={:.3}\ngpu_total_ms={:.3}\nlight_update_ms={:.3}\ninstance_update_ms={:.3}\nprobe_update_ms={:.3}\nirradiance_upload_ms={:.3}\nvisibility_rebuild_ms={:.3}\nprobes_updated={}\nprobe_budget={}\nstatic_samples={}\ndynamic_samples={}\nregions={}\n",
+            "frame_cpu_ms={:.3}\ngpu_shadow_ms={:.3}\ngpu_scene_ms={:.3}\ngpu_sdf_gi_ms={:.3}\ngpu_gizmo_ms={:.3}\ngpu_ui_ms={:.3}\ngpu_total_ms={:.3}\nlight_update_ms={:.3}\ninstance_update_ms={:.3}\nsdf_build_cpu_ms={:.3}\nsdf_upload_ms={:.3}\nsdf_voxels_updated={}\ngi_history_valid_percent={:.1}\nprobe_update_ms={:.3}\nirradiance_upload_ms={:.3}\nvisibility_rebuild_ms={:.3}\nprobes_updated={}\nprobe_budget={}\nstatic_samples={}\ndynamic_samples={}\nregions={}\n",
             stats.frame_cpu_ms,
             stats.gpu_shadow_ms,
             stats.gpu_scene_ms,
+            stats.gpu_sdf_gi_ms,
             stats.gpu_gizmo_ms,
             stats.gpu_ui_ms,
             stats.gpu_total_ms,
             stats.light_update_ms,
             stats.instance_update_ms,
+            stats.sdf_build_cpu_ms,
+            stats.sdf_upload_ms,
+            stats.sdf_voxels_updated,
+            stats.gi_history_valid_percent,
             stats.probe_update_ms,
             stats.irradiance_upload_ms,
             stats.visibility_rebuild_ms,

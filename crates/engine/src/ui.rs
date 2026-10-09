@@ -133,6 +133,9 @@ struct UiButton {
     text: String,
     text_size: f32,
     text_color: Color,
+    text_centered: bool,
+    toggled_color: Color,
+    untoggled_color: Color,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +146,7 @@ struct UiLabel {
     text: String,
     size: f32,
     color: Color,
+    visible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -160,6 +164,7 @@ struct UiContainer {
     child_index: usize,
     auto_layout: Option<UiAutoLayout>,
     children: Vec<UiChild>,
+    visible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +179,7 @@ struct UiGraph {
     values: Vec<f32>,
     color: Color,
     background: Color,
+    visible: bool,
 }
 
 #[derive(Debug)]
@@ -208,8 +214,20 @@ impl UiCanvas {
     pub fn add_container(&mut self, parent: Option<UiContainerId>, layout: UiLayout, auto_layout: UiAutoLayout) -> UiContainerId {
         let id = UiContainerId(self.containers.len());
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Container(id))).unwrap_or(0);
-        self.containers.push(UiContainer { layout, parent, child_index, auto_layout: Some(auto_layout), children: Vec::new() });
+        self.containers.push(UiContainer { layout, parent, child_index, auto_layout: Some(auto_layout), children: Vec::new(), visible: true });
         id
+    }
+
+    pub fn set_container_visible(&mut self, container: UiContainerId, visible: bool) -> bool {
+        let Some(container) = self.containers.get_mut(container.0) else { return false };
+        container.visible = visible;
+        true
+    }
+
+    pub fn set_label_visible(&mut self, label: UiLabelId, visible: bool) -> bool {
+        let Some(label) = self.labels.get_mut(label.0) else { return false };
+        label.visible = visible;
+        true
     }
 
     pub fn add_panel(&mut self, layout: UiLayout, color: Color) -> UiPanelId {
@@ -218,10 +236,22 @@ impl UiCanvas {
         id
     }
 
+    pub fn set_panel_layout(&mut self, panel: UiPanelId, layout: UiLayout) -> bool {
+        let Some(panel) = self.panels.get_mut(panel.0) else { return false };
+        panel.layout = layout;
+        true
+    }
+
     pub fn add_graph(&mut self, layout: UiLayout, color: Color, background: Color) -> UiGraphId {
         let id = UiGraphId(self.graphs.len());
-        self.graphs.push(UiGraph { layout, values: Vec::new(), color, background });
+        self.graphs.push(UiGraph { layout, values: Vec::new(), color, background, visible: true });
         id
+    }
+
+    pub fn set_graph_visible(&mut self, graph: UiGraphId, visible: bool) -> bool {
+        let Some(graph) = self.graphs.get_mut(graph.0) else { return false };
+        graph.visible = visible;
+        true
     }
 
     pub fn set_graph_values(&mut self, graph: UiGraphId, values: &[f32]) -> bool {
@@ -270,8 +300,26 @@ impl UiCanvas {
     pub fn add_toggle_button_layout(&mut self, parent: Option<UiContainerId>, layout: UiLayout, toggled: bool) -> UiButtonId {
         let id = UiButtonId(self.buttons.len());
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Button(id))).unwrap_or(0);
-        self.buttons.push(UiButton { layout, parent, child_index, toggled, text: String::new(), text_size: 11.0, text_color: Color::WHITE });
+        self.buttons.push(UiButton {
+            layout,
+            parent,
+            child_index,
+            toggled,
+            text: String::new(),
+            text_size: 11.0,
+            text_color: Color::WHITE,
+            text_centered: true,
+            toggled_color: Color::rgb(0.2, 0.75, 0.35),
+            untoggled_color: Color::rgb(0.35, 0.38, 0.44),
+        });
         id
+    }
+
+    pub fn set_button_toggled_colors(&mut self, button: UiButtonId, toggled_color: Color, untoggled_color: Color) -> bool {
+        let Some(button) = self.buttons.get_mut(button.0) else { return false };
+        button.toggled_color = toggled_color;
+        button.untoggled_color = untoggled_color;
+        true
     }
 
     pub fn set_button_text(&mut self, button: UiButtonId, text: impl Into<String>, size: f32, color: Color) -> bool {
@@ -279,6 +327,12 @@ impl UiCanvas {
         button.text = text.into();
         button.text_size = size.max(1.0);
         button.text_color = color;
+        true
+    }
+
+    pub fn set_button_text_centered(&mut self, button: UiButtonId, centered: bool) -> bool {
+        let Some(button) = self.buttons.get_mut(button.0) else { return false };
+        button.text_centered = centered;
         true
     }
 
@@ -299,7 +353,7 @@ impl UiCanvas {
     pub fn add_label_layout(&mut self, parent: Option<UiContainerId>, layout: UiLayout, text: impl Into<String>, size: f32, color: Color) -> UiLabelId {
         let id = UiLabelId(self.labels.len());
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Label(id))).unwrap_or(0);
-        self.labels.push(UiLabel { layout, parent, child_index, text: text.into(), size: size.max(1.0), color });
+        self.labels.push(UiLabel { layout, parent, child_index, text: text.into(), size: size.max(1.0), color, visible: true });
         id
     }
 
@@ -317,7 +371,8 @@ impl UiCanvas {
         let cursor = input.cursor_position();
         if input.left_mouse_pressed() {
             for index in 0..self.buttons.len() {
-                if self.control_rect(UiChild::Button(UiButtonId(index)), root).contains(cursor) {
+                let button = UiChild::Button(UiButtonId(index));
+                if self.child_is_visible(button) && self.control_rect(button, root).contains(cursor) {
                     self.buttons[index].toggled = !self.buttons[index].toggled;
                 }
             }
@@ -326,7 +381,11 @@ impl UiCanvas {
             return;
         }
         for index in 0..self.sliders.len() {
-            let rect = self.control_rect(UiChild::Slider(UiSliderId(index)), root);
+            let slider = UiChild::Slider(UiSliderId(index));
+            if !self.child_is_visible(slider) {
+                continue;
+            }
+            let rect = self.control_rect(slider, root);
             if rect.contains(cursor) {
                 let amount = ((cursor.x - rect.x) / rect.width).clamp(0.0, 1.0);
                 let slider = &mut self.sliders[index];
@@ -345,10 +404,16 @@ impl UiCanvas {
             add_rect(&mut vertices, panel.layout.resolve(root), panel.color, width, height);
         }
         for graph in &self.graphs {
-            add_graph(&mut vertices, graph, graph.layout.resolve(root), width, height);
+            if graph.visible {
+                add_graph(&mut vertices, graph, graph.layout.resolve(root), width, height);
+            }
         }
         for (index, slider) in self.sliders.iter().enumerate() {
-            let rect = self.control_rect(UiChild::Slider(UiSliderId(index)), root);
+            let child = UiChild::Slider(UiSliderId(index));
+            if !self.child_is_visible(child) {
+                continue;
+            }
+            let rect = self.control_rect(child, root);
             let track = UiRect::new(rect.x, rect.y + rect.height * 0.35, rect.width, rect.height * 0.3);
             add_rect(&mut vertices, track, slider.track_color, width, height);
             let amount = (slider.value - slider.min) / (slider.max - slider.min);
@@ -357,17 +422,31 @@ impl UiCanvas {
             add_rect(&mut vertices, UiRect::new(knob_x, rect.y, 10.0, rect.height), slider.knob_color, width, height);
         }
         for (index, button) in self.buttons.iter().enumerate() {
-            let color = if button.toggled { Color::rgb(0.2, 0.75, 0.35) } else { Color::rgb(0.35, 0.38, 0.44) };
-            add_rect(&mut vertices, self.control_rect(UiChild::Button(UiButtonId(index)), root), color, width, height);
+            let child = UiChild::Button(UiButtonId(index));
+            if !self.child_is_visible(child) {
+                continue;
+            }
+            let color = if button.toggled { button.toggled_color } else { button.untoggled_color };
+            add_rect(&mut vertices, self.control_rect(child, root), color, width, height);
         }
         if let Some(font) = &self.font {
             for (index, button) in self.buttons.iter().enumerate() {
-                if !button.text.is_empty() {
-                    add_text(&mut vertices, font.font(), &button.text, button.text_size, button.text_color, self.control_rect(UiChild::Button(UiButtonId(index)), root), (width, height));
+                let child = UiChild::Button(UiButtonId(index));
+                if self.child_is_visible(child) && !button.text.is_empty() {
+                    let mut rect = self.control_rect(UiChild::Button(UiButtonId(index)), root);
+                    if !button.text_centered {
+                        rect.x += 8.0;
+                        rect.width = (rect.width - 16.0).max(0.0);
+                    }
+                    add_text(&mut vertices, font.font(), &button.text, button.text_size, button.text_color, rect, (width, height), button.text_centered);
                 }
             }
             for (index, label) in self.labels.iter().enumerate() {
-                let rect = self.control_rect(UiChild::Label(UiLabelId(index)), root);
+                let child = UiChild::Label(UiLabelId(index));
+                if !self.child_is_visible(child) {
+                    continue;
+                }
+                let rect = self.control_rect(child, root);
                 add_label(&mut vertices, font.font(), label, rect, (width, height));
             }
         }
@@ -399,6 +478,30 @@ impl UiCanvas {
         }
     }
 
+    fn child_is_visible(&self, child: UiChild) -> bool {
+        let parent = match child {
+            UiChild::Slider(id) => self.sliders[id.0].parent,
+            UiChild::Button(id) => self.buttons[id.0].parent,
+            UiChild::Label(id) => {
+                let label = &self.labels[id.0];
+                return label.visible && self.container_is_visible(label.parent);
+            }
+            UiChild::Container(id) => return self.container_is_visible(Some(id)),
+        };
+        self.container_is_visible(parent)
+    }
+
+    fn container_is_visible(&self, mut container_id: Option<UiContainerId>) -> bool {
+        while let Some(id) = container_id {
+            let container = &self.containers[id.0];
+            if !container.visible {
+                return false;
+            }
+            container_id = container.parent;
+        }
+        true
+    }
+
     fn container_rect(&self, id: UiContainerId, root: UiRect) -> UiRect {
         let container = &self.containers[id.0];
         let parent = container.parent.map(|parent| self.container_rect(parent, root)).unwrap_or(root);
@@ -415,12 +518,14 @@ impl UiCanvas {
     fn auto_child_rect(&self, parent_rect: UiRect, parent_id: UiContainerId, child_index: usize, layout: UiLayout, fallback: UiRect) -> UiRect {
         let Some(auto) = self.containers[parent_id.0].auto_layout else { return fallback };
         let children = &self.containers[parent_id.0].children;
+        let visible_children = children.iter().filter(|child| self.child_is_visible(**child)).count();
         let available = match auto.direction {
-            UiFlexDirection::Column => parent_rect.height - auto.padding * 2.0 - auto.spacing * children.len().saturating_sub(1) as f32,
-            UiFlexDirection::Row => parent_rect.width - auto.padding * 2.0 - auto.spacing * children.len().saturating_sub(1) as f32,
+            UiFlexDirection::Column => parent_rect.height - auto.padding * 2.0 - auto.spacing * visible_children.saturating_sub(1) as f32,
+            UiFlexDirection::Row => parent_rect.width - auto.padding * 2.0 - auto.spacing * visible_children.saturating_sub(1) as f32,
         };
         let fixed = children
             .iter()
+            .filter(|child| self.child_is_visible(**child))
             .map(|child| self.child_layout(*child))
             .map(|child_layout| match auto.direction {
                 UiFlexDirection::Column => child_layout.size.y,
@@ -430,6 +535,7 @@ impl UiCanvas {
             .sum::<f32>();
         let fill_count = children
             .iter()
+            .filter(|child| self.child_is_visible(**child))
             .map(|child| self.child_layout(*child))
             .filter(|child_layout| match auto.direction {
                 UiFlexDirection::Column => child_layout.size.y <= 0.0,
@@ -438,7 +544,7 @@ impl UiCanvas {
             .count();
         let fill_size = if fill_count == 0 { 0.0 } else { ((available - fixed) / fill_count as f32).max(0.0) };
         let mut cursor = auto.padding;
-        for child in self.containers[parent_id.0].children.iter().take(child_index) {
+        for child in self.containers[parent_id.0].children.iter().take(child_index).filter(|child| self.child_is_visible(**child)) {
             let prior = self.child_layout(*child);
             let prior_size = match auto.direction {
                 UiFlexDirection::Column => prior.size.y,
@@ -489,7 +595,7 @@ impl UiCanvas {
 }
 
 fn add_label(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, label: &UiLabel, rect: UiRect, viewport: (u32, u32)) {
-    add_text(vertices, font, &label.text, label.size, label.color, rect, viewport);
+    add_text(vertices, font, &label.text, label.size, label.color, rect, viewport, false);
 }
 
 fn add_graph(vertices: &mut Vec<UiVertex>, graph: &UiGraph, rect: UiRect, width: u32, height: u32) {
@@ -520,9 +626,10 @@ fn add_line(vertices: &mut Vec<UiVertex>, start: Vec2, end: Vec2, color: Color, 
     vertices.extend_from_slice(&[first, second, third, first, third, fourth]);
 }
 
-fn add_text(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, text: &str, size: f32, color: Color, rect: UiRect, viewport: (u32, u32)) {
+fn add_text(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, text: &str, size: f32, color: Color, rect: UiRect, viewport: (u32, u32), centered: bool) {
     let scaled = font.as_scaled(PxScale::from(size));
-    let mut cursor_x = rect.x;
+    let text_width = text.chars().map(|character| scaled.h_advance(scaled.glyph_id(character))).sum::<f32>();
+    let mut cursor_x = if centered { rect.x + (rect.width - text_width).max(0.0) * 0.5 } else { rect.x };
     let baseline = rect.y + (rect.height - size).max(0.0) * 0.5 + scaled.ascent();
     for character in text.chars() {
         let mut glyph = scaled.scaled_glyph(character);
