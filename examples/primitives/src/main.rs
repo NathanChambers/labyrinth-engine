@@ -4,6 +4,7 @@ use labyrinth::{
     Application, Camera, CameraId, Color, DirectionalLight, Easing, EulerRot, FontAsset, GraphicsApi, KeyCode, LightId, MeshId, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId,
     UiLayout, UiSliderId, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run,
 };
+use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
 
 struct PrimitiveDemo {
     cube: Option<MeshId>,
@@ -19,6 +20,7 @@ struct PrimitiveDemo {
     camera_pitch: f32,
     light_angle: f32,
     font: Option<FontAsset>,
+    debug_panels: Option<DebugPanels>,
 }
 
 impl PrimitiveDemo {
@@ -37,9 +39,13 @@ impl PrimitiveDemo {
         self.font = Some(font);
         let panel_layout = UiLayout::anchored(Vec2::new(320.0, 110.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0));
         context.ui.set_window_layout(panel_layout);
-        context.ui.add_label_layout(None, UiLayout::anchored(Vec2::new(200.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(34.0, 24.0)), "Lighting", 16.0, Color::WHITE);
+        let header = context.ui.add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(320.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0)), false);
+        context.ui.set_button_text(header, "Lighting", 16.0, Color::WHITE);
+        context.ui.set_button_text_centered(header, false);
+        context.ui.set_button_toggled_colors(header, Color::rgba(0.1, 0.12, 0.17, 1.0), Color::rgba(0.1, 0.12, 0.17, 1.0));
 
         let stack = context.ui.add_container(None, UiLayout::anchored(Vec2::new(320.0, 84.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 50.0)), UiAutoLayout::column(10.0, 4.0));
+        context.ui.register_window_panel(header, stack, 26.0);
         let light_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
         context.ui.add_label_layout(
             Some(light_row),
@@ -60,6 +66,8 @@ impl PrimitiveDemo {
             Color::rgb(0.75, 0.8, 0.9),
         );
         self.time_slider = Some(context.ui.add_slider_layout(Some(sphere_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 2.0, 0.5));
+        self.debug_panels =
+            Some(DebugPanels::new(context, DebugPanelsConfig::new("Render Debug").with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0)).with_performance_offset(Vec2::new(-24.0, 500.0))));
         Ok(())
     }
 
@@ -91,7 +99,7 @@ impl PrimitiveDemo {
         Ok(())
     }
 
-    fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32) -> Result<(), String> {
+    fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32, movement_keys_active: bool) -> Result<(), String> {
         let mouse_delta = context.input.mouse_delta();
         if context.input.cursor_captured() {
             self.camera_yaw -= mouse_delta.x * 0.002;
@@ -101,17 +109,19 @@ impl PrimitiveDemo {
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was removed before update")?;
         let rotation = Quat::from_euler(EulerRot::YXZ, self.camera_yaw, self.camera_pitch, 0.0);
         let mut movement = Vec3::ZERO;
-        if context.input.is_key_down(KeyCode::KeyW) {
-            movement += rotation * Vec3::NEG_Z;
-        }
-        if context.input.is_key_down(KeyCode::KeyS) {
-            movement += rotation * Vec3::Z;
-        }
-        if context.input.is_key_down(KeyCode::KeyD) {
-            movement += rotation * Vec3::X;
-        }
-        if context.input.is_key_down(KeyCode::KeyA) {
-            movement += rotation * Vec3::NEG_X;
+        if !movement_keys_active {
+            if context.input.is_key_down(KeyCode::KeyW) {
+                movement += rotation * Vec3::NEG_Z;
+            }
+            if context.input.is_key_down(KeyCode::KeyS) {
+                movement += rotation * Vec3::Z;
+            }
+            if context.input.is_key_down(KeyCode::KeyD) {
+                movement += rotation * Vec3::X;
+            }
+            if context.input.is_key_down(KeyCode::KeyA) {
+                movement += rotation * Vec3::NEG_X;
+            }
         }
         camera.transform.rotation = rotation;
         camera.transform.translate(movement.normalize_or_zero() * (4.0 * delta_seconds));
@@ -144,8 +154,11 @@ impl Application for PrimitiveDemo {
         let delta_seconds = context.time.delta_seconds();
         self.update_cube(context, delta_seconds)?;
         self.update_sphere(context, delta_seconds)?;
-        self.update_camera(context, delta_seconds)?;
-        self.update_light(context, delta_seconds)
+        self.debug_panels.as_mut().expect("shared debug panels are initialized").update(context);
+        let movement_keys_active = self.debug_panels.as_ref().is_some_and(DebugPanels::movement_keys_active);
+        self.update_camera(context, delta_seconds, movement_keys_active)?;
+        self.update_light(context, delta_seconds)?;
+        Ok(())
     }
 }
 
@@ -181,6 +194,7 @@ fn main() -> Result<(), String> {
             camera_pitch: -0.33,
             light_angle: 0.0,
             font: None,
+            debug_panels: None,
         },
     )
 }

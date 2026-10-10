@@ -7,4 +7,5 @@ publish = false
 
 [dependencies]
 labyrinth = { path = "../../crates/engine" }
+labyrinth_debug_ui = { path = "../../crates/debug_ui" }
 mesh = { path = "../../crates/mesh" }

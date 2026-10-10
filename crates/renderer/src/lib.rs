@@ -25,16 +25,29 @@ const MAX_IRRADIANCE_PROBES: usize = 4096;
 const PROBE_SURFACE_SAMPLE_SCALE: f32 = 1.25;
 const VISIBILITY_REBUILD_INTERVAL: u32 = 4;
 const GPU_TIMESTAMP_COUNT: u32 = 12;
-const SDF_CLIPMAP_RESOLUTION: [u32; 3] = [64, 32, 64];
-const SDF_CLIPMAP_EXTENT: Vec3 = Vec3::new(32.0, 16.0, 32.0);
+const SDF_CLIPMAP_RESOLUTION: [u32; 3] = [128, 32, 128];
+const SDF_CLIPMAP_EXTENT: Vec3 = Vec3::new(64.0, 16.0, 64.0);
+const SCENE_GI_PADDING: Vec3 = Vec3::new(8.0, 4.0, 8.0);
 const SDF_MAX_DISTANCE: f32 = 16.0;
-const RADIANCE_FIELD_RESOLUTION: [u32; 3] = [8, 4, 8];
+const SDF_CLEARANCE_RADIUS_VOXELS: u16 = 4;
+const RADIANCE_FIELD_DEFAULT_RESOLUTION: [u32; 3] = [32, 8, 32];
+const RADIANCE_FIELD_MAX_RESOLUTION: [u32; 3] = [40, 10, 40];
 const SURFACE_PROBE_STRIDE: u32 = 16;
 const SURFACE_PROBE_CAPACITY: u32 = 131_072;
-const RADIANCE_NEAR_FIELD_EXTENT: Vec3 = Vec3::new(16.0, 8.0, 16.0);
-const RADIANCE_FAR_FIELD_EXTENT: Vec3 = SDF_CLIPMAP_EXTENT;
-const RADIANCE_FIELD_DIRECTIONS: usize = 6;
-const RADIANCE_FIELD_REFRESH_INTERVAL: u32 = 32;
+const RADIANCE_FIELD_EXTENT: Vec3 = SDF_CLIPMAP_EXTENT;
+pub const RADIANCE_FIELD_CHANNEL_COUNT: usize = 6;
+pub const RADIANCE_FIELD_RAY_COUNT: usize = 24;
+pub const RADIANCE_FIELD_RAYS_PER_CHANNEL: usize = RADIANCE_FIELD_RAY_COUNT / RADIANCE_FIELD_CHANNEL_COUNT;
+pub const RADIANCE_SURFACE_CANDIDATE_COUNT: usize = 8;
+const RADIANCE_SURFACE_INSPECTION_VEC4_COUNT: usize = 4 + RADIANCE_SURFACE_CANDIDATE_COUNT * 9;
+const RADIANCE_SURFACE_INSPECTION_SIZE: u64 = (RADIANCE_SURFACE_INSPECTION_VEC4_COUNT * mem::size_of::<[f32; 4]>()) as u64;
+const RADIANCE_FIELD_REFRESH_COOLDOWN_FRAMES: u32 = 60;
+const RADIANCE_FIELD_DIRTY_CELL_BUDGET: usize = 16;
+const RADIANCE_FIELD_NEW_CELL_BUDGET: usize = RADIANCE_FIELD_DIRTY_CELL_BUDGET / 2;
+const RADIANCE_FIELD_SAMPLE_ROUND_MAX: u32 = u16::MAX as u32;
+const RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT: usize = 13;
+const RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE: u64 = (RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT * mem::size_of::<[f32; 4]>()) as u64;
+const RADIANCE_FIELD_VALUE_SIZE: u64 = mem::size_of::<[f32; 4]>() as u64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -51,6 +64,7 @@ pub enum RenderDebugMode {
     Wireframe,
     ShadowVisibility,
     GiOnly,
+    GiSupport,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -270,7 +284,7 @@ impl Default for RenderSettings {
             ambient_occlusion_enabled: false,
             ambient_intensity: 0.02,
             irradiance_enabled: true,
-            surface_probes_enabled: true,
+            surface_probes_enabled: false,
             shadow_cascade_count: SHADOW_CASCADE_COUNT as u32,
             shadow_resolution: SHADOW_MAP_SIZE,
             shadow_depth_bias: 0.00005,
@@ -394,7 +408,6 @@ struct SdfClipmapUniform {
     maximum: [f32; 4],
     resolution: [u32; 4],
     settings: [u32; 4],
-    grid_offset: [u32; 4],
     sky_radiance: [f32; 4],
 }
 
@@ -404,9 +417,9 @@ struct RadianceFieldUniform {
     minimum: [f32; 4],
     maximum: [f32; 4],
     resolution: [u32; 4],
-    grid_offset: [u32; 4],
-    scroll_shift: [i32; 4],
     settings: [u32; 4],
+    scheduled_cells: [[u32; 4]; 4],
+    schedule_metadata: [u32; 4],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -424,7 +437,6 @@ struct SdfClipmap {
     emission_values: Vec<[f32; 4]>,
     geometry_bounds: Vec<SdfGeometry>,
     geometry_bvh: SdfGeometryBvh,
-    grid_offset: [u32; 3],
 }
 
 struct SdfGeometryBvh {
@@ -443,26 +455,34 @@ struct SdfBvhNode {
 }
 
 struct WorldRadianceField {
-    extent: Vec3,
     resolution: [u32; 3],
     minimum: Vec3,
     maximum: Vec3,
     cell_size: Vec3,
-    grid_offset: [u32; 3],
     frame_index: u32,
-    refresh_frames_remaining: u32,
+    sample_rounds: Vec<u32>,
+    refresh_cooldown_frames: u32,
+    refresh_snapshot_pending: bool,
     needs_full_refresh: bool,
+    queued_new_cells: VecDeque<u32>,
+    queued_new_cell_mask: Vec<bool>,
+    queued_initial_sample_cells: VecDeque<u32>,
+    queued_initial_sample_cell_mask: Vec<bool>,
+    queued_priority_cells: VecDeque<u32>,
+    queued_priority_cell_mask: Vec<bool>,
+    queued_dirty_cells: VecDeque<u32>,
+    queued_dirty_cell_mask: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct RadianceFieldPriority {
+    position: Vec3,
+    radius: f32,
 }
 
 #[derive(Clone, Copy)]
 struct SdfTextureRegion {
     origin: [u32; 3],
-    size: [u32; 3],
-}
-
-#[derive(Clone, Copy)]
-struct SdfLogicalRegion {
-    start: [u32; 3],
     size: [u32; 3],
 }
 
@@ -477,6 +497,35 @@ pub struct RendererIrradianceVolume {
     pub maximum: [f32; 3],
     pub resolution: [u32; 3],
     pub enabled: bool,
+}
+
+/// Radiance-field cell counts, ordered as X, Y, Z.
+/// The renderer clamps horizontal axes to 40 cells and the vertical axis to 10 cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadianceFieldResolution {
+    pub resolution: [u32; 3],
+}
+
+impl Default for RadianceFieldResolution {
+    fn default() -> Self {
+        Self { resolution: RADIANCE_FIELD_DEFAULT_RESOLUTION }
+    }
+}
+
+impl RadianceFieldResolution {
+    fn bounded(self) -> Self {
+        Self { resolution: std::array::from_fn(|axis| self.resolution[axis].clamp(1, RADIANCE_FIELD_MAX_RESOLUTION[axis])) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererRadianceFieldGrid {
+    /// Minimum world-space corner of the field.
+    pub minimum: [f32; 3],
+    /// Maximum world-space corner of the field.
+    pub maximum: [f32; 3],
+    /// Cell count along X, Y, and Z.
+    pub resolution: [u32; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -510,6 +559,79 @@ pub struct RendererPerformanceStats {
     pub gpu_total_ms: f32,
     pub scheduled_shadow_lights: u32,
     pub dirty_shadow_lights: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RendererGiTraceDebugMode {
+    #[default]
+    Geometry,
+    Radiance,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererGiRayDiagnostic {
+    pub valid: bool,
+    pub relocation_data_valid: bool,
+    pub relocation_succeeded: bool,
+    pub selected_cell: [u32; 3],
+    pub termination_reason: u32,
+    pub travelled_distance: f32,
+    pub hit_position: [f32; 3],
+    pub hit_normal: [f32; 3],
+    pub original_cell_center: [f32; 3],
+    pub ray_origin: [f32; 3],
+    pub relocation_offset: [f32; 3],
+    pub radiance: [f32; 3],
+    pub direct_radiance: [f32; 3],
+    pub emission_radiance: [f32; 3],
+    pub sky_radiance: [f32; 3],
+    pub stored_radiance: [f32; 3],
+    pub radiance_difference: [f32; 3],
+    pub last_update_age_frames: u32,
+    pub ray_direction: [f32; 3],
+    pub accumulated_sample_count: u32,
+    pub attempted_sample_count: u32,
+    pub blend_factor: f32,
+    pub directional_weights: [f32; RADIANCE_FIELD_CHANNEL_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererRadianceSurfaceCandidate {
+    pub grid_position: [u32; 3],
+    pub probe_position: [f32; 3],
+    pub probe_valid: bool,
+    pub spatial_weight: f32,
+    pub side_weight: f32,
+    pub directional_radiance: [f32; 3],
+    pub directional_support: f32,
+    pub contribution_radiance: [f32; 3],
+    pub final_weight: f32,
+    pub first_blocking_voxel: [i32; 3],
+    pub has_first_blocking_voxel: bool,
+    pub first_occupied_after_start: [i32; 3],
+    pub has_occupied_voxel_after_start: bool,
+    pub first_occupied_after_start_minimum: [f32; 3],
+    pub first_occupied_after_start_maximum: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererRadianceSurfaceInspection {
+    pub valid: bool,
+    pub inside_field: bool,
+    pub world_position: [f32; 3],
+    pub normal: [f32; 3],
+    pub sdf_start_voxel: [i32; 3],
+    pub sdf_start_in_bounds: bool,
+    pub sdf_start_occupied: bool,
+    pub sdf_origin_offset: [f32; 3],
+    pub candidates: [RendererRadianceSurfaceCandidate; RADIANCE_SURFACE_CANDIDATE_COUNT],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RadianceSurfaceInspectionSettings {
+    pixel: [u32; 4],
 }
 
 struct GpuTimestampState {
@@ -574,6 +696,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     radiance_field_pipeline: wgpu::ComputePipeline,
+    radiance_surface_inspection_pipeline: wgpu::ComputePipeline,
     surface_probe_update_pipeline: wgpu::ComputePipeline,
     surface_probe_maintenance_pipeline: wgpu::ComputePipeline,
     depth_prepass_pipeline: wgpu::RenderPipeline,
@@ -599,17 +722,27 @@ pub struct Renderer {
     sdf_uniform_buffer: wgpu::Buffer,
     _sdf_texture: wgpu::Texture,
     _sdf_emission_texture: wgpu::Texture,
-    near_radiance_field: WorldRadianceField,
-    far_radiance_field: WorldRadianceField,
-    near_radiance_field_uniform_buffer: wgpu::Buffer,
-    far_radiance_field_uniform_buffer: wgpu::Buffer,
-    _near_radiance_field_buffer: wgpu::Buffer,
-    _far_radiance_field_buffer: wgpu::Buffer,
+    radiance_field: WorldRadianceField,
+    radiance_field_uniform_buffer: wgpu::Buffer,
+    _radiance_field_buffer: wgpu::Buffer,
+    _radiance_field_probe_buffer: wgpu::Buffer,
     _radiance_field_trace_debug_buffer: wgpu::Buffer,
+    gi_trace_readback_buffer: wgpu::Buffer,
+    gi_trace_readback_receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    gi_trace_readback_cell: [u32; 3],
+    gi_trace_readback_frame: u32,
+    gi_trace_diagnostics: [RendererGiRayDiagnostic; RADIANCE_FIELD_RAY_COUNT],
+    radiance_surface_inspection_settings_buffer: wgpu::Buffer,
+    radiance_surface_inspection_values_buffer: wgpu::Buffer,
+    radiance_surface_inspection_readback_buffer: wgpu::Buffer,
+    radiance_surface_inspection_readback_receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    radiance_surface_inspection_request: Option<[u32; 2]>,
+    radiance_surface_inspection: RendererRadianceSurfaceInspection,
     surface_probe_uniform_buffer: wgpu::Buffer,
     _surface_probe_buffer: wgpu::Buffer,
     sdf_gi_enabled: bool,
     gi_radiance_frozen: bool,
+    gi_radiance_temporal_accumulation_enabled: bool,
     irradiance_probe_ages: [u32; MAX_IRRADIANCE_PROBES],
     irradiance_update_budget: usize,
     sky_lighting: RendererSkyLighting,
@@ -670,7 +803,6 @@ pub struct Renderer {
     world_radiance_gizmos_enabled: bool,
     world_radiance_trace_gizmos_enabled: bool,
     selected_radiance_cell: [u32; 3],
-    selected_radiance_field_far: bool,
     sdf_occupancy_gizmos_enabled: bool,
     render_debug_mode: RenderDebugMode,
     render_settings: RenderSettings,
@@ -689,6 +821,19 @@ impl Renderer {
     }
 
     pub fn new(window: Arc<Window>, graphics_api: GraphicsApi, camera: &Camera, lights: &[Light], instances: &[MeshInstance], irradiance_volumes: &[RendererIrradianceVolume]) -> Result<Self, String> {
+        Self::new_with_radiance_field_resolution(window, graphics_api, camera, lights, instances, irradiance_volumes, RadianceFieldResolution::default())
+    }
+
+    pub fn new_with_radiance_field_resolution(
+        window: Arc<Window>,
+        graphics_api: GraphicsApi,
+        camera: &Camera,
+        lights: &[Light],
+        instances: &[MeshInstance],
+        irradiance_volumes: &[RendererIrradianceVolume],
+        radiance_field_resolution: RadianceFieldResolution,
+    ) -> Result<Self, String> {
+        let radiance_field_resolution = radiance_field_resolution.bounded();
         let (vertices, indices) = flatten_instances(instances)?;
         let (shadow_draw_ranges, shadow_caster_bounds) = shadow_draw_data(instances);
         if vertices.is_empty() || indices.is_empty() {
@@ -914,7 +1059,8 @@ impl Renderer {
         let visibility_bounds = geometry_bounds(instances);
         let visibility_grid = VisibilityGrid::from_bounds(&visibility_bounds);
         let sdf_geometries = sdf_geometries(instances);
-        let sdf_clipmap = SdfClipmap::new(camera.transform.position, &sdf_geometries);
+        let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
+        let sdf_clipmap = SdfClipmap::new(scene_bounds, &sdf_geometries);
         let sdf_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("AABB SDF geometry and albedo clipmap"),
             size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
@@ -937,39 +1083,58 @@ impl Renderer {
             view_formats: &[],
         });
         let sdf_emission_view = sdf_emission_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
-        let near_radiance_field = WorldRadianceField::new(camera.transform.position, RADIANCE_NEAR_FIELD_EXTENT, RADIANCE_FIELD_RESOLUTION);
-        let far_radiance_field = WorldRadianceField::new(camera.transform.position, RADIANCE_FAR_FIELD_EXTENT, RADIANCE_FIELD_RESOLUTION);
+        let radiance_field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, radiance_field_resolution.resolution);
         let radiance_field_uniform = RadianceFieldUniform::zeroed();
-        let near_radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("near world radiance field uniform"),
+        let radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world radiance field uniform"),
             contents: bytemuck::bytes_of(&radiance_field_uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let far_radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("far world radiance field uniform"),
-            contents: bytemuck::bytes_of(&radiance_field_uniform),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let radiance_field_values = vec![[0.0_f32; 4]; RADIANCE_FIELD_RESOLUTION.iter().product::<u32>() as usize * RADIANCE_FIELD_DIRECTIONS];
-        let near_radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("near world radiance field directional lobes"),
+        let radiance_field_values = vec![[0.0_f32; 4]; radiance_field_resolution.resolution.iter().product::<u32>() as usize * RADIANCE_FIELD_CHANNEL_COUNT];
+        let radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world radiance field directional lobes"),
             contents: bytemuck::cast_slice(&radiance_field_values),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
-        let far_radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("far world radiance field directional lobes"),
-            contents: bytemuck::cast_slice(&radiance_field_values),
-            usage: wgpu::BufferUsages::STORAGE,
+        let radiance_field_probe_values = vec![[0.0_f32; 4]; radiance_field_resolution.resolution.iter().product::<u32>() as usize];
+        let radiance_field_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world radiance field probe relocation state"),
+            contents: bytemuck::cast_slice(&radiance_field_probe_values),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let radiance_field_trace_debug_values = vec![[[0.0_f32; 4]; 4]; RADIANCE_FIELD_RESOLUTION.iter().product::<u32>() as usize * RADIANCE_FIELD_DIRECTIONS * 2];
+        let radiance_field_trace_debug_count = radiance_field_resolution.resolution.iter().product::<u32>() as usize;
+        let radiance_field_trace_debug_values = vec![[[0.0_f32; 4]; RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT]; radiance_field_trace_debug_count * RADIANCE_FIELD_RAY_COUNT];
         let radiance_field_trace_debug_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field trace diagnostics"),
             contents: bytemuck::cast_slice(&radiance_field_trace_debug_values),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let gi_trace_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("selected GI ray radiance readback"),
+            size: RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64 + RADIANCE_FIELD_VALUE_SIZE * RADIANCE_FIELD_CHANNEL_COUNT as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let radiance_surface_inspection_settings_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GI surface inspection pixel"),
+            contents: bytemuck::bytes_of(&RadianceSurfaceInspectionSettings { pixel: [0; 4] }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let radiance_surface_inspection_values = vec![[0.0_f32; 4]; RADIANCE_SURFACE_INSPECTION_VEC4_COUNT];
+        let radiance_surface_inspection_values_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GI surface candidate contributions"),
+            contents: bytemuck::cast_slice(&radiance_surface_inspection_values),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let radiance_surface_inspection_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GI surface inspection readback"),
+            size: RADIANCE_SURFACE_INSPECTION_SIZE,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
         });
         let gi_gizmo_selection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("selected GI radiance cell"),
-            contents: bytemuck::cast_slice(&[4_u32, 1, 4, 0]),
+            contents: bytemuck::cast_slice(&[4_u32, 1, 4, 0, 0, 0, 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let surface_probe_uniform = SurfaceProbeUniform {
@@ -1119,18 +1284,6 @@ impl Renderer {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 13,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 14,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 15,
                     visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
@@ -1144,6 +1297,24 @@ impl Renderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 20,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 22,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 23,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 24,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
@@ -1165,13 +1336,14 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&sdf_view) },
                 wgpu::BindGroupEntry { binding: 9, resource: sdf_uniform_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sdf_emission_view) },
-                wgpu::BindGroupEntry { binding: 11, resource: near_radiance_field_uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: near_radiance_field_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: far_radiance_field_uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: far_radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: radiance_field_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 15, resource: surface_probe_uniform_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 16, resource: surface_probe_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 22, resource: radiance_field_probe_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 23, resource: radiance_surface_inspection_settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 24, resource: radiance_surface_inspection_values_buffer.as_entire_binding() },
             ],
         });
         let gi_gizmo_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1208,18 +1380,6 @@ impl Renderer {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 13,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 14,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 16,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
@@ -1246,10 +1406,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&sdf_view) },
                 wgpu::BindGroupEntry { binding: 9, resource: sdf_uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: near_radiance_field_uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 12, resource: near_radiance_field_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 13, resource: far_radiance_field_uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 14, resource: far_radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: radiance_field_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 16, resource: surface_probe_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 21, resource: gi_gizmo_selection_buffer.as_entire_binding() },
@@ -1299,6 +1457,14 @@ impl Renderer {
             layout: Some(&radiance_field_pipeline_layout),
             module: &shader,
             entry_point: Some("update_world_radiance_field"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let radiance_surface_inspection_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GI surface contribution inspection pipeline"),
+            layout: Some(&radiance_field_pipeline_layout),
+            module: &shader,
+            entry_point: Some("inspect_radiance_surface"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -1513,6 +1679,7 @@ impl Renderer {
             config,
             pipeline,
             radiance_field_pipeline,
+            radiance_surface_inspection_pipeline,
             surface_probe_update_pipeline,
             surface_probe_maintenance_pipeline,
             depth_prepass_pipeline,
@@ -1536,17 +1703,27 @@ impl Renderer {
             sdf_uniform_buffer,
             _sdf_texture: sdf_texture,
             _sdf_emission_texture: sdf_emission_texture,
-            near_radiance_field,
-            far_radiance_field,
-            near_radiance_field_uniform_buffer,
-            far_radiance_field_uniform_buffer,
-            _near_radiance_field_buffer: near_radiance_field_buffer,
-            _far_radiance_field_buffer: far_radiance_field_buffer,
+            radiance_field,
+            radiance_field_uniform_buffer,
+            _radiance_field_buffer: radiance_field_buffer,
+            _radiance_field_probe_buffer: radiance_field_probe_buffer,
             _radiance_field_trace_debug_buffer: radiance_field_trace_debug_buffer,
+            gi_trace_readback_buffer,
+            gi_trace_readback_receiver: None,
+            gi_trace_readback_cell: [4, 1, 4],
+            gi_trace_readback_frame: 0,
+            gi_trace_diagnostics: [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT],
+            radiance_surface_inspection_settings_buffer,
+            radiance_surface_inspection_values_buffer,
+            radiance_surface_inspection_readback_buffer,
+            radiance_surface_inspection_readback_receiver: None,
+            radiance_surface_inspection_request: None,
+            radiance_surface_inspection: RendererRadianceSurfaceInspection::default(),
             surface_probe_uniform_buffer,
             _surface_probe_buffer: surface_probe_buffer,
             sdf_gi_enabled: false,
             gi_radiance_frozen: false,
+            gi_radiance_temporal_accumulation_enabled: true,
             irradiance_probe_ages: [0; MAX_IRRADIANCE_PROBES],
             irradiance_update_budget: 8,
             sky_lighting,
@@ -1613,7 +1790,6 @@ impl Renderer {
             world_radiance_gizmos_enabled: false,
             world_radiance_trace_gizmos_enabled: false,
             selected_radiance_cell: [4, 1, 4],
-            selected_radiance_field_far: false,
             sdf_occupancy_gizmos_enabled: false,
             render_debug_mode: RenderDebugMode::default(),
             render_settings: RenderSettings::default(),
@@ -1683,7 +1859,8 @@ impl Renderer {
         } else {
             self.dynamic_probe_samples = build_dynamic_probe_samples(instances);
         }
-        self.sdf_geometry_cache = sdf_geometries(instances);
+        let sdf_geometry_cache = sdf_geometries(instances);
+        self.sdf_geometry_cache = sdf_geometry_cache;
         self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
         Ok(())
     }
@@ -1757,8 +1934,8 @@ impl Renderer {
         }
         let previous_lights = self.lights.clone();
         if previous_lights != lights {
-            self.near_radiance_field.refresh_temporally();
-            self.far_radiance_field.refresh_temporally();
+            let priority = changed_light_priority(&previous_lights, lights);
+            self.radiance_field.refresh_for_lighting_change(priority, self.gi_radiance_temporal_accumulation_enabled);
         }
         self.lights.clear();
         self.lights.extend_from_slice(lights);
@@ -1799,8 +1976,7 @@ impl Renderer {
     pub fn update_irradiance_volumes(&mut self, volumes: &[RendererIrradianceVolume], instances: &[MeshInstance], lights: &[Light], sdf_gi_enabled: bool) {
         if sdf_gi_enabled != self.sdf_gi_enabled {
             self.sdf_gi_enabled = sdf_gi_enabled;
-            self.near_radiance_field.invalidate();
-            self.far_radiance_field.invalidate();
+            self.radiance_field.invalidate();
         }
         self.performance_stats.sdf_build_cpu_ms = 0.0;
         self.performance_stats.sdf_upload_ms = 0.0;
@@ -1820,11 +1996,19 @@ impl Renderer {
         if sdf_gi_enabled {
             let sdf_build_start = Instant::now();
             let geometry_changed = self.sdf_clipmap.geometry_bounds != self.sdf_geometry_cache;
-            let sdf_update = self.sdf_clipmap.update(self.camera.transform.position, &self.sdf_geometry_cache);
+            let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
+            let sdf_update = self.sdf_clipmap.update(scene_bounds, &self.sdf_geometry_cache);
+            let field_reanchored = self.radiance_field.reanchor(scene_bounds, RADIANCE_FIELD_EXTENT);
+            if field_reanchored {
+                self.queue.write_buffer(&self._radiance_field_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count() * RADIANCE_FIELD_CHANNEL_COUNT]));
+                self.queue.write_buffer(&self._radiance_field_probe_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count()]));
+            }
             self.performance_stats.sdf_build_cpu_ms = sdf_build_start.elapsed().as_secs_f32() * 1000.0;
             if geometry_changed {
-                self.near_radiance_field.refresh_temporally();
-                self.far_radiance_field.refresh_temporally();
+                if !field_reanchored {
+                    self.queue.write_buffer(&self._radiance_field_probe_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count()]));
+                }
+                self.radiance_field.refresh_temporally(self.gi_radiance_temporal_accumulation_enabled);
             }
             if let Some(sdf_update) = sdf_update {
                 self.performance_stats.sdf_voxels_updated = sdf_update.voxels_updated;
@@ -1835,10 +2019,8 @@ impl Renderer {
                 upload_sdf_region(&self.queue, &self._sdf_emission_texture, &self.sdf_clipmap.emission_values, SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION });
                 self.performance_stats.sdf_upload_ms = sdf_upload_start.elapsed().as_secs_f32() * 1000.0;
             }
-            let near_radiance_field_uniform = self.near_radiance_field.uniform(self.camera.transform.position);
-            let far_radiance_field_uniform = self.far_radiance_field.uniform(self.camera.transform.position);
-            self.queue.write_buffer(&self.near_radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&near_radiance_field_uniform));
-            self.queue.write_buffer(&self.far_radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&far_radiance_field_uniform));
+            let radiance_field_uniform = self.radiance_field.uniform(self.gi_radiance_temporal_accumulation_enabled, Some(self.selected_radiance_cell));
+            self.queue.write_buffer(&self.radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&radiance_field_uniform));
             self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(true, self.sky_lighting)));
             self.performance_stats.probe_update_ms = 0.0;
             self.performance_stats.irradiance_upload_ms = 0.0;
@@ -1965,6 +2147,10 @@ impl Renderer {
         self.performance_stats
     }
 
+    pub fn radiance_field_grid(&self) -> RendererRadianceFieldGrid {
+        self.radiance_field.grid()
+    }
+
     pub fn shadow_requests(&self) -> &[ShadowRequest] {
         &self.shadow_scheduler.requests
     }
@@ -2028,8 +2214,7 @@ impl Renderer {
         }
         self.sky_lighting = sky_lighting;
         self.irradiance_probe_ages.fill(u32::MAX);
-        self.near_radiance_field.refresh_temporally();
-        self.far_radiance_field.refresh_temporally();
+        self.radiance_field.refresh_temporally(self.gi_radiance_temporal_accumulation_enabled);
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, sky_lighting)));
     }
 
@@ -2047,8 +2232,7 @@ impl Renderer {
         let gi_reenabled = !self.render_settings.irradiance_enabled && settings.irradiance_enabled && self.sdf_gi_enabled;
         self.render_settings = settings;
         if gi_reenabled {
-            self.near_radiance_field.invalidate();
-            self.far_radiance_field.invalidate();
+            self.radiance_field.invalidate();
         }
         self.shadow_scheduler.rebuild(&self.lights, &self.camera, settings.shadow_budget);
         self.rebuild_shadow_resources();
@@ -2115,6 +2299,10 @@ impl Renderer {
         self.gi_radiance_frozen = frozen;
     }
 
+    pub fn set_gi_radiance_temporal_accumulation_enabled(&mut self, enabled: bool) {
+        self.gi_radiance_temporal_accumulation_enabled = enabled;
+    }
+
     fn packed_surface_probe_frame_index(&self) -> u32 {
         (self.frame_index & 0x7fff_ffff) | if self.gi_radiance_frozen { 0x8000_0000 } else { 0 }
     }
@@ -2127,11 +2315,175 @@ impl Renderer {
         self.world_radiance_trace_gizmos_enabled = enabled;
     }
 
-    pub fn set_selected_radiance_cell(&mut self, cell: [u32; 3], far_field: bool) {
-        self.selected_radiance_cell = [cell[0].min(7), cell[1].min(3), cell[2].min(7)];
-        self.selected_radiance_field_far = far_field;
-        let selection = [self.selected_radiance_cell[0], self.selected_radiance_cell[1], self.selected_radiance_cell[2], u32::from(far_field)];
+    pub fn set_selected_radiance_cell(&mut self, cell: [u32; 3]) {
+        let resolution = self.radiance_field.resolution;
+        let selected_cell = [cell[0].min(resolution[0] - 1), cell[1].min(resolution[1] - 1), cell[2].min(resolution[2] - 1)];
+        if selected_cell == self.selected_radiance_cell {
+            return;
+        }
+        self.selected_radiance_cell = selected_cell;
+        let selection = [self.selected_radiance_cell[0], self.selected_radiance_cell[1], self.selected_radiance_cell[2], 0];
         self.queue.write_buffer(&self.gi_gizmo_selection_buffer, 0, bytemuck::cast_slice(&selection));
+    }
+
+    pub fn set_selected_radiance_trace_options(&mut self, selected_ray: u32, mode: RendererGiTraceDebugMode, overview_enabled: bool) {
+        let options = [selected_ray.min(RADIANCE_FIELD_RAY_COUNT as u32 - 1), mode as u32, u32::from(overview_enabled), 0];
+        self.queue.write_buffer(&self.gi_gizmo_selection_buffer, 16, bytemuck::cast_slice(&options));
+    }
+
+    pub fn gi_trace_diagnostics(&self) -> [RendererGiRayDiagnostic; RADIANCE_FIELD_RAY_COUNT] {
+        self.gi_trace_diagnostics
+    }
+
+    pub fn request_radiance_surface_inspection(&mut self, pixel: [u32; 2]) {
+        self.radiance_surface_inspection_request = Some([pixel[0].min(self.config.width.saturating_sub(1)), pixel[1].min(self.config.height.saturating_sub(1))]);
+        self.radiance_surface_inspection = RendererRadianceSurfaceInspection::default();
+    }
+
+    pub fn radiance_surface_inspection(&self) -> RendererRadianceSurfaceInspection {
+        self.radiance_surface_inspection
+    }
+
+    pub fn radiance_surface_inspection_pending(&self) -> bool {
+        self.radiance_surface_inspection_request.is_some() || self.radiance_surface_inspection_readback_receiver.is_some()
+    }
+
+    fn copy_selected_gi_trace_debug(&self, encoder: &mut wgpu::CommandEncoder) {
+        let field = &self.radiance_field;
+        let coordinate = self.selected_radiance_cell;
+        let cell_index = coordinate[0] + coordinate[1] * field.resolution[0] + coordinate[2] * field.resolution[0] * field.resolution[1];
+        let copy_size = RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64;
+        encoder.copy_buffer_to_buffer(&self._radiance_field_trace_debug_buffer, 0, &self.gi_trace_readback_buffer, 0, copy_size);
+        let radiance_offset = (cell_index as u64 * RADIANCE_FIELD_CHANNEL_COUNT as u64) * RADIANCE_FIELD_VALUE_SIZE;
+        encoder.copy_buffer_to_buffer(&self._radiance_field_buffer, radiance_offset, &self.gi_trace_readback_buffer, copy_size, RADIANCE_FIELD_VALUE_SIZE * RADIANCE_FIELD_CHANNEL_COUNT as u64);
+    }
+
+    fn poll_gi_trace_readback(&mut self) -> Result<(), String> {
+        if self.gi_trace_readback_receiver.is_none() {
+            return Ok(());
+        }
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let result = match self.gi_trace_readback_receiver.as_ref().unwrap().try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.gi_trace_readback_receiver = None;
+                self.gi_trace_diagnostics = [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT];
+                return Ok(());
+            }
+        };
+        self.gi_trace_readback_receiver = None;
+        if result.is_err() {
+            self.gi_trace_diagnostics = [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT];
+            return Ok(());
+        }
+        let slice = self.gi_trace_readback_buffer.slice(..);
+        let mapped = slice.get_mapped_range().map_err(|error| error.to_string())?;
+        let debug_size = (RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64) as usize;
+        let records = bytemuck::cast_slice::<u8, [[f32; 4]; RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT]>(&mapped[..debug_size]);
+        let stored_values = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped[debug_size..]);
+        for (index, record) in records.iter().enumerate() {
+            let channel_index = index / RADIANCE_FIELD_RAYS_PER_CHANNEL;
+            let stored_radiance = [stored_values[channel_index][0], stored_values[channel_index][1], stored_values[channel_index][2]];
+            let radiance = [record[4][0], record[4][1], record[4][2]];
+            let last_update_frame = record[7][3].max(0.0).round() as u32;
+            self.gi_trace_diagnostics[index] = RendererGiRayDiagnostic {
+                valid: record[0][3] > 0.5,
+                relocation_data_valid: record[12][3] != 0.0,
+                relocation_succeeded: record[12][3] > 0.0,
+                selected_cell: self.gi_trace_readback_cell,
+                termination_reason: record[3][3].round() as u32,
+                travelled_distance: record[2][3],
+                hit_position: [record[1][0], record[1][1], record[1][2]],
+                hit_normal: [record[2][0], record[2][1], record[2][2]],
+                original_cell_center: [record[12][0], record[12][1], record[12][2]],
+                ray_origin: [record[0][0], record[0][1], record[0][2]],
+                relocation_offset: [record[0][0] - record[12][0], record[0][1] - record[12][1], record[0][2] - record[12][2]],
+                radiance,
+                direct_radiance: [record[5][0], record[5][1], record[5][2]],
+                emission_radiance: [record[6][0], record[6][1], record[6][2]],
+                sky_radiance: [record[7][0], record[7][1], record[7][2]],
+                stored_radiance,
+                radiance_difference: [radiance[0] - stored_radiance[0], radiance[1] - stored_radiance[1], radiance[2] - stored_radiance[2]],
+                last_update_age_frames: self.gi_trace_readback_frame.wrapping_sub(last_update_frame),
+                ray_direction: [record[3][0], record[3][1], record[3][2]],
+                accumulated_sample_count: record[6][3].max(0.0).round() as u32,
+                attempted_sample_count: record[11][3].max(0.0).round() as u32,
+                blend_factor: record[4][3].clamp(0.0, 1.0),
+                directional_weights: [record[8][0], record[8][1], record[8][2], record[8][3], record[9][0], record[9][1]],
+            };
+        }
+        drop(mapped);
+        self.gi_trace_readback_buffer.unmap();
+        Ok(())
+    }
+
+    fn poll_radiance_surface_inspection(&mut self) -> Result<(), String> {
+        if self.radiance_surface_inspection_readback_receiver.is_none() {
+            return Ok(());
+        }
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let result = match self.radiance_surface_inspection_readback_receiver.as_ref().unwrap().try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.radiance_surface_inspection_readback_receiver = None;
+                self.radiance_surface_inspection = RendererRadianceSurfaceInspection::default();
+                return Ok(());
+            }
+        };
+        self.radiance_surface_inspection_readback_receiver = None;
+        if result.is_err() {
+            self.radiance_surface_inspection = RendererRadianceSurfaceInspection::default();
+            return Ok(());
+        }
+        let mapped = self.radiance_surface_inspection_readback_buffer.slice(..).get_mapped_range().map_err(|error| error.to_string())?;
+        let values = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped);
+        let mut inspection = RendererRadianceSurfaceInspection {
+            valid: values[0][3] > 0.5,
+            inside_field: values[1][3] > 0.5,
+            world_position: [values[0][0], values[0][1], values[0][2]],
+            normal: [values[1][0], values[1][1], values[1][2]],
+            sdf_start_voxel: [values[2][0].round() as i32, values[2][1].round() as i32, values[2][2].round() as i32],
+            sdf_start_in_bounds: values[2][3] > 0.5,
+            sdf_start_occupied: values[3][3] > 0.5,
+            sdf_origin_offset: [values[3][0], values[3][1], values[3][2]],
+            ..RendererRadianceSurfaceInspection::default()
+        };
+        for candidate_index in 0..RADIANCE_SURFACE_CANDIDATE_COUNT {
+            let value_offset = 4 + candidate_index * 9;
+            let grid_position = values[value_offset];
+            let probe_position = values[value_offset + 1];
+            let directional_radiance = values[value_offset + 2];
+            let contribution = values[value_offset + 3];
+            let side_weight = values[value_offset + 4];
+            let first_blocking_voxel = values[value_offset + 5];
+            let first_occupied_after_start = values[value_offset + 6];
+            let first_occupied_after_start_minimum = values[value_offset + 7];
+            let first_occupied_after_start_maximum = values[value_offset + 8];
+            inspection.candidates[candidate_index] = RendererRadianceSurfaceCandidate {
+                grid_position: [grid_position[0].round().max(0.0) as u32, grid_position[1].round().max(0.0) as u32, grid_position[2].round().max(0.0) as u32],
+                probe_position: [probe_position[0], probe_position[1], probe_position[2]],
+                probe_valid: grid_position[3] > 0.0,
+                spatial_weight: probe_position[3],
+                side_weight: side_weight[0],
+                directional_radiance: [directional_radiance[0], directional_radiance[1], directional_radiance[2]],
+                directional_support: directional_radiance[3],
+                contribution_radiance: [contribution[0], contribution[1], contribution[2]],
+                final_weight: contribution[3],
+                first_blocking_voxel: [first_blocking_voxel[0].round() as i32, first_blocking_voxel[1].round() as i32, first_blocking_voxel[2].round() as i32],
+                has_first_blocking_voxel: first_blocking_voxel[3] > 0.5,
+                first_occupied_after_start: [first_occupied_after_start[0].round() as i32, first_occupied_after_start[1].round() as i32, first_occupied_after_start[2].round() as i32],
+                has_occupied_voxel_after_start: first_occupied_after_start[3] > 0.5,
+                first_occupied_after_start_minimum: [first_occupied_after_start_minimum[0], first_occupied_after_start_minimum[1], first_occupied_after_start_minimum[2]],
+                first_occupied_after_start_maximum: [first_occupied_after_start_maximum[0], first_occupied_after_start_maximum[1], first_occupied_after_start_maximum[2]],
+                ..RendererRadianceSurfaceCandidate::default()
+            };
+        }
+        self.radiance_surface_inspection = inspection;
+        drop(mapped);
+        self.radiance_surface_inspection_readback_buffer.unmap();
+        Ok(())
     }
 
     pub fn set_sdf_occupancy_gizmos_enabled(&mut self, enabled: bool) {
@@ -2317,6 +2669,8 @@ impl Renderer {
     }
 
     pub fn render(&mut self) -> Result<(), String> {
+        self.poll_gi_trace_readback()?;
+        self.poll_radiance_surface_inspection()?;
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -2350,6 +2704,13 @@ impl Renderer {
         self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&probe_uniform));
         self.frame_index = self.frame_index.wrapping_add(1);
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
+        let trace_readback_copied = self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.gi_trace_readback_receiver.is_none();
+        let surface_inspection_copied =
+            self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.radiance_surface_inspection_request.is_some() && self.radiance_surface_inspection_readback_receiver.is_none();
+        if surface_inspection_copied {
+            let pixel = self.radiance_surface_inspection_request.unwrap_or_default();
+            self.queue.write_buffer(&self.radiance_surface_inspection_settings_buffer, 0, bytemuck::bytes_of(&RadianceSurfaceInspectionSettings { pixel: [pixel[0], pixel[1], 0, 0] }));
+        }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene encoder") });
         encoder.push_debug_group("GPU shadow passes");
         self.render_shadow_pass(&mut encoder);
@@ -2365,6 +2726,18 @@ impl Renderer {
         );
         if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
             self.render_world_radiance_field_pass(&mut encoder, &self.depth_bind_group, self.config.width, self.config.height);
+            if trace_readback_copied {
+                self.copy_selected_gi_trace_debug(&mut encoder);
+            }
+            if surface_inspection_copied {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GI surface contribution inspection"), timestamp_writes: None });
+                pass.set_pipeline(&self.radiance_surface_inspection_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.depth_bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                drop(pass);
+                encoder.copy_buffer_to_buffer(&self.radiance_surface_inspection_values_buffer, 0, &self.radiance_surface_inspection_readback_buffer, 0, RADIANCE_SURFACE_INSPECTION_SIZE);
+            }
         }
         self.render_scene_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group);
         encoder.pop_debug_group();
@@ -2379,6 +2752,23 @@ impl Renderer {
         }
         self.resolve_gpu_timestamps(&mut encoder);
         self.queue.submit(Some(encoder.finish()));
+        if trace_readback_copied {
+            self.gi_trace_readback_cell = self.selected_radiance_cell;
+            self.gi_trace_readback_frame = self.radiance_field.frame_index;
+            let (sender, receiver) = mpsc::channel();
+            self.gi_trace_readback_buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            self.gi_trace_readback_receiver = Some(receiver);
+        }
+        if surface_inspection_copied {
+            self.radiance_surface_inspection_request = None;
+            let (sender, receiver) = mpsc::channel();
+            self.radiance_surface_inspection_readback_buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            self.radiance_surface_inspection_readback_receiver = Some(receiver);
+        }
         if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
             self.performance_stats.gi_history_valid_percent = 100.0;
         }
@@ -2487,11 +2877,14 @@ impl Renderer {
         pass.set_pipeline(&self.radiance_field_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_bind_group(1, depth_bind_group, &[]);
-        pass.dispatch_workgroups(RADIANCE_FIELD_RESOLUTION[0].div_ceil(4), RADIANCE_FIELD_RESOLUTION[1].div_ceil(4), RADIANCE_FIELD_RESOLUTION[2].div_ceil(4));
-        pass.set_pipeline(&self.surface_probe_update_pipeline);
-        pass.dispatch_workgroups(width.div_ceil(SURFACE_PROBE_STRIDE * 8), height.div_ceil(SURFACE_PROBE_STRIDE * 8), 1);
-        pass.set_pipeline(&self.surface_probe_maintenance_pipeline);
-        pass.dispatch_workgroups(SURFACE_PROBE_CAPACITY.div_ceil(64), 1, 1);
+        let resolution = self.radiance_field.resolution;
+        pass.dispatch_workgroups(resolution[0].div_ceil(4), resolution[1].div_ceil(4), resolution[2].div_ceil(4));
+        if self.render_settings.surface_probes_enabled {
+            pass.set_pipeline(&self.surface_probe_update_pipeline);
+            pass.dispatch_workgroups(width.div_ceil(SURFACE_PROBE_STRIDE * 8), height.div_ceil(SURFACE_PROBE_STRIDE * 8), 1);
+            pass.set_pipeline(&self.surface_probe_maintenance_pipeline);
+            pass.dispatch_workgroups(SURFACE_PROBE_CAPACITY.div_ceil(64), 1, 1);
+        }
     }
 
     fn render_shadow_pass(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -2689,7 +3082,7 @@ impl Renderer {
         pass.set_pipeline(&self.gi_gizmo_pipeline);
         pass.set_bind_group(0, &self.gi_gizmo_bind_group, &[]);
         let surface_probe_count = SURFACE_PROBE_CAPACITY;
-        let radiance_field_count = RADIANCE_FIELD_RESOLUTION.iter().product::<u32>() * 2;
+        let radiance_field_count = self.radiance_field.cell_count() as u32;
         if self.surface_probe_gizmos_enabled {
             pass.draw(0..8, 0..surface_probe_count);
         }
@@ -2698,8 +3091,8 @@ impl Renderer {
         }
         if self.world_radiance_trace_gizmos_enabled {
             let trace_start = surface_probe_count + radiance_field_count;
-            pass.draw(0..28, trace_start..trace_start + RADIANCE_FIELD_DIRECTIONS as u32);
-            pass.draw(0..2, trace_start + RADIANCE_FIELD_DIRECTIONS as u32..trace_start + RADIANCE_FIELD_DIRECTIONS as u32 + 12);
+            pass.draw(0..42, trace_start..trace_start + RADIANCE_FIELD_RAY_COUNT as u32);
+            pass.draw(0..2, trace_start + RADIANCE_FIELD_RAY_COUNT as u32..trace_start + RADIANCE_FIELD_RAY_COUNT as u32 + 12);
         }
         if self.sdf_occupancy_gizmos_enabled {
             pass.set_pipeline(&self.sdf_occupancy_gizmo_pipeline);
@@ -2809,6 +3202,7 @@ fn camera_uniform(width: u32, height: u32, camera: &Camera, lights: &[Light], mo
                 RenderDebugMode::Wireframe => 2,
                 RenderDebugMode::ShadowVisibility => 3,
                 RenderDebugMode::GiOnly => 4,
+                RenderDebugMode::GiSupport => 5,
             },
             u32::from(settings.shadows_enabled),
             u32::from(settings.irradiance_enabled),
@@ -3414,45 +3808,29 @@ impl SdfGeometryBvh {
 }
 
 impl SdfClipmap {
-    fn new(camera_position: Vec3, geometry_bounds: &[SdfGeometry]) -> Self {
-        let voxel_size = SDF_CLIPMAP_EXTENT / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
-        let minimum = Self::snapped_minimum(camera_position, voxel_size);
-        let maximum = minimum + SDF_CLIPMAP_EXTENT;
-        let mut clipmap =
-            Self { minimum, maximum, voxel_size, values: Vec::new(), emission_values: Vec::new(), geometry_bounds: Vec::new(), geometry_bvh: SdfGeometryBvh::new(&[]), grid_offset: [0; 3] };
+    fn new(scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry]) -> Self {
+        let extent = scene_sdf_extent(scene_bounds);
+        let voxel_size = extent / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
+        let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
+        let maximum = minimum + extent;
+        let mut clipmap = Self { minimum, maximum, voxel_size, values: Vec::new(), emission_values: Vec::new(), geometry_bounds: Vec::new(), geometry_bvh: SdfGeometryBvh::new(&[]) };
         clipmap.rebuild(geometry_bounds);
         clipmap
     }
 
-    fn update(&mut self, camera_position: Vec3, geometry_bounds: &[SdfGeometry]) -> Option<SdfClipmapUpdate> {
-        let minimum = Self::snapped_minimum(camera_position, self.voxel_size);
-        let geometry_changed = self.geometry_bounds != geometry_bounds;
-        if self.minimum == minimum && !geometry_changed {
+    fn update(&mut self, scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry]) -> Option<SdfClipmapUpdate> {
+        let extent = scene_sdf_extent(scene_bounds);
+        let voxel_size = extent / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
+        let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
+        let bounds_changed = self.minimum != minimum || self.maximum != minimum + extent;
+        if self.geometry_bounds == geometry_bounds && !bounds_changed {
             return None;
         }
-        let shift_vector = (minimum - self.minimum) / self.voxel_size;
-        let shift = [shift_vector.x.round() as i32, shift_vector.y.round() as i32, shift_vector.z.round() as i32];
         self.minimum = minimum;
-        self.maximum = minimum + SDF_CLIPMAP_EXTENT;
-        if geometry_changed || shift.iter().enumerate().any(|(axis, value)| value.unsigned_abs() >= SDF_CLIPMAP_RESOLUTION[axis]) {
-            self.grid_offset = [0; 3];
-            self.rebuild(geometry_bounds);
-            return Some(SdfClipmapUpdate { texture_regions: vec![SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION }], voxels_updated: SDF_CLIPMAP_RESOLUTION.iter().product() });
-        }
-
-        for axis in 0..3 {
-            self.grid_offset[axis] = (self.grid_offset[axis] as i32 + shift[axis]).rem_euclid(SDF_CLIPMAP_RESOLUTION[axis] as i32) as u32;
-        }
-        let logical_regions = scrolling_regions(shift, SDF_CLIPMAP_RESOLUTION);
-        let mut texture_regions = Vec::new();
-        let mut voxels_updated = 0;
-        for region in logical_regions {
-            self.rebuild_logical_region(region);
-            voxels_updated += region.size.iter().product::<u32>();
-            texture_regions.extend(self.texture_regions_for(region));
-        }
-        self.rebuild_conservative_clearance();
-        Some(SdfClipmapUpdate { texture_regions, voxels_updated })
+        self.maximum = minimum + extent;
+        self.voxel_size = voxel_size;
+        self.rebuild(geometry_bounds);
+        Some(SdfClipmapUpdate { texture_regions: vec![SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION }], voxels_updated: SDF_CLIPMAP_RESOLUTION.iter().product() })
     }
 
     fn uniform(&self, enabled: bool, sky_lighting: RendererSkyLighting) -> SdfClipmapUniform {
@@ -3461,15 +3839,8 @@ impl SdfClipmap {
             maximum: self.maximum.extend(0.0).to_array(),
             resolution: [SDF_CLIPMAP_RESOLUTION[0], SDF_CLIPMAP_RESOLUTION[1], SDF_CLIPMAP_RESOLUTION[2], 0],
             settings: [u32::from(enabled), 0, 0, 0],
-            grid_offset: [self.grid_offset[0], self.grid_offset[1], self.grid_offset[2], 0],
             sky_radiance: [sky_lighting.color.red * sky_lighting.intensity, sky_lighting.color.green * sky_lighting.intensity, sky_lighting.color.blue * sky_lighting.intensity, 0.0],
         }
-    }
-
-    fn snapped_minimum(camera_position: Vec3, voxel_size: Vec3) -> Vec3 {
-        let snapped_center =
-            Vec3::new((camera_position.x / voxel_size.x).floor() * voxel_size.x, (camera_position.y / voxel_size.y).floor() * voxel_size.y, (camera_position.z / voxel_size.z).floor() * voxel_size.z);
-        Vec3::new(snapped_center.x - SDF_CLIPMAP_EXTENT.x * 0.5, snapped_center.y - SDF_CLIPMAP_EXTENT.y * 0.875, snapped_center.z - SDF_CLIPMAP_EXTENT.z * 0.5)
     }
 
     fn rebuild(&mut self, geometry_bounds: &[SdfGeometry]) {
@@ -3488,14 +3859,8 @@ impl SdfClipmap {
         let resolution = SDF_CLIPMAP_RESOLUTION;
         let voxel_count = resolution.iter().product::<u32>() as usize;
         let mut clearance = vec![u16::MAX; voxel_count];
-        let grid_offset = self.grid_offset;
         let index = |x: u32, y: u32, z: u32| (x + y * resolution[0] + z * resolution[0] * resolution[1]) as usize;
-        let physical_index = |x: u32, y: u32, z: u32| {
-            let px = (x + grid_offset[0]) % resolution[0];
-            let py = (y + grid_offset[1]) % resolution[1];
-            let pz = (z + grid_offset[2]) % resolution[2];
-            index(px, py, pz)
-        };
+        let physical_index = |x: u32, y: u32, z: u32| index(x, y, z);
         for z in 0..resolution[2] {
             for y in 0..resolution[1] {
                 for x in 0..resolution[0] {
@@ -3558,8 +3923,8 @@ impl SdfClipmap {
         for z in 0..resolution[2] {
             for y in 0..resolution[1] {
                 for x in 0..resolution[0] {
-                    let distance = clearance[index(x, y, z)];
-                    let safe_distance = if distance == u16::MAX { SDF_MAX_DISTANCE } else { (distance as f32 * minimum_voxel_size - half_voxel_diagonal).max(0.0) };
+                    let distance = clearance[index(x, y, z)].min(SDF_CLEARANCE_RADIUS_VOXELS);
+                    let safe_distance = (distance as f32 * minimum_voxel_size - half_voxel_diagonal).max(0.0);
                     self.emission_values[physical_index(x, y, z)][3] = safe_distance;
                 }
             }
@@ -3593,131 +3958,378 @@ impl SdfClipmap {
             }
         });
     }
-
-    fn rebuild_logical_region(&mut self, region: SdfLogicalRegion) {
-        for z in region.start[2]..region.start[2] + region.size[2] {
-            for y in region.start[1]..region.start[1] + region.size[1] {
-                for x in region.start[0]..region.start[0] + region.size[0] {
-                    let position = self.minimum + Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) * self.voxel_size;
-                    let physical_x = (x + self.grid_offset[0]) % SDF_CLIPMAP_RESOLUTION[0];
-                    let physical_y = (y + self.grid_offset[1]) % SDF_CLIPMAP_RESOLUTION[1];
-                    let physical_z = (z + self.grid_offset[2]) % SDF_CLIPMAP_RESOLUTION[2];
-                    let index = (physical_x + physical_y * SDF_CLIPMAP_RESOLUTION[0] + physical_z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
-                    let (nearest_distance, albedo, emission) = self.geometry_bvh.nearest(position, self.voxel_size * 0.5);
-                    self.values[index] = [nearest_distance.clamp(-SDF_MAX_DISTANCE, SDF_MAX_DISTANCE), albedo.x, albedo.y, albedo.z];
-                    self.emission_values[index] = [emission.x, emission.y, emission.z, 0.0];
-                }
-            }
-        }
-    }
-
-    fn texture_regions_for(&self, region: SdfLogicalRegion) -> Vec<SdfTextureRegion> {
-        let axes = (0..3).map(|axis| split_wrapped_range(region.start[axis], region.size[axis], self.grid_offset[axis], SDF_CLIPMAP_RESOLUTION[axis])).collect::<Vec<_>>();
-        let mut regions = Vec::new();
-        for &(x, width) in &axes[0] {
-            for &(y, height) in &axes[1] {
-                for &(z, depth) in &axes[2] {
-                    regions.push(SdfTextureRegion { origin: [x, y, z], size: [width, height, depth] });
-                }
-            }
-        }
-        regions
-    }
 }
 
 impl WorldRadianceField {
-    fn new(camera_position: Vec3, extent: Vec3, resolution: [u32; 3]) -> Self {
-        let cell_size = extent / Vec3::new(resolution[0] as f32, resolution[1] as f32, resolution[2] as f32);
-        let minimum = Self::snapped_minimum(camera_position, cell_size, extent);
-        Self { extent, resolution, minimum, maximum: minimum + extent, cell_size, grid_offset: [0; 3], frame_index: 0, refresh_frames_remaining: 0, needs_full_refresh: true }
+    fn grid(&self) -> RendererRadianceFieldGrid {
+        RendererRadianceFieldGrid { minimum: self.minimum.to_array(), maximum: self.maximum.to_array(), resolution: self.resolution }
     }
 
-    fn uniform(&mut self, camera_position: Vec3) -> RadianceFieldUniform {
-        let minimum = Self::snapped_minimum(camera_position, self.cell_size, self.extent);
-        let shift_vector = (minimum - self.minimum) / self.cell_size;
-        let mut shift = [shift_vector.x.round() as i32, shift_vector.y.round() as i32, shift_vector.z.round() as i32];
-        let full_refresh = self.needs_full_refresh || shift.iter().enumerate().any(|(axis, value)| value.unsigned_abs() >= self.resolution[axis]);
-        if full_refresh {
-            self.grid_offset = [0; 3];
-            shift = self.resolution.map(|value| value as i32);
-            self.needs_full_refresh = false;
-            self.refresh_frames_remaining = 0;
-        } else {
-            for axis in 0..3 {
-                self.grid_offset[axis] = (self.grid_offset[axis] as i32 + shift[axis]).rem_euclid(self.resolution[axis] as i32) as u32;
-            }
+    fn cell_count(&self) -> usize {
+        self.resolution.iter().product::<u32>() as usize
+    }
+
+    fn new(scene_bounds: GeometryBounds, extent: Vec3, resolution: [u32; 3]) -> Self {
+        let extent = scene_radiance_extent(scene_bounds, extent);
+        let cell_size = extent / Vec3::new(resolution[0] as f32, resolution[1] as f32, resolution[2] as f32);
+        let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
+        Self {
+            resolution,
+            minimum,
+            maximum: minimum + extent,
+            cell_size,
+            frame_index: 0,
+            sample_rounds: vec![0; resolution.iter().product::<u32>() as usize],
+            refresh_cooldown_frames: 0,
+            refresh_snapshot_pending: false,
+            needs_full_refresh: true,
+            queued_new_cells: VecDeque::new(),
+            queued_new_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
+            queued_initial_sample_cells: VecDeque::new(),
+            queued_initial_sample_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
+            queued_priority_cells: VecDeque::new(),
+            queued_priority_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
+            queued_dirty_cells: VecDeque::new(),
+            queued_dirty_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
+        }
+    }
+
+    fn reanchor(&mut self, scene_bounds: GeometryBounds, extent: Vec3) -> bool {
+        let extent = scene_radiance_extent(scene_bounds, extent);
+        let cell_size = extent / Vec3::new(self.resolution[0] as f32, self.resolution[1] as f32, self.resolution[2] as f32);
+        let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
+        if self.minimum == minimum && self.maximum == minimum + extent {
+            return false;
         }
         self.minimum = minimum;
-        self.maximum = minimum + self.extent;
+        self.maximum = minimum + extent;
+        self.cell_size = cell_size;
+        self.invalidate();
+        true
+    }
+
+    fn uniform(&mut self, temporal_accumulation_enabled: bool, selected_cell: Option<[u32; 3]>) -> RadianceFieldUniform {
+        let full_refresh = self.needs_full_refresh;
+        if full_refresh {
+            self.needs_full_refresh = false;
+            self.clear_pending_cells();
+            self.sample_rounds.fill(0);
+        }
         self.frame_index = self.frame_index.wrapping_add(1);
-        let refresh_interval = if self.refresh_frames_remaining > 0 { RADIANCE_FIELD_REFRESH_INTERVAL } else { 0 };
-        self.refresh_frames_remaining = self.refresh_frames_remaining.saturating_sub(1);
+        self.refresh_cooldown_frames = self.refresh_cooldown_frames.saturating_sub(1);
+        let dirty_refresh = !full_refresh && self.refresh_snapshot_pending && self.refresh_cooldown_frames == 0;
+        if full_refresh {
+            self.refresh_snapshot_pending = false;
+        } else if dirty_refresh {
+            self.refresh_snapshot_pending = false;
+            self.refresh_cooldown_frames = RADIANCE_FIELD_REFRESH_COOLDOWN_FRAMES;
+        }
+        let flags = u32::from(full_refresh) | (u32::from(dirty_refresh) << 1) | (u32::from(temporal_accumulation_enabled) << 2);
+        if !temporal_accumulation_enabled {
+            self.queued_initial_sample_cells.clear();
+            self.queued_initial_sample_cell_mask.fill(false);
+        }
+        let (scheduled_cells, refine_all_cells) = if temporal_accumulation_enabled || full_refresh {
+            self.clear_pending_cells();
+            (Vec::new(), true)
+        } else {
+            self.schedule_cells(false, selected_cell)
+        };
+        let mut packed_scheduled_cells = [[u32::MAX; 4]; 4];
+        for (index, (cell, sample_round)) in scheduled_cells.iter().enumerate() {
+            packed_scheduled_cells[index / 4][index % 4] = (*sample_round << 16) | *cell;
+        }
         RadianceFieldUniform {
             minimum: self.minimum.extend(0.0).to_array(),
             maximum: self.maximum.extend(0.0).to_array(),
             resolution: [self.resolution[0], self.resolution[1], self.resolution[2], 0],
-            grid_offset: [self.grid_offset[0], self.grid_offset[1], self.grid_offset[2], 0],
-            scroll_shift: [shift[0], shift[1], shift[2], 0],
-            settings: [self.frame_index, refresh_interval, RADIANCE_FIELD_DIRECTIONS as u32, u32::from(full_refresh)],
+            settings: [self.frame_index, RADIANCE_FIELD_RAY_COUNT as u32, RADIANCE_FIELD_CHANNEL_COUNT as u32, flags],
+            scheduled_cells: packed_scheduled_cells,
+            schedule_metadata: [scheduled_cells.len() as u32, u32::from(refine_all_cells), 0, 0],
         }
-    }
-
-    fn snapped_minimum(camera_position: Vec3, cell_size: Vec3, extent: Vec3) -> Vec3 {
-        let snapped_center =
-            Vec3::new((camera_position.x / cell_size.x).floor() * cell_size.x, (camera_position.y / cell_size.y).floor() * cell_size.y, (camera_position.z / cell_size.z).floor() * cell_size.z);
-        Vec3::new(snapped_center.x - extent.x * 0.5, snapped_center.y - extent.y * 0.875, snapped_center.z - extent.z * 0.5)
     }
 
     fn invalidate(&mut self) {
         self.needs_full_refresh = true;
-        self.refresh_frames_remaining = 0;
+        self.refresh_cooldown_frames = 0;
+        self.refresh_snapshot_pending = false;
+        self.clear_pending_cells();
     }
 
-    fn refresh_temporally(&mut self) {
-        self.refresh_frames_remaining = RADIANCE_FIELD_REFRESH_INTERVAL;
-    }
-}
-
-fn scrolling_regions(shift: [i32; 3], resolution: [u32; 3]) -> Vec<SdfLogicalRegion> {
-    let ranges = (0..3).map(|axis| scrolling_axis_ranges(shift[axis], resolution[axis])).collect::<Vec<_>>();
-    let mut regions = Vec::new();
-    for dirty_x in &ranges[0].0 {
-        regions.push(SdfLogicalRegion { start: [dirty_x.0, 0, 0], size: [dirty_x.1, resolution[1], resolution[2]] });
-    }
-    for retained_x in &ranges[0].1 {
-        for dirty_y in &ranges[1].0 {
-            regions.push(SdfLogicalRegion { start: [retained_x.0, dirty_y.0, 0], size: [retained_x.1, dirty_y.1, resolution[2]] });
+    fn refresh_temporally(&mut self, refinement_enabled: bool) {
+        let new_refresh_request = !self.refresh_snapshot_pending && self.refresh_cooldown_frames == 0;
+        self.refresh_snapshot_pending = true;
+        if refinement_enabled {
+            return;
+        }
+        if new_refresh_request {
+            self.sample_rounds.fill(0);
+        }
+        self.queued_priority_cells.clear();
+        self.queued_priority_cell_mask.fill(false);
+        for index in 0..self.cell_count() as u32 {
+            self.enqueue_dirty_cell(index);
         }
     }
-    for retained_x in &ranges[0].1 {
-        for retained_y in &ranges[1].1 {
-            for dirty_z in &ranges[2].0 {
-                regions.push(SdfLogicalRegion { start: [retained_x.0, retained_y.0, dirty_z.0], size: [retained_x.1, retained_y.1, dirty_z.1] });
+
+    fn refresh_for_lighting_change(&mut self, priority: Option<RadianceFieldPriority>, refinement_enabled: bool) {
+        let new_refresh_request = !self.refresh_snapshot_pending && self.refresh_cooldown_frames == 0;
+        self.refresh_snapshot_pending = true;
+        if refinement_enabled {
+            return;
+        }
+        if new_refresh_request {
+            self.sample_rounds.fill(0);
+        }
+        if priority.is_none() {
+            self.queued_priority_cells.clear();
+            self.queued_priority_cell_mask.fill(false);
+        }
+        let mut affected_cells = Vec::new();
+        if let Some(priority) = priority {
+            let cell_diagonal = self.cell_size.length() * 0.5;
+            for index in 0..self.cell_count() as u32 {
+                let coordinate = radiance_field_coordinate(index, self.resolution);
+                let center = self.minimum + (Vec3::new(coordinate[0] as f32, coordinate[1] as f32, coordinate[2] as f32) + Vec3::splat(0.5)) * self.cell_size;
+                let distance = center.distance(priority.position);
+                if distance <= priority.radius + cell_diagonal {
+                    affected_cells.push((distance, index));
+                }
+            }
+            affected_cells.sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        }
+        let mut affected_mask = vec![false; self.cell_count()];
+        for (_, index) in affected_cells {
+            let index_usize = index as usize;
+            affected_mask[index_usize] = true;
+            self.enqueue_priority_cell(index);
+        }
+        for index in 0..self.cell_count() as u32 {
+            if !affected_mask[index as usize] {
+                self.enqueue_dirty_cell(index);
             }
         }
     }
-    regions
+
+    fn clear_pending_cells(&mut self) {
+        self.queued_new_cells.clear();
+        self.queued_new_cell_mask.fill(false);
+        self.queued_initial_sample_cells.clear();
+        self.queued_initial_sample_cell_mask.fill(false);
+        self.queued_priority_cells.clear();
+        self.queued_priority_cell_mask.fill(false);
+        self.queued_dirty_cells.clear();
+        self.queued_dirty_cell_mask.fill(false);
+    }
+
+    fn enqueue_priority_cell(&mut self, index: u32) {
+        enqueue_cell(&mut self.queued_priority_cells, &mut self.queued_priority_cell_mask, index);
+    }
+
+    fn enqueue_initial_sample_cell(&mut self, index: u32) {
+        enqueue_cell(&mut self.queued_initial_sample_cells, &mut self.queued_initial_sample_cell_mask, index);
+    }
+
+    fn enqueue_dirty_cell(&mut self, index: u32) {
+        enqueue_cell(&mut self.queued_dirty_cells, &mut self.queued_dirty_cell_mask, index);
+    }
+
+    fn schedule_cells(&mut self, refinement_enabled: bool, selected_cell: Option<[u32; 3]>) -> (Vec<(u32, u32)>, bool) {
+        let has_queued_work = self.queued_new_cell_mask.iter().any(|queued| *queued)
+            || self.queued_initial_sample_cell_mask.iter().any(|queued| *queued)
+            || self.queued_priority_cell_mask.iter().any(|queued| *queued)
+            || self.queued_dirty_cell_mask.iter().any(|queued| *queued);
+        if refinement_enabled && !has_queued_work {
+            for index in 0..self.cell_count() as u32 {
+                self.enqueue_dirty_cell(index);
+            }
+        }
+        let has_queued_work = self.queued_new_cell_mask.iter().any(|queued| *queued)
+            || self.queued_initial_sample_cell_mask.iter().any(|queued| *queued)
+            || self.queued_priority_cell_mask.iter().any(|queued| *queued)
+            || self.queued_dirty_cell_mask.iter().any(|queued| *queued);
+        if has_queued_work {
+            let mut scheduled = Vec::with_capacity(RADIANCE_FIELD_DIRTY_CELL_BUDGET);
+            let mut scheduled_mask = vec![false; self.cell_count()];
+            let mut follow_up_cells = Vec::new();
+            if refinement_enabled {
+                if let Some([x, y, z]) = selected_cell {
+                    let index = x + y * self.resolution[0] + z * self.resolution[0] * self.resolution[1];
+                    if (index as usize) < self.sample_rounds.len() {
+                        scheduled_mask[index as usize] = true;
+                        let sample_round = self.sample_rounds[index as usize];
+                        scheduled.push((index, sample_round));
+                        self.sample_rounds[index as usize] = sample_round.saturating_add(1).min(RADIANCE_FIELD_SAMPLE_ROUND_MAX);
+                        if sample_round == 0 {
+                            follow_up_cells.push(index);
+                        }
+                    }
+                }
+            }
+            let initial_samples_pending = self.queued_initial_sample_cell_mask.iter().any(|queued| *queued);
+            let new_cell_budget = if initial_samples_pending { RADIANCE_FIELD_NEW_CELL_BUDGET } else { RADIANCE_FIELD_DIRTY_CELL_BUDGET };
+            schedule_queued_cells(
+                &mut self.queued_new_cells,
+                &mut self.queued_new_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                &mut self.sample_rounds,
+                &mut follow_up_cells,
+                true,
+                refinement_enabled,
+                new_cell_budget,
+            );
+            schedule_queued_cells(
+                &mut self.queued_priority_cells,
+                &mut self.queued_priority_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                &mut self.sample_rounds,
+                &mut follow_up_cells,
+                true,
+                refinement_enabled,
+                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+            );
+            schedule_queued_cells(
+                &mut self.queued_initial_sample_cells,
+                &mut self.queued_initial_sample_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                &mut self.sample_rounds,
+                &mut follow_up_cells,
+                false,
+                refinement_enabled,
+                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+            );
+            schedule_queued_cells(
+                &mut self.queued_new_cells,
+                &mut self.queued_new_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                &mut self.sample_rounds,
+                &mut follow_up_cells,
+                true,
+                refinement_enabled,
+                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+            );
+            schedule_queued_cells(
+                &mut self.queued_priority_cells,
+                &mut self.queued_priority_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                &mut self.sample_rounds,
+                &mut follow_up_cells,
+                true,
+                refinement_enabled,
+                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+            );
+            schedule_queued_cells(
+                &mut self.queued_dirty_cells,
+                &mut self.queued_dirty_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                &mut self.sample_rounds,
+                &mut follow_up_cells,
+                false,
+                refinement_enabled,
+                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+            );
+            for index in follow_up_cells {
+                self.enqueue_initial_sample_cell(index);
+            }
+            return (scheduled, false);
+        }
+
+        if !refinement_enabled {
+            return (Vec::new(), false);
+        }
+
+        (Vec::new(), false)
+    }
 }
 
-fn scrolling_axis_ranges(shift: i32, resolution: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
-    if shift == 0 {
-        return (Vec::new(), vec![(0, resolution)]);
+fn schedule_queued_cells(
+    queue: &mut VecDeque<u32>,
+    queued_mask: &mut Vec<bool>,
+    scheduled: &mut Vec<(u32, u32)>,
+    scheduled_mask: &mut Vec<bool>,
+    sample_rounds: &mut [u32],
+    follow_up_cells: &mut Vec<u32>,
+    enqueue_follow_up: bool,
+    refinement_enabled: bool,
+    maximum_count: usize,
+) {
+    let mut selected_count = 0;
+    while selected_count < maximum_count && scheduled.len() < RADIANCE_FIELD_DIRTY_CELL_BUDGET {
+        let Some(index) = pop_queued_cell(queue, queued_mask) else { break };
+        let slot = index as usize;
+        if scheduled_mask[slot] {
+            continue;
+        }
+        scheduled_mask[slot] = true;
+        let sample_round = if refinement_enabled { sample_rounds[slot] } else { 0 };
+        scheduled.push((index, sample_round));
+        sample_rounds[slot] = if refinement_enabled { sample_round.saturating_add(1).min(RADIANCE_FIELD_SAMPLE_ROUND_MAX) } else { sample_rounds[slot].max(1) };
+        if enqueue_follow_up && refinement_enabled && sample_round == 0 {
+            follow_up_cells.push(index);
+        }
+        selected_count += 1;
     }
-    let magnitude = shift.unsigned_abs();
-    if shift > 0 { (vec![(resolution - magnitude, magnitude)], vec![(0, resolution - magnitude)]) } else { (vec![(0, magnitude)], vec![(magnitude, resolution - magnitude)]) }
 }
 
-fn split_wrapped_range(start: u32, size: u32, offset: u32, resolution: u32) -> Vec<(u32, u32)> {
-    if size == resolution {
-        return vec![(0, resolution)];
+fn radiance_field_coordinate(index: u32, resolution: [u32; 3]) -> [u32; 3] {
+    [index % resolution[0], (index / resolution[0]) % resolution[1], index / (resolution[0] * resolution[1])]
+}
+
+fn enqueue_cell(queue: &mut VecDeque<u32>, queued: &mut Vec<bool>, index: u32) {
+    let Some(is_queued) = queued.get_mut(index as usize) else { return };
+    if !*is_queued {
+        *is_queued = true;
+        queue.push_back(index);
     }
-    let physical_start = (start + offset) % resolution;
-    let first_size = size.min(resolution - physical_start);
-    let mut ranges = vec![(physical_start, first_size)];
-    if first_size < size {
-        ranges.push((0, size - first_size));
+}
+
+fn pop_queued_cell(queue: &mut VecDeque<u32>, queued: &mut Vec<bool>) -> Option<u32> {
+    while let Some(index) = queue.pop_front() {
+        let is_queued = queued.get_mut(index as usize)?;
+        if *is_queued {
+            *is_queued = false;
+            return Some(index);
+        }
     }
-    ranges
+    None
+}
+
+fn changed_light_priority(previous: &[Light], current: &[Light]) -> Option<RadianceFieldPriority> {
+    let mut minimum = Vec3::splat(f32::MAX);
+    let mut maximum = Vec3::splat(f32::MIN);
+    let mut has_local_light = false;
+
+    for index in 0..previous.len().max(current.len()) {
+        let old_light = previous.get(index).copied();
+        let new_light = current.get(index).copied();
+        if old_light == new_light {
+            continue;
+        }
+
+        for light in [old_light, new_light].into_iter().flatten() {
+            let (position, range) = match light {
+                Light::Directional(_) => return None,
+                Light::Point(light) => (light.position, light.range),
+                Light::Spot(light) => (light.position, light.range),
+            };
+            let radius = Vec3::splat(range.max(0.0));
+            minimum = minimum.min(position - radius);
+            maximum = maximum.max(position + radius);
+            has_local_light = true;
+        }
+    }
+
+    if !has_local_light {
+        return None;
+    }
+    let center = (minimum + maximum) * 0.5;
+    Some(RadianceFieldPriority { position: center, radius: (maximum - minimum).length() * 0.5 })
 }
 
 fn upload_sdf_region(queue: &wgpu::Queue, texture: &wgpu::Texture, values: &[[f32; 4]], region: SdfTextureRegion) {
@@ -4102,6 +4714,24 @@ fn combined_geometry_bounds(bounds: &[GeometryBounds]) -> GeometryBounds {
     if minimum.is_finite() && maximum.is_finite() { GeometryBounds { minimum, maximum } } else { GeometryBounds { minimum: Vec3::splat(-10.0), maximum: Vec3::splat(10.0) } }
 }
 
+fn bounds_center(bounds: GeometryBounds) -> Vec3 {
+    (bounds.minimum + bounds.maximum) * 0.5
+}
+
+fn static_grid_minimum(center: Vec3, extent: Vec3) -> Vec3 {
+    center - extent * 0.5
+}
+
+fn scene_sdf_extent(scene_bounds: GeometryBounds) -> Vec3 {
+    let required_extent = scene_bounds.maximum - scene_bounds.minimum + SCENE_GI_PADDING * 2.0;
+    SDF_CLIPMAP_EXTENT.max(required_extent)
+}
+
+fn scene_radiance_extent(scene_bounds: GeometryBounds, default_extent: Vec3) -> Vec3 {
+    let required_extent = scene_bounds.maximum - scene_bounds.minimum + SCENE_GI_PADDING * 2.0;
+    if required_extent.cmpgt(SDF_CLIPMAP_EXTENT).any() { default_extent.max(required_extent) } else { default_extent }
+}
+
 fn probe_irradiance(
     position: Vec3,
     static_samples: &[ProbeSurfaceSample],
@@ -4189,39 +4819,120 @@ mod sdf_clearance_tests {
 
     fn occupied_at(clipmap: &SdfClipmap, position: Vec3) -> bool {
         let logical = ((position - clipmap.minimum) / clipmap.voxel_size).floor().as_uvec3();
-        let physical_x = (logical.x + clipmap.grid_offset[0]) % SDF_CLIPMAP_RESOLUTION[0];
-        let physical_y = (logical.y + clipmap.grid_offset[1]) % SDF_CLIPMAP_RESOLUTION[1];
-        let physical_z = (logical.z + clipmap.grid_offset[2]) % SDF_CLIPMAP_RESOLUTION[2];
-        let index = (physical_x + physical_y * SDF_CLIPMAP_RESOLUTION[0] + physical_z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+        let index = (logical.x + logical.y * SDF_CLIPMAP_RESOLUTION[0] + logical.z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
         clipmap.values[index][0] <= 0.0
     }
 
     #[test]
-    fn conservative_voxel_field_covers_floors_walls_corners_and_thin_geometry_after_scroll() {
+    fn conservative_voxel_field_covers_geometry_inside_static_scene_bounds() {
         let geometries = [
             SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
             SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
             SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
             SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-4.0, -1.0, 0.0), maximum: Vec3::new(-3.99, 1.0, 0.01) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
         ];
-        let mut clipmap = SdfClipmap::new(Vec3::ZERO, &geometries);
+        let scene_bounds = GeometryBounds { minimum: Vec3::new(-8.0, -2.0, -8.0), maximum: Vec3::new(8.0, 4.0, 8.0) };
+        let mut clipmap = SdfClipmap::new(scene_bounds, &geometries);
         let geometry_samples = [Vec3::ZERO, Vec3::new(3.0, 1.0, 0.0), Vec3::new(4.0, 0.0, 4.0), Vec3::new(-4.0, 0.0, 0.0)];
         assert!(geometry_samples.iter().all(|position| occupied_at(&clipmap, *position)));
 
         let empty_position = Vec3::new(8.0, 1.0, 8.0);
         let empty_logical = ((empty_position - clipmap.minimum) / clipmap.voxel_size).floor().as_uvec3();
-        let empty_physical_x = (empty_logical.x + clipmap.grid_offset[0]) % SDF_CLIPMAP_RESOLUTION[0];
-        let empty_physical_y = (empty_logical.y + clipmap.grid_offset[1]) % SDF_CLIPMAP_RESOLUTION[1];
-        let empty_physical_z = (empty_logical.z + clipmap.grid_offset[2]) % SDF_CLIPMAP_RESOLUTION[2];
-        let empty_index = (empty_physical_x + empty_physical_y * SDF_CLIPMAP_RESOLUTION[0] + empty_physical_z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+        let empty_index = (empty_logical.x + empty_logical.y * SDF_CLIPMAP_RESOLUTION[0] + empty_logical.z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
         let empty_center = clipmap.minimum + (empty_logical.as_vec3() + Vec3::splat(0.5)) * clipmap.voxel_size;
         let nearest_geometry_distance = geometries.iter().map(|geometry| signed_distance_to_bounds(empty_center, geometry.bounds)).fold(f32::INFINITY, f32::min);
         let safe_clearance = clipmap.emission_values[empty_index][3];
         assert!(safe_clearance > 0.0);
         assert!(safe_clearance <= nearest_geometry_distance);
 
-        clipmap.update(Vec3::splat(0.6), &geometries).expect("camera movement should scroll the SDF");
+        assert!(clipmap.update(scene_bounds, &geometries).is_none(), "camera movement must not shift the static SDF");
         assert!(geometry_samples.iter().all(|position| occupied_at(&clipmap, *position)));
+    }
+}
+
+#[cfg(test)]
+mod radiance_field_tests {
+    use super::*;
+
+    #[test]
+    fn room_test_outer_walls_fit_inside_single_radiance_and_sdf_fields() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::new(-16.0, 0.0, -16.0), maximum: Vec3::new(16.0, 5.2, 16.0) };
+        let sdf_extent = scene_sdf_extent(scene_bounds);
+        let sdf_minimum = static_grid_minimum(bounds_center(scene_bounds), sdf_extent);
+        let sdf_maximum = sdf_minimum + sdf_extent;
+        let radiance_field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
+
+        for position in [Vec3::new(-13.15, 0.0, -13.15), Vec3::new(13.15, 5.2, 13.15)] {
+            assert!(position.cmpge(sdf_minimum).all() && position.cmplt(sdf_maximum).all());
+            assert!(position.cmpge(radiance_field.minimum).all() && position.cmplt(radiance_field.maximum).all());
+        }
+
+        assert_eq!(radiance_field.cell_size, Vec3::splat(4.0));
+    }
+
+    #[test]
+    fn large_static_scene_expands_and_reanchors_single_world_radiance_field() {
+        let small_bounds = GeometryBounds { minimum: Vec3::new(-16.0, 0.0, -16.0), maximum: Vec3::new(16.0, 5.2, 16.0) };
+        let large_bounds = GeometryBounds { minimum: Vec3::new(0.0, 0.0, 0.0), maximum: Vec3::new(116.0, 3.25, 116.0) };
+        let sdf_extent = scene_sdf_extent(large_bounds);
+        let sdf_minimum = static_grid_minimum(bounds_center(large_bounds), sdf_extent);
+        let sdf_maximum = sdf_minimum + sdf_extent;
+        let mut field = WorldRadianceField::new(small_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
+        field.uniform(false, None);
+
+        assert!(sdf_minimum.cmple(large_bounds.minimum - SCENE_GI_PADDING).all());
+        assert!(sdf_maximum.cmpge(large_bounds.maximum + SCENE_GI_PADDING).all());
+        assert!(field.reanchor(large_bounds, RADIANCE_FIELD_EXTENT));
+        assert!(field.needs_full_refresh);
+        assert!(field.minimum.cmple(large_bounds.minimum - SCENE_GI_PADDING).all());
+        assert!(field.maximum.cmpge(large_bounds.maximum + SCENE_GI_PADDING).all());
+        assert!(field.cell_size.x > 4.0);
+        field.uniform(false, None);
+        assert!(field.reanchor(small_bounds, RADIANCE_FIELD_EXTENT));
+        assert!(field.needs_full_refresh);
+        assert_eq!(field.cell_size, Vec3::splat(4.0));
+    }
+
+    #[test]
+    fn static_radiance_cells_keep_their_world_bounds_across_updates() {
+        let resolution = RADIANCE_FIELD_DEFAULT_RESOLUTION;
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, resolution);
+        let initial = field.uniform(true, None);
+        let fixed_minimum = field.minimum;
+        let next = field.uniform(true, None);
+
+        assert_eq!(initial.settings[3] & 1, 1);
+        assert_eq!(next.settings[3] & 1, 0);
+        assert_eq!(field.minimum, fixed_minimum);
+    }
+
+    #[test]
+    fn radiance_refinement_updates_the_full_field_and_refinement_is_toggleable() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
+        let initial = field.uniform(true, None);
+        assert_eq!(initial.settings[3] & 1, 1);
+        assert_eq!(initial.settings[3] & 4, 4);
+        assert_eq!(initial.schedule_metadata[0], 0);
+        assert_eq!(initial.schedule_metadata[1], 1);
+
+        let continuous_update = field.uniform(true, None);
+        assert_eq!(continuous_update.schedule_metadata[0], 0);
+        assert_eq!(continuous_update.schedule_metadata[1], 1);
+
+        field.refresh_temporally(true);
+        let changed = field.uniform(true, None);
+        assert_eq!(changed.settings[3] & 2, 2);
+        assert_eq!(changed.schedule_metadata[0], 0);
+        assert_eq!(changed.schedule_metadata[1], 1);
+
+        let refinement_disabled = field.uniform(false, None);
+        assert_eq!(refinement_disabled.settings[3] & 4, 0);
+
+        let disabled_update = field.uniform(false, None);
+        assert_eq!(disabled_update.schedule_metadata[0], 0);
+        assert_eq!(disabled_update.schedule_metadata[1], 0);
     }
 }
 

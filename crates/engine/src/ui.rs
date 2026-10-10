@@ -20,6 +20,9 @@ pub struct UiContainerId(usize);
 pub struct UiPanelId(usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UiPanelWindowId(usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct UiGraphId(usize);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -155,6 +158,7 @@ enum UiChild {
     Button(UiButtonId),
     Label(UiLabelId),
     Container(UiContainerId),
+    Graph(UiGraphId),
 }
 
 #[derive(Clone, Debug)]
@@ -173,9 +177,31 @@ struct UiPanel {
     color: Color,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct UiPanelWindow {
+    panel: Option<UiPanelId>,
+    header: UiButtonId,
+    content: UiContainerId,
+    header_height: f32,
+    content_top_offset: f32,
+    expanded_height: f32,
+    collapsed: bool,
+    visible: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActivePanelDrag {
+    window: UiPanelWindowId,
+    press_position: Vec2,
+    last_position: Vec2,
+    dragged: bool,
+}
+
 #[derive(Clone, Debug)]
 struct UiGraph {
     layout: UiLayout,
+    parent: Option<UiContainerId>,
+    child_index: usize,
     values: Vec<f32>,
     color: Color,
     background: Color,
@@ -190,13 +216,38 @@ pub struct UiCanvas {
     labels: Vec<UiLabel>,
     containers: Vec<UiContainer>,
     panels: Vec<UiPanel>,
+    panel_windows: Vec<UiPanelWindow>,
+    active_panel_drag: Option<ActivePanelDrag>,
     graphs: Vec<UiGraph>,
     font: Option<FontAsset>,
+    viewport_size: (u32, u32),
+    pointer_press_consumed: bool,
 }
 
 impl UiCanvas {
     pub fn new(window: UiRect) -> Self {
-        Self { window: UiLayout::absolute(window), sliders: Vec::new(), buttons: Vec::new(), labels: Vec::new(), containers: Vec::new(), panels: Vec::new(), graphs: Vec::new(), font: None }
+        Self {
+            window: UiLayout::absolute(window),
+            sliders: Vec::new(),
+            buttons: Vec::new(),
+            labels: Vec::new(),
+            containers: Vec::new(),
+            panels: Vec::new(),
+            panel_windows: Vec::new(),
+            active_panel_drag: None,
+            graphs: Vec::new(),
+            font: None,
+            viewport_size: (1, 1),
+            pointer_press_consumed: false,
+        }
+    }
+
+    pub fn viewport_size(&self) -> (u32, u32) {
+        self.viewport_size
+    }
+
+    pub fn pointer_press_consumed(&self) -> bool {
+        self.pointer_press_consumed
     }
 
     pub fn set_font(&mut self, font: FontAsset) {
@@ -242,9 +293,58 @@ impl UiCanvas {
         true
     }
 
+    pub fn register_panel_window(&mut self, panel: UiPanelId, header: UiButtonId, content: UiContainerId, header_height: f32) -> UiPanelWindowId {
+        self.register_panel_window_inner(Some(panel), header, content, header_height)
+    }
+
+    pub fn register_window_panel(&mut self, header: UiButtonId, content: UiContainerId, header_height: f32) -> UiPanelWindowId {
+        self.register_panel_window_inner(None, header, content, header_height)
+    }
+
+    fn register_panel_window_inner(&mut self, panel: Option<UiPanelId>, header: UiButtonId, content: UiContainerId, header_height: f32) -> UiPanelWindowId {
+        let id = UiPanelWindowId(self.panel_windows.len());
+        let header_height = header_height.max(1.0);
+        let expanded_height = panel.map(|panel| self.panels[panel.0].layout.size.y).unwrap_or(self.window.size.y);
+        let content_top_offset = self.containers[content.0].layout.offset.y - self.buttons[header.0].layout.offset.y;
+        self.panel_windows.push(UiPanelWindow { panel, header, content, header_height, content_top_offset, expanded_height, collapsed: false, visible: true });
+        id
+    }
+
+    pub fn set_panel_window_expanded_height(&mut self, window: UiPanelWindowId, height: f32) -> bool {
+        let Some(window_state) = self.panel_windows.get_mut(window.0) else { return false };
+        window_state.expanded_height = height.max(window_state.header_height);
+        let window_state = *window_state;
+        self.set_window_height(window_state);
+        self.containers[window_state.content.0].layout.size.y = (window_state.expanded_height - window_state.content_top_offset).max(0.0);
+        true
+    }
+
+    pub fn panel_window_collapsed(&self, window: UiPanelWindowId) -> Option<bool> {
+        self.panel_windows.get(window.0).map(|window| window.collapsed)
+    }
+
+    pub fn set_panel_window_visible(&mut self, window: UiPanelWindowId, visible: bool) -> bool {
+        let Some(window_state) = self.panel_windows.get_mut(window.0) else { return false };
+        window_state.visible = visible;
+        if !visible {
+            self.containers[window_state.content.0].visible = false;
+        }
+        true
+    }
+
+    pub fn pointer_over_ui(&self, cursor: Vec2, width: u32, height: u32) -> bool {
+        let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
+        self.pointer_over_ui_at(cursor, root)
+    }
+
     pub fn add_graph(&mut self, layout: UiLayout, color: Color, background: Color) -> UiGraphId {
+        self.add_graph_layout(None, layout, color, background)
+    }
+
+    pub fn add_graph_layout(&mut self, parent: Option<UiContainerId>, layout: UiLayout, color: Color, background: Color) -> UiGraphId {
         let id = UiGraphId(self.graphs.len());
-        self.graphs.push(UiGraph { layout, values: Vec::new(), color, background, visible: true });
+        let child_index = parent.map(|parent| self.add_child(parent, UiChild::Graph(id))).unwrap_or(0);
+        self.graphs.push(UiGraph { layout, parent, child_index, values: Vec::new(), color, background, visible: true });
         id
     }
 
@@ -363,19 +463,60 @@ impl UiCanvas {
         true
     }
 
+    pub fn set_label_color(&mut self, label: UiLabelId, color: Color) -> bool {
+        let Some(label) = self.labels.get_mut(label.0) else { return false };
+        label.color = color;
+        true
+    }
+
     pub fn update(&mut self, input: &InputState, width: u32, height: u32) {
-        if input.cursor_captured() || (!input.left_mouse_down() && !input.left_mouse_pressed()) {
-            return;
+        self.viewport_size = (width.max(1), height.max(1));
+        self.pointer_press_consumed = false;
+        if input.left_mouse_pressed() && !input.cursor_captured() {
+            let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
+            self.pointer_press_consumed = self.pointer_over_ui_at(input.cursor_position(), root);
         }
         let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
         let cursor = input.cursor_position();
+        if let Some(mut drag) = self.active_panel_drag {
+            if input.left_mouse_down() && !input.cursor_captured() {
+                let total_delta = cursor - drag.press_position;
+                if total_delta.length_squared() >= 16.0 {
+                    drag.dragged = true;
+                }
+                if drag.dragged {
+                    self.move_panel_window(drag.window, cursor - drag.last_position, root);
+                }
+                drag.last_position = cursor;
+                self.active_panel_drag = Some(drag);
+            } else {
+                if !drag.dragged && !input.cursor_captured() {
+                    self.toggle_panel_window(drag.window);
+                }
+                self.active_panel_drag = None;
+            }
+        }
+        if input.cursor_captured() || (!input.left_mouse_down() && !input.left_mouse_pressed()) {
+            return;
+        }
         if input.left_mouse_pressed() {
-            for index in 0..self.buttons.len() {
+            let mut header_window = None;
+            for index in (0..self.buttons.len()).rev() {
                 let button = UiChild::Button(UiButtonId(index));
                 if self.child_is_visible(button) && self.control_rect(button, root).contains(cursor) {
-                    self.buttons[index].toggled = !self.buttons[index].toggled;
+                    header_window = self.panel_windows.iter().enumerate().rev().find_map(|(window_index, window)| (window.header.0 == index).then_some(UiPanelWindowId(window_index)));
+                    if header_window.is_none() {
+                        self.buttons[index].toggled = !self.buttons[index].toggled;
+                    }
+                    break;
                 }
             }
+            if let Some(window) = header_window {
+                self.active_panel_drag = Some(ActivePanelDrag { window, press_position: cursor, last_position: cursor, dragged: false });
+            }
+        }
+        if self.active_panel_drag.is_some() {
+            return;
         }
         if !input.left_mouse_down() {
             return;
@@ -394,18 +535,92 @@ impl UiCanvas {
         }
     }
 
+    fn pointer_over_ui_at(&self, cursor: Vec2, root: UiRect) -> bool {
+        self.window.resolve(root).contains(cursor)
+            || self.panels.iter().enumerate().any(|(panel_index, panel)| {
+                let visible = !self.panel_windows.iter().any(|window| window.panel.is_some_and(|id| id.0 == panel_index) && !window.visible);
+                visible && panel.layout.resolve(root).contains(cursor)
+            })
+            || self.buttons.iter().enumerate().any(|(index, _)| {
+                let child = UiChild::Button(UiButtonId(index));
+                self.child_is_visible(child) && self.control_rect(child, root).contains(cursor)
+            })
+            || self.sliders.iter().enumerate().any(|(index, _)| {
+                let child = UiChild::Slider(UiSliderId(index));
+                self.child_is_visible(child) && self.control_rect(child, root).contains(cursor)
+            })
+            || self.labels.iter().enumerate().any(|(index, _)| {
+                let child = UiChild::Label(UiLabelId(index));
+                self.child_is_visible(child) && self.control_rect(child, root).contains(cursor)
+            })
+            || self.containers.iter().enumerate().any(|(index, _)| {
+                let child = UiChild::Container(UiContainerId(index));
+                self.child_is_visible(child) && self.control_rect(child, root).contains(cursor)
+            })
+            || self.graphs.iter().enumerate().any(|(index, _)| {
+                let child = UiChild::Graph(UiGraphId(index));
+                self.child_is_visible(child) && self.control_rect(child, root).contains(cursor)
+            })
+    }
+
+    fn toggle_panel_window(&mut self, window_id: UiPanelWindowId) {
+        let window = {
+            let window = &mut self.panel_windows[window_id.0];
+            window.collapsed = !window.collapsed;
+            *window
+        };
+        self.buttons[window.header.0].toggled = window.collapsed;
+        self.containers[window.content.0].visible = !window.collapsed;
+        self.set_window_height(window);
+    }
+
+    fn move_panel_window(&mut self, window_id: UiPanelWindowId, requested_delta: Vec2, root: UiRect) {
+        let window = self.panel_windows[window_id.0];
+        let panel_layout = self.panel_window_layout(window);
+        let panel_rect = panel_layout.resolve(root);
+        let maximum_x = (root.width - panel_rect.width).max(0.0);
+        let maximum_y = (root.height - window.header_height).max(0.0);
+        let new_x = (panel_rect.x + requested_delta.x).clamp(0.0, maximum_x);
+        let new_y = (panel_rect.y + requested_delta.y).clamp(0.0, maximum_y);
+        let delta = Vec2::new(new_x - panel_rect.x, new_y - panel_rect.y);
+        if let Some(panel) = window.panel {
+            self.panels[panel.0].layout.offset += delta;
+        } else {
+            self.window.offset += delta;
+        }
+        self.buttons[window.header.0].layout.offset += delta;
+        self.containers[window.content.0].layout.offset += delta;
+    }
+
+    fn panel_window_layout(&self, window: UiPanelWindow) -> UiLayout {
+        window.panel.map(|panel| self.panels[panel.0].layout).unwrap_or(self.window)
+    }
+
+    fn set_window_height(&mut self, window: UiPanelWindow) {
+        let height = if window.collapsed { window.header_height } else { window.expanded_height };
+        if let Some(panel) = window.panel {
+            self.panels[panel.0].layout.size.y = height;
+        } else {
+            self.window.size.y = height;
+        }
+    }
+
     pub fn vertices(&self, width: u32, height: u32) -> Vec<UiVertex> {
         let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
         let window = self.window.resolve(root);
         let mut vertices = Vec::with_capacity(30);
         add_rect(&mut vertices, window, Color::rgba(0.03, 0.04, 0.06, 0.94), width, height);
         add_rect(&mut vertices, UiRect::new(window.x, window.y, window.width, 26.0), Color::rgba(0.1, 0.12, 0.17, 1.0), width, height);
-        for panel in &self.panels {
+        for (panel_index, panel) in self.panels.iter().enumerate() {
+            if self.panel_windows.iter().any(|window| window.panel.is_some_and(|id| id.0 == panel_index) && !window.visible) {
+                continue;
+            }
             add_rect(&mut vertices, panel.layout.resolve(root), panel.color, width, height);
         }
-        for graph in &self.graphs {
-            if graph.visible {
-                add_graph(&mut vertices, graph, graph.layout.resolve(root), width, height);
+        for (index, graph) in self.graphs.iter().enumerate() {
+            let child = UiChild::Graph(UiGraphId(index));
+            if self.child_is_visible(child) {
+                add_graph(&mut vertices, graph, self.control_rect(child, root), width, height);
             }
         }
         for (index, slider) in self.sliders.iter().enumerate() {
@@ -475,13 +690,29 @@ impl UiCanvas {
                 self.item_rect(item.parent, item.child_index, item.layout, root)
             }
             UiChild::Container(id) => self.container_rect(id, root),
+            UiChild::Graph(id) => {
+                let item = &self.graphs[id.0];
+                self.item_rect(item.parent, item.child_index, item.layout, root)
+            }
         }
     }
 
     fn child_is_visible(&self, child: UiChild) -> bool {
         let parent = match child {
             UiChild::Slider(id) => self.sliders[id.0].parent,
-            UiChild::Button(id) => self.buttons[id.0].parent,
+            UiChild::Button(id) => {
+                let Some(window) = self.panel_windows.iter().find(|window| window.header == id) else {
+                    return self.container_is_visible(self.buttons[id.0].parent);
+                };
+                if !window.visible {
+                    return false;
+                }
+                self.buttons[id.0].parent
+            }
+            UiChild::Graph(id) => {
+                let graph = &self.graphs[id.0];
+                return graph.visible && self.container_is_visible(graph.parent);
+            }
             UiChild::Label(id) => {
                 let label = &self.labels[id.0];
                 return label.visible && self.container_is_visible(label.parent);
@@ -590,6 +821,7 @@ impl UiCanvas {
             UiChild::Button(id) => self.buttons[id.0].layout,
             UiChild::Label(id) => self.labels[id.0].layout,
             UiChild::Container(id) => self.containers[id.0].layout,
+            UiChild::Graph(id) => self.graphs[id.0].layout,
         }
     }
 }

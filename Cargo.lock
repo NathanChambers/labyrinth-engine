@@ -511,6 +511,7 @@ name = "genos"
 version = "0.1.0"
 dependencies = [
  "labyrinth",
+ "labyrinth_debug_ui",
 ]
 
 [[package]]
@@ -769,6 +770,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "labyrinth_debug_ui"
+version = "0.1.0"
+dependencies = [
+ "labyrinth",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -807,6 +815,7 @@ name = "lighting"
 version = "0.1.0"
 dependencies = [
  "labyrinth",
+ "labyrinth_debug_ui",
  "mesh",
 ]
 
@@ -1439,6 +1448,7 @@ name = "primitives"
 version = "0.1.0"
 dependencies = [
  "labyrinth",
+ "labyrinth_debug_ui",
  "mesh",
 ]
 

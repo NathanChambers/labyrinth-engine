@@ -4,9 +4,10 @@ use std::path::Path;
 
 use building::{Building, LampSlot, MovingBox, distributed_lamps};
 use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, EulerRot, FontAsset, IrradianceMode, KeyCode, LightId, PointLight, Quat, RenderDebugMode, RuntimeContext, Transform, UiAnchor,
+    Application, Camera, CameraId, Color, DirectionalLight, EulerRot, FontAsset, IrradianceMode, KeyCode, LightId, PointLight, Quat, RadianceFieldResolution, RuntimeContext, Transform, UiAnchor,
     UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run,
 };
+use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
 
 const MAX_POINT_LIGHTS: usize = 7;
 const LAMP_TOTAL: f32 = 1.0;
@@ -33,17 +34,6 @@ struct InspectorButtons {
     time_of_day: Option<UiSliderId>,
     time_of_day_value: Option<UiLabelId>,
     boxes: Vec<UiButtonId>,
-    display_mode: Vec<UiButtonId>,
-    irradiance: Option<UiButtonId>,
-    surface_probe_gi: Option<UiButtonId>,
-    shadows: Option<UiButtonId>,
-    freeze_gi: Option<UiButtonId>,
-    gizmos: Option<UiButtonId>,
-    normals: Option<UiButtonId>,
-    lights_gizmos: Option<UiButtonId>,
-    global_probes: Option<UiButtonId>,
-    screen_probes: Option<UiButtonId>,
-    gi_traces: Option<UiButtonId>,
 }
 
 struct LampEntity {
@@ -79,12 +69,13 @@ struct GenosDemo {
     lamps: Vec<LampEntity>,
     moving_boxes: Vec<MovingBoxEntity>,
     buttons: InspectorButtons,
-    render_mode: RenderDebugMode,
+    debug_panels: Option<DebugPanels>,
 }
 
 impl Application for GenosDemo {
     fn setup(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         context.irradiance_mode = IrradianceMode::AabbSdf;
+        context.gi_radiance_field_resolution = RadianceFieldResolution { resolution: [40, 10, 40] };
         context.render_settings.ambient_intensity = 0.0;
         context.render_settings.surface_probes_enabled = self.surface_probe_gi_enabled;
         self.build_scene(context);
@@ -98,11 +89,13 @@ impl Application for GenosDemo {
             self.box_time += delta_seconds;
         }
         self.update_inspector(context)?;
+        self.debug_panels.as_mut().expect("shared debug panels are initialized").update(context);
+        let movement_keys_active = self.debug_panels.as_ref().is_some_and(DebugPanels::movement_keys_active);
         if !self.sun_frozen {
             self.day = (self.day + delta_seconds * self.sun_speed / DAY_SECONDS).rem_euclid(1.0);
         }
         self.update_sun(context);
-        self.update_camera(context, delta_seconds)?;
+        self.update_camera(context, delta_seconds, movement_keys_active)?;
 
         for lamp in &self.lamps {
             let point_light = context.scene.get_point_light_mut(lamp.id).ok_or("point light disappeared from the scene")?;
@@ -178,14 +171,18 @@ impl GenosDemo {
     fn setup_ui(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         let font_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lighting/assets/fonts/default.ttf");
         context.ui.set_font(FontAsset::from_file(font_path)?);
-        let panel_size = Vec2::new(420.0, 640.0);
+        let panel_size = Vec2::new(420.0, 390.0);
         context.ui.set_window_layout(UiLayout::anchored(panel_size, UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(20.0, 20.0)));
-        context.ui.add_label_layout(None, UiLayout::anchored(Vec2::new(320.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(30.0, 22.0)), "Genos Stress Inspector", 15.0, Color::WHITE);
+        let header = context.ui.add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(panel_size.x, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(20.0, 20.0)), false);
+        context.ui.set_button_text(header, "Genos Stress Inspector", 15.0, Color::WHITE);
+        context.ui.set_button_text_centered(header, false);
+        context.ui.set_button_toggled_colors(header, Color::rgba(0.1, 0.12, 0.17, 1.0), Color::rgba(0.1, 0.12, 0.17, 1.0));
         let stack = context.ui.add_container(
             None,
             UiLayout::anchored(Vec2::new(panel_size.x, panel_size.y - 42.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(20.0, 48.0)),
             UiAutoLayout::column(8.0, 2.0),
         );
+        context.ui.register_window_panel(header, stack, 26.0);
 
         add_inspector_section(context, stack, "STRESS SCENE");
         self.buttons.lights = add_inspector_mode_row(context, stack, "Point lights", &["1", "3", "5", "7"], light_mode_index(self.light_count));
@@ -201,28 +198,8 @@ impl GenosDemo {
         self.buttons.time_of_day_value = Some(time_label);
         self.buttons.boxes = add_inspector_mode_row(context, stack, "Boxes", &["Move", "Still"], usize::from(self.boxes_still));
 
-        add_inspector_section(context, stack, "DISPLAY MODE");
-        let display = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 24.0)), UiAutoLayout::row(0.0, 6.0));
-        self.buttons.display_mode = [
-            add_inspector_mode_button(context, display, "Lit", self.render_mode == RenderDebugMode::LitMaterials),
-            add_inspector_mode_button(context, display, "Unlit", self.render_mode == RenderDebugMode::UnlitMaterials),
-            add_inspector_mode_button(context, display, "Wire", self.render_mode == RenderDebugMode::Wireframe),
-        ]
-        .into();
-
-        add_inspector_section(context, stack, "RENDER OPTIONS");
-        self.buttons.irradiance = Some(add_inspector_checkbox(context, stack, "Global illumination", context.render_settings.irradiance_enabled));
-        self.buttons.surface_probe_gi = Some(add_inspector_checkbox(context, stack, "Screen probe GI", context.render_settings.surface_probes_enabled));
-        self.buttons.shadows = Some(add_inspector_checkbox(context, stack, "Shadows", context.render_settings.shadows_enabled));
-        self.buttons.freeze_gi = Some(add_inspector_checkbox(context, stack, "Freeze GI radiance", context.freeze_gi_radiance));
-
-        add_inspector_section(context, stack, "GIZMOS");
-        self.buttons.gizmos = Some(add_inspector_checkbox(context, stack, "Show gizmos", context.gizmos_enabled));
-        self.buttons.normals = Some(add_inspector_checkbox(context, stack, "Normals", context.normal_gizmos_enabled));
-        self.buttons.lights_gizmos = Some(add_inspector_checkbox(context, stack, "Lights", context.light_gizmos_enabled));
-        self.buttons.global_probes = Some(add_inspector_checkbox(context, stack, "GI global probes", context.gi_global_gizmos_enabled));
-        self.buttons.screen_probes = Some(add_inspector_checkbox(context, stack, "Screen space probes", context.gi_gizmos_enabled));
-        self.buttons.gi_traces = Some(add_inspector_checkbox(context, stack, "GI SDF ray traces", context.gi_trace_gizmos_enabled));
+        self.debug_panels =
+            Some(DebugPanels::new(context, DebugPanelsConfig::new("Render Debug").with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0)).with_performance_offset(Vec2::new(-24.0, 500.0))));
         Ok(())
     }
 
@@ -337,49 +314,10 @@ impl GenosDemo {
         sync_group(context, &self.buttons.sky, usize::from(!self.sky_on));
         sync_group(context, &self.buttons.speed, SUN_SPEEDS.iter().position(|speed| *speed == self.sun_speed).unwrap_or(1));
         sync_group(context, &self.buttons.boxes, usize::from(self.boxes_still));
-        self.update_debug_options(context);
         Ok(())
     }
 
-    fn update_debug_options(&mut self, context: &mut RuntimeContext) {
-        let modes = [RenderDebugMode::LitMaterials, RenderDebugMode::UnlitMaterials, RenderDebugMode::Wireframe];
-        if let Some(index) = select_new_button(context, &self.buttons.display_mode, modes.iter().position(|mode| *mode == self.render_mode).unwrap_or(0)) {
-            self.render_mode = modes[index];
-        }
-        context.render_debug_mode = self.render_mode;
-        sync_group(context, &self.buttons.display_mode, modes.iter().position(|mode| *mode == self.render_mode).unwrap_or(0));
-        let mut settings = context.render_settings;
-        settings.irradiance_enabled = read_toggle(context, self.buttons.irradiance, settings.irradiance_enabled);
-        settings.surface_probes_enabled = read_toggle(context, self.buttons.surface_probe_gi, settings.surface_probes_enabled);
-        settings.shadows_enabled = read_toggle(context, self.buttons.shadows, settings.shadows_enabled);
-        context.render_settings = settings;
-        context.gizmos_enabled = read_toggle(context, self.buttons.gizmos, context.gizmos_enabled);
-        context.normal_gizmos_enabled = read_toggle(context, self.buttons.normals, context.normal_gizmos_enabled);
-        context.light_gizmos_enabled = read_toggle(context, self.buttons.lights_gizmos, context.light_gizmos_enabled);
-        context.gi_global_gizmos_enabled = read_toggle(context, self.buttons.global_probes, context.gi_global_gizmos_enabled);
-        context.gi_gizmos_enabled = read_toggle(context, self.buttons.screen_probes, context.gi_gizmos_enabled);
-        context.gi_trace_gizmos_enabled = read_toggle(context, self.buttons.gi_traces, context.gi_trace_gizmos_enabled);
-        context.freeze_gi_radiance = read_toggle(context, self.buttons.freeze_gi, context.freeze_gi_radiance);
-        for button in [
-            self.buttons.irradiance,
-            self.buttons.surface_probe_gi,
-            self.buttons.shadows,
-            self.buttons.freeze_gi,
-            self.buttons.gizmos,
-            self.buttons.normals,
-            self.buttons.lights_gizmos,
-            self.buttons.global_probes,
-            self.buttons.screen_probes,
-            self.buttons.gi_traces,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            set_checkbox_mark(context, button);
-        }
-    }
-
-    fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32) -> Result<(), String> {
+    fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32, movement_keys_active: bool) -> Result<(), String> {
         if context.input.cursor_captured() {
             let mouse = context.input.mouse_delta();
             self.yaw -= mouse.x * 0.002;
@@ -389,23 +327,25 @@ impl GenosDemo {
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was removed")?;
         let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
         let mut movement = Vec3::ZERO;
-        if context.input.is_key_down(KeyCode::KeyW) {
-            movement += rotation * Vec3::NEG_Z;
-        }
-        if context.input.is_key_down(KeyCode::KeyS) {
-            movement += rotation * Vec3::Z;
-        }
-        if context.input.is_key_down(KeyCode::KeyD) {
-            movement += rotation * Vec3::X;
-        }
-        if context.input.is_key_down(KeyCode::KeyA) {
-            movement += rotation * Vec3::NEG_X;
-        }
-        if context.input.is_key_down(KeyCode::Space) {
-            movement += Vec3::Y;
-        }
-        if context.input.is_key_down(KeyCode::KeyC) {
-            movement -= Vec3::Y;
+        if !movement_keys_active {
+            if context.input.is_key_down(KeyCode::KeyW) {
+                movement += rotation * Vec3::NEG_Z;
+            }
+            if context.input.is_key_down(KeyCode::KeyS) {
+                movement += rotation * Vec3::Z;
+            }
+            if context.input.is_key_down(KeyCode::KeyD) {
+                movement += rotation * Vec3::X;
+            }
+            if context.input.is_key_down(KeyCode::KeyA) {
+                movement += rotation * Vec3::NEG_X;
+            }
+            if context.input.is_key_down(KeyCode::Space) {
+                movement += Vec3::Y;
+            }
+            if context.input.is_key_down(KeyCode::KeyC) {
+                movement -= Vec3::Y;
+            }
         }
         let speed = if context.input.is_key_down(KeyCode::ShiftLeft) { 20.0 } else { 5.0 };
         camera.transform.rotation = rotation;
@@ -427,14 +367,6 @@ fn add_inspector_mode_row(context: &mut RuntimeContext, parent: UiContainerId, l
     let row = context.ui.add_container(Some(parent), UiLayout::new(Vec2::new(0.0, 24.0)), UiAutoLayout::row(0.0, 5.0));
     context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(94.0, 20.0)), label, 11.0, Color::WHITE);
     names.iter().enumerate().map(|(index, name)| add_inspector_mode_button(context, row, name, selected == index)).collect()
-}
-
-fn add_inspector_checkbox(context: &mut RuntimeContext, parent: UiContainerId, name: &str, enabled: bool) -> UiButtonId {
-    let row = context.ui.add_container(Some(parent), UiLayout::new(Vec2::new(0.0, 20.0)), UiAutoLayout::row(0.0, 8.0));
-    context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 18.0)), name, 11.0, Color::WHITE);
-    let button = context.ui.add_toggle_button_layout(Some(row), UiLayout::new(Vec2::new(16.0, 16.0)), enabled);
-    set_checkbox_mark(context, button);
-    button
 }
 
 fn add_inspector_slider_row(context: &mut RuntimeContext, parent: UiContainerId, name: &str, minimum: f32, maximum: f32, value: f32) -> (UiSliderId, UiLabelId) {
@@ -467,15 +399,6 @@ fn sync_group(context: &mut RuntimeContext, buttons: &[UiButtonId], selected: us
     for (index, button) in buttons.iter().enumerate() {
         context.ui.set_button_toggled(*button, index == selected);
     }
-}
-
-fn read_toggle(context: &RuntimeContext, button: Option<UiButtonId>, fallback: bool) -> bool {
-    button.and_then(|button| context.ui.button_toggled(button)).unwrap_or(fallback)
-}
-
-fn set_checkbox_mark(context: &mut RuntimeContext, button: UiButtonId) {
-    let text = if context.ui.button_toggled(button).unwrap_or(false) { "✓" } else { "" };
-    context.ui.set_button_text(button, text, 11.0, Color::WHITE);
 }
 
 fn moving_set(count: usize, dynamic_count: usize) -> Vec<bool> {
@@ -581,7 +504,7 @@ fn main() -> Result<(), String> {
             lamps: Vec::new(),
             moving_boxes: Vec::new(),
             buttons: InspectorButtons::default(),
-            render_mode: RenderDebugMode::LitMaterials,
+            debug_panels: None,
         },
     )
 }

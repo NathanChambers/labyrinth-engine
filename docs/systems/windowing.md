@@ -10,7 +10,7 @@ Windowing owns the desktop event loop, window lifetime, initial size, display mo
 
 ## State and invariants
 
-`Runner` owns `WindowSettings`, the active `Window`, the active `Renderer`, the `RuntimeContext`, and any terminal error. The application object owns its object handles and behavior through the `Application` trait. Only one window and renderer are active. The public `WindowMode` values are windowed, borderless fullscreen, and exclusive fullscreen. The current mode in settings is updated when F11 cycles modes.
+`Runner` owns `WindowSettings`, the active `Window`, the active `Renderer`, the `RuntimeContext`, and any terminal error. The application object owns its object handles and behavior through the `Application` trait. Only one window and renderer are active. The public `WindowMode` values are windowed, borderless fullscreen, and exclusive fullscreen. The current mode in settings is updated when F11 cycles modes. Cursor capture state is cleared and the cursor is made visible and unconfined before application cleanup on exit, and before the window is dropped on suspension. Applications can temporarily disable cursor capture on a scene click through `RuntimeContext::cursor_capture_on_scene_click`; the shared GI picker uses this while armed so the click reaches the tool.
 
 ## Public contract
 RuntimeContext includes an optional debug capture coordinator. WindowSettings may specify a Rhai capture script and a capture output root. The script is compiled after application setup; its camera actions run after the application update, and capture.exit() exits cleanly after pending images are written.
@@ -21,7 +21,7 @@ F11 cycles windowed → borderless → exclusive → windowed. Escape and the cl
 
 ## Lifecycle
 
-The application creates its window and renderer on `resumed`. It drops both on `suspended`, allowing surface resources to be recreated on a later resume. Resize events update the renderer's surface and depth target. Redraw events render one frame. Initialization or rendering errors exit the event loop and return to the caller.
+The application creates its window and renderer on `resumed`. It releases cursor capture before dropping both on `suspended`, allowing surface resources to be recreated on a later resume. Resize events update the renderer's surface and depth target. Redraw events render one frame. Initialization or rendering errors exit the event loop and return to the caller; all event-loop exits release cursor capture before the application's cleanup hook runs.
 
 ## Connections
 

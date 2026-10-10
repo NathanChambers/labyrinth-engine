@@ -30,10 +30,14 @@ pub use gizmo::{GizmoCanvas, GizmoVertex};
 pub use input::InputState;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
 pub use mesh::{Material, Mesh, MeshInstance, MeshVertex};
-pub use renderer::{GraphicsApi, RenderDebugMode, RenderSettings, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererSkyLighting, ShadowQuality};
+pub use renderer::{
+    GraphicsApi, RADIANCE_FIELD_CHANNEL_COUNT, RADIANCE_FIELD_RAY_COUNT, RADIANCE_FIELD_RAYS_PER_CHANNEL, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceFieldResolution, RenderDebugMode, RenderSettings,
+    RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceFieldGrid, RendererRadianceSurfaceCandidate,
+    RendererRadianceSurfaceInspection, RendererSkyLighting, ShadowQuality,
+};
 pub use scene::{CameraId, LightId, MeshId, Scene};
 pub use time::{Time, TimeScaleId};
-pub use ui::{UiAnchor, UiAutoLayout, UiButtonId, UiCanvas, UiContainerId, UiFlexDirection, UiGraphId, UiLabelId, UiLayout, UiPanelId, UiPivot, UiRect, UiSliderId};
+pub use ui::{UiAnchor, UiAutoLayout, UiButtonId, UiCanvas, UiContainerId, UiFlexDirection, UiGraphId, UiLabelId, UiLayout, UiPanelId, UiPanelWindowId, UiPivot, UiRect, UiSliderId};
 pub use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -81,8 +85,24 @@ pub struct RuntimeContext {
     pub irradiance_mode: IrradianceMode,
     pub irradiance_clipmap: IrradianceClipmapDesc,
     pub irradiance_update_budget: usize,
+    /// World radiance-field cell counts, read when the renderer initializes.
+    pub gi_radiance_field_resolution: RadianceFieldResolution,
+    /// Current renderer-owned bounds and resolution for the scene radiance field.
+    pub gi_radiance_field_grid: RendererRadianceFieldGrid,
     pub sky_lighting: RendererSkyLighting,
     pub performance_stats: RendererPerformanceStats,
+    pub gi_trace_diagnostics: [RendererGiRayDiagnostic; RADIANCE_FIELD_RAY_COUNT],
+    /// Latest GPU-evaluated surface point and its eight radiance-field contributions.
+    pub gi_surface_inspection: RendererRadianceSurfaceInspection,
+    /// Whether a surface contribution pick is queued or being read back.
+    pub gi_surface_inspection_pending: bool,
+    /// Pixel requested for the next depth-prepass surface inspection.
+    pub gi_surface_inspector_pick_request: Option<[u32; 2]>,
+    /// Whether the selected surface contribution gizmos should be drawn.
+    pub gi_surface_inspector_enabled: bool,
+    pub gi_trace_selected_ray: u32,
+    pub gi_trace_debug_mode: RendererGiTraceDebugMode,
+    pub gi_trace_overview_enabled: bool,
     pub gizmos: GizmoCanvas,
     pub gizmos_enabled: bool,
     pub normal_gizmos_enabled: bool,
@@ -91,13 +111,58 @@ pub struct RuntimeContext {
     pub gi_gizmos_enabled: bool,
     pub gi_trace_gizmos_enabled: bool,
     pub gi_selected_radiance_cell: [u32; 3],
-    pub gi_selected_radiance_field_far: bool,
+    /// Whether a scene click should capture the cursor; tools can disable this while picking.
+    pub cursor_capture_on_scene_click: bool,
+    pub gi_radiance_temporal_accumulation_enabled: bool,
+    /// Requests one blocking readback of the most recently rendered GPU timestamps.
+    pub request_gpu_timing_sample: bool,
     pub sdf_occupancy_gizmos_enabled: bool,
     pub freeze_gi_radiance: bool,
     pub ui_enabled: bool,
     pub render_debug_mode: RenderDebugMode,
     pub render_settings: RenderSettings,
     pub debug_capture: Option<DebugCapture>,
+}
+
+fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection: RendererRadianceSurfaceInspection, grid: RendererRadianceFieldGrid) {
+    if !inspection.valid {
+        return;
+    }
+    let surface = Vec3::from_array(inspection.world_position);
+    let normal = Vec3::from_array(inspection.normal).normalize_or_zero();
+    gizmos.dot(surface, 0.12, Color::rgb(0.0, 0.95, 1.0));
+    gizmos.line(surface, surface + normal * 0.35, Color::rgb(0.2, 0.6, 1.0));
+    let visibility_origin = surface + Vec3::from_array(inspection.sdf_origin_offset);
+    gizmos.line(surface, visibility_origin, Color::rgb(1.0, 0.72, 0.12));
+    gizmos.dot(visibility_origin, 0.07, Color::rgb(0.35, 1.0, 0.48));
+    if !inspection.inside_field {
+        return;
+    }
+    let resolution = Vec3::new(grid.resolution[0] as f32, grid.resolution[1] as f32, grid.resolution[2] as f32);
+    if resolution.min_element() <= 0.0 {
+        return;
+    }
+    let cell_size = (Vec3::from_array(grid.maximum) - Vec3::from_array(grid.minimum)) / resolution;
+    for candidate in inspection.candidates {
+        let grid_position = Vec3::new(candidate.grid_position[0] as f32, candidate.grid_position[1] as f32, candidate.grid_position[2] as f32);
+        let logical_position = Vec3::from_array(grid.minimum) + (grid_position + Vec3::splat(0.5)) * cell_size;
+        let probe = if candidate.probe_valid { Vec3::from_array(candidate.probe_position) } else { logical_position };
+        let color = if candidate.probe_valid {
+            Color::rgb(display_radiance(candidate.contribution_radiance[0]), display_radiance(candidate.contribution_radiance[1]), display_radiance(candidate.contribution_radiance[2]))
+        } else {
+            Color::rgb(1.0, 0.25, 0.18)
+        };
+        gizmos.line(surface, probe, if candidate.probe_valid { Color::rgb(0.58, 0.65, 0.72) } else { color });
+        gizmos.dot(probe, 0.06 + candidate.final_weight.sqrt() * 0.24, color);
+    }
+    if let Some(candidate) = inspection.candidates.iter().filter(|candidate| candidate.has_occupied_voxel_after_start).max_by(|first, second| first.final_weight.total_cmp(&second.final_weight)) {
+        gizmos.wire_box(Vec3::from_array(candidate.first_occupied_after_start_minimum), Vec3::from_array(candidate.first_occupied_after_start_maximum), Color::rgba(1.0, 0.52, 0.08, 0.38));
+    }
+}
+
+fn display_radiance(value: f32) -> f32 {
+    let value = value.max(0.0);
+    value / (1.0 + value)
 }
 
 pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: A) -> Result<(), String> {
@@ -113,8 +178,18 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         irradiance_mode: IrradianceMode::default(),
         irradiance_clipmap: IrradianceClipmapDesc::default(),
         irradiance_update_budget: 8,
+        gi_radiance_field_resolution: RadianceFieldResolution::default(),
+        gi_radiance_field_grid: RendererRadianceFieldGrid::default(),
         sky_lighting: RendererSkyLighting::default(),
         performance_stats: RendererPerformanceStats::default(),
+        gi_trace_diagnostics: [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT],
+        gi_surface_inspection: RendererRadianceSurfaceInspection::default(),
+        gi_surface_inspection_pending: false,
+        gi_surface_inspector_pick_request: None,
+        gi_surface_inspector_enabled: false,
+        gi_trace_selected_ray: 0,
+        gi_trace_debug_mode: RendererGiTraceDebugMode::Geometry,
+        gi_trace_overview_enabled: false,
         gizmos: GizmoCanvas::default(),
         gizmos_enabled: false,
         normal_gizmos_enabled: false,
@@ -123,7 +198,9 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         gi_gizmos_enabled: false,
         gi_trace_gizmos_enabled: false,
         gi_selected_radiance_cell: [4, 1, 4],
-        gi_selected_radiance_field_far: false,
+        cursor_capture_on_scene_click: true,
+        gi_radiance_temporal_accumulation_enabled: true,
+        request_gpu_timing_sample: false,
         sdf_occupancy_gizmos_enabled: false,
         freeze_gi_radiance: false,
         ui_enabled: true,
@@ -138,6 +215,7 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
     }
     let mut runner = Runner { settings, application, context, last_frame: Instant::now(), window: None, renderer: None, failure: None };
     let event_loop_result = event_loop.run_app(&mut runner).map_err(|error| error.to_string());
+    runner.release_cursor();
     runner.application.cleanup(&mut runner.context);
     event_loop_result?;
     match runner.failure {
@@ -183,6 +261,13 @@ fn renderer_irradiance_volumes(volumes: &IrradianceVolumes, mode: IrradianceMode
 }
 
 impl<A> Runner<A> {
+    fn release_cursor(&mut self) {
+        self.context.input.set_cursor_captured(false);
+        if let Some(window) = &self.window {
+            self.apply_cursor_mode(window);
+        }
+    }
+
     fn set_mode(&mut self, mode: WindowMode) {
         self.settings.mode = mode;
         if let Some(window) = &self.window {
@@ -223,6 +308,7 @@ where
             Ok(window) => Arc::new(window),
             Err(error) => return self.fail(event_loop, error.to_string()),
         };
+        self.window = Some(window.clone());
         self.context.input.set_cursor_captured(true);
         self.apply_cursor_mode(&window);
         eprintln!("Initializing {:?} renderer", self.settings.graphics_api);
@@ -233,14 +319,21 @@ where
         };
         let lights = self.context.active_lights.iter().filter_map(|id| self.context.scene.get_light(*id)).copied().collect::<Vec<_>>();
         let irradiance_volumes = renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera);
-        let renderer = match Renderer::new(window.clone(), self.settings.graphics_api, camera, &lights, self.context.scene.instances(), &irradiance_volumes) {
+        let renderer = match Renderer::new_with_radiance_field_resolution(
+            window.clone(),
+            self.settings.graphics_api,
+            camera,
+            &lights,
+            self.context.scene.instances(),
+            &irradiance_volumes,
+            self.context.gi_radiance_field_resolution,
+        ) {
             Ok(renderer) => renderer,
             Err(error) => return self.fail(event_loop, error),
         };
         eprintln!("Renderer ready");
         window.request_redraw();
         self.renderer = Some(renderer);
-        self.window = Some(window);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -250,6 +343,7 @@ where
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.release_cursor();
         self.renderer = None;
         self.window = None;
     }
@@ -278,7 +372,12 @@ where
                 self.context.input.set_cursor_captured(false);
                 self.apply_cursor_mode(window);
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !self.context.input.cursor_captured() && !self.context.input.alt_held() => {
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
+                if !self.context.input.cursor_captured()
+                    && !self.context.input.alt_held()
+                    && self.context.cursor_capture_on_scene_click
+                    && !self.context.ui.pointer_over_ui(self.context.input.cursor_position(), window.inner_size().width, window.inner_size().height) =>
+            {
                 self.context.input.set_left_mouse_down(true);
                 self.context.input.set_cursor_captured(true);
                 self.apply_cursor_mode(window);
@@ -297,7 +396,7 @@ where
                         self.apply_cursor_mode(window);
                     }
                     if matches!(key, KeyCode::AltLeft | KeyCode::AltRight) {
-                        self.context.input.set_cursor_captured(!self.context.input.alt_held());
+                        self.context.input.set_cursor_captured(!self.context.input.alt_held() && self.context.cursor_capture_on_scene_click);
                         self.apply_cursor_mode(window);
                     }
                     if key == KeyCode::F11 && event.state == ElementState::Pressed && !event.repeat {
@@ -386,6 +485,9 @@ where
                             self.context.gizmos.mesh_normals(self.context.scene.instances(), 0.18);
                         }
                     }
+                    if !capture_without_gizmos && self.context.gi_surface_inspector_enabled {
+                        draw_radiance_surface_inspection_gizmos(&mut self.context.gizmos, self.context.gi_surface_inspection, self.context.gi_radiance_field_grid);
+                    }
                     let gizmo_vertices =
                         self.context.gizmos.vertices().iter().map(|vertex| RendererGizmoVertex { position: vertex.position.to_array(), color: vertex.color.to_array() }).collect::<Vec<_>>();
                     let irradiance_volumes =
@@ -394,18 +496,28 @@ where
                         renderer.set_irradiance_update_budget(self.context.irradiance_update_budget);
                         renderer.update_render_settings(self.context.render_settings);
                         renderer.update_sky_lighting(self.context.sky_lighting);
+                        renderer.set_gi_radiance_temporal_accumulation_enabled(self.context.gi_radiance_temporal_accumulation_enabled);
                         renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights, self.context.irradiance_mode == IrradianceMode::AabbSdf);
+                        self.context.gi_radiance_field_grid = renderer.radiance_field_grid();
                         self.context.performance_stats = renderer.performance_stats();
                         renderer.update_render_debug_mode(self.context.render_debug_mode);
                         renderer.set_surface_probe_gizmos_enabled(self.context.gi_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.set_gi_radiance_frozen(self.context.freeze_gi_radiance);
                         renderer.set_world_radiance_gizmos_enabled(self.context.gi_global_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.set_world_radiance_trace_gizmos_enabled(self.context.gi_trace_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
-                        renderer.set_selected_radiance_cell(self.context.gi_selected_radiance_cell, self.context.gi_selected_radiance_field_far);
+                        renderer.set_selected_radiance_cell(self.context.gi_selected_radiance_cell);
+                        renderer.set_selected_radiance_trace_options(self.context.gi_trace_selected_ray, self.context.gi_trace_debug_mode, self.context.gi_trace_overview_enabled);
+                        if let Some(pixel) = self.context.gi_surface_inspector_pick_request.take() {
+                            renderer.request_radiance_surface_inspection(pixel);
+                        }
                         renderer.set_sdf_occupancy_gizmos_enabled(self.context.sdf_occupancy_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.update_gizmos(&gizmo_vertices);
                         renderer.update_ui(&ui_vertices);
-                        renderer.render()
+                        renderer.render()?;
+                        self.context.gi_trace_diagnostics = renderer.gi_trace_diagnostics();
+                        self.context.gi_surface_inspection = renderer.radiance_surface_inspection();
+                        self.context.gi_surface_inspection_pending = renderer.radiance_surface_inspection_pending();
+                        Ok(())
                     });
                     if result.is_ok() {
                         let frame_cpu_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
@@ -413,7 +525,9 @@ where
                         self.context.performance_stats.frame_cpu_ms = frame_cpu_ms;
                     }
                     let result = result.and_then(|_| {
-                        if self.context.debug_capture.as_ref().is_some_and(DebugCapture::has_pending_report) {
+                        let capture_report_requested = self.context.debug_capture.as_ref().is_some_and(DebugCapture::has_pending_report);
+                        if self.context.request_gpu_timing_sample || capture_report_requested {
+                            self.context.request_gpu_timing_sample = false;
                             renderer.update_gpu_timestamps()?;
                             self.context.performance_stats = renderer.performance_stats();
                         }

@@ -7,20 +7,18 @@ struct SdfClipmapData {
     maximum: vec4<f32>,
     resolution: vec4<u32>,
     settings: vec4<u32>,
-    grid_offset: vec4<u32>,
     sky_radiance: vec4<f32>,
 };
 
 struct SelectedRadianceCell {
     coordinate_and_level: vec4<u32>,
+    trace_options: vec4<u32>,
 };
 
 struct RadianceFieldData {
     minimum: vec4<f32>,
     maximum: vec4<f32>,
     resolution: vec4<u32>,
-    grid_offset: vec4<u32>,
-    scroll_shift: vec4<i32>,
     settings: vec4<u32>,
 };
 
@@ -33,6 +31,15 @@ struct RadianceFieldTraceDebug {
     hit_position: vec4<f32>,
     hit_normal_distance: vec4<f32>,
     direction_hit: vec4<f32>,
+    radiance: vec4<f32>,
+    direct_radiance: vec4<f32>,
+    emission_radiance: vec4<f32>,
+    sky_radiance: vec4<f32>,
+    directional_weights_first: vec4<f32>,
+    directional_weights_second: vec4<f32>,
+    channel_statistics: vec4<f32>,
+    channel_statistics_aux: vec4<f32>,
+    cell_position: vec4<f32>,
 };
 
 struct RadianceFieldTraceDebugValues {
@@ -68,16 +75,10 @@ var sdf_texture: texture_3d<f32>;
 var<uniform> sdf_clipmap: SdfClipmapData;
 
 @group(0) @binding(11)
-var<uniform> near_radiance_field: RadianceFieldData;
+var<uniform> radiance_field: RadianceFieldData;
 
 @group(0) @binding(12)
-var<storage, read> near_radiance_values: RadianceFieldValues;
-
-@group(0) @binding(13)
-var<uniform> far_radiance_field: RadianceFieldData;
-
-@group(0) @binding(14)
-var<storage, read> far_radiance_values: RadianceFieldValues;
+var<storage, read> radiance_field_values: RadianceFieldValues;
 
 @group(0) @binding(16)
 var<storage, read> surface_probes: SurfaceProbeValues;
@@ -89,12 +90,8 @@ var<storage, read> radiance_field_trace_debug: RadianceFieldTraceDebugValues;
 var<uniform> selected_radiance_cell: SelectedRadianceCell;
 
 const SURFACE_PROBE_CAPACITY: u32 = 131072u;
-const RADIANCE_FIELD_DIRECTIONS: u32 = 6u;
-const LIGHTING_KIND_UNLIT: u32 = 0u;
-const LIGHTING_KIND_DIRECT: u32 = 1u;
-const LIGHTING_KIND_SHADOWED: u32 = 2u;
-const LIGHTING_KIND_EMISSIVE: u32 = 3u;
-const LIGHTING_KIND_SKY: u32 = 4u;
+const RADIANCE_FIELD_CHANNELS: u32 = 6u;
+const RADIANCE_FIELD_RAY_COUNT: u32 = 24u;
 const TRACE_TERMINATION_HIT: u32 = 1u;
 const TRACE_TERMINATION_MAX_STEPS: u32 = 2u;
 const TRACE_TERMINATION_MAX_DISTANCE: u32 = 3u;
@@ -106,22 +103,6 @@ fn field_cell_index(coordinate: vec3<u32>, resolution: vec3<u32>) -> u32 {
 
 fn display_radiance(radiance: vec3<f32>) -> vec3<f32> {
     return clamp(radiance / (radiance + vec3<f32>(0.3)), vec3<f32>(0.06), vec3<f32>(1.0));
-}
-
-fn lighting_kind_color(kind: u32) -> vec3<f32> {
-    if kind == LIGHTING_KIND_DIRECT {
-        return vec3<f32>(1.0, 0.86, 0.12);
-    }
-    if kind == LIGHTING_KIND_SHADOWED {
-        return vec3<f32>(0.12, 0.45, 1.0);
-    }
-    if kind == LIGHTING_KIND_EMISSIVE {
-        return vec3<f32>(1.0, 0.12, 0.85);
-    }
-    if kind == LIGHTING_KIND_SKY {
-        return vec3<f32>(0.1, 0.9, 1.0);
-    }
-    return vec3<f32>(0.68, 0.72, 0.78);
 }
 
 fn trace_termination_color(reason: u32) -> vec3<f32> {
@@ -161,20 +142,17 @@ fn probe_reason_color(reason: u32) -> vec3<f32> {
     return vec3<f32>(0.45, 0.55, 0.68);
 }
 
-fn field_radiance(index: u32, field: RadianceFieldData, is_near: bool) -> vec3<f32> {
+fn field_radiance(index: u32, field: RadianceFieldData) -> vec3<f32> {
     var result = vec3<f32>(0.0);
     let resolution = field.resolution.xyz;
     let logical = vec3<u32>(index % resolution.x, (index / resolution.x) % resolution.y, index / (resolution.x * resolution.y));
-    let physical = (logical + field.grid_offset.xyz) % resolution;
+    let physical = logical;
     let physical_index = field_cell_index(physical, resolution);
-    for (var lobe = 0u; lobe < RADIANCE_FIELD_DIRECTIONS; lobe++) {
-        var value = far_radiance_values.values[physical_index * RADIANCE_FIELD_DIRECTIONS + lobe];
-        if is_near {
-            value = near_radiance_values.values[physical_index * RADIANCE_FIELD_DIRECTIONS + lobe];
-        }
+    for (var lobe = 0u; lobe < RADIANCE_FIELD_CHANNELS; lobe++) {
+        let value = radiance_field_values.values[physical_index * RADIANCE_FIELD_CHANNELS + lobe];
         result += value.rgb * value.a;
     }
-    return result / f32(RADIANCE_FIELD_DIRECTIONS);
+    return result / f32(RADIANCE_FIELD_CHANNELS);
 }
 
 fn field_cell_position(index: u32, field: RadianceFieldData) -> vec3<f32> {
@@ -188,7 +166,7 @@ fn field_cell_position(index: u32, field: RadianceFieldData) -> vec3<f32> {
 }
 
 fn sdf_physical_coordinate(logical: vec3<u32>) -> vec3<i32> {
-    return vec3<i32>((logical + sdf_clipmap.grid_offset.xyz) % sdf_clipmap.resolution.xyz);
+    return vec3<i32>(logical);
 }
 
 fn sdf_distance_at(logical: vec3<i32>) -> f32 {
@@ -240,21 +218,24 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
         return make_vertex(position, vec4<f32>(color, 0.95));
     }
 
-    let field_cell_count = near_radiance_field.resolution.x * near_radiance_field.resolution.y * near_radiance_field.resolution.z;
+    let field_cell_count = radiance_field.resolution.x * radiance_field.resolution.y * radiance_field.resolution.z;
     let field_instance = instance_index - SURFACE_PROBE_CAPACITY;
-    let is_near = field_instance < field_cell_count;
-    if field_instance >= field_cell_count * 2u {
-        let trace_instance = field_instance - field_cell_count * 2u;
-        var trace_field = near_radiance_field;
-        if selected_radiance_cell.coordinate_and_level.w == 1u {
-            trace_field = far_radiance_field;
-        }
+    if field_instance >= field_cell_count {
+        let trace_instance = field_instance - field_cell_count;
+        let trace_field = radiance_field;
         let cell = min(selected_radiance_cell.coordinate_and_level.xyz, trace_field.resolution.xyz - vec3<u32>(1u));
-        let physical_cell = (cell + trace_field.grid_offset.xyz) % trace_field.resolution.xyz;
+        let physical_cell = cell;
         let physical_cell_index = field_cell_index(physical_cell, trace_field.resolution.xyz);
-        let trace_offset = select(0u, field_cell_count * RADIANCE_FIELD_DIRECTIONS, selected_radiance_cell.coordinate_and_level.w == 1u);
-        if trace_instance < RADIANCE_FIELD_DIRECTIONS {
-            let trace_data_index = trace_offset + physical_cell_index * RADIANCE_FIELD_DIRECTIONS + trace_instance;
+        let trace_offset = 0u;
+        if trace_instance < RADIANCE_FIELD_RAY_COUNT {
+            let selected_ray = selected_radiance_cell.trace_options.x;
+            let radiance_mode = selected_radiance_cell.trace_options.y == 1u;
+            let overview_enabled = selected_radiance_cell.trace_options.z != 0u;
+            let selected_ray_active = trace_instance == selected_ray;
+            if !overview_enabled && !selected_ray_active {
+                return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
+            }
+            let trace_data_index = trace_offset + physical_cell_index * RADIANCE_FIELD_RAY_COUNT + trace_instance;
             let trace = radiance_field_trace_debug.values[trace_data_index];
             let origin = trace.probe_position.xyz;
             let raw_direction = trace.direction_hit.xyz;
@@ -266,14 +247,18 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
             let valid = trace.probe_position.w > 0.5 && direction_is_valid && all(abs(hit_position) < vec3<f32>(1e20));
             let invalid_color = vec3<f32>(1.0, 0.08, 0.05);
             let geometry_color = select(vec3<f32>(1.0, 0.5, 0.08), vec3<f32>(0.1, 1.0, 0.2), hit);
-            let ray_color = select(geometry_color, invalid_color, !valid);
-            let lighting_color = select(lighting_kind_color(u32(max(trace.hit_position.w, 0.0) + 0.5)), invalid_color, !valid);
+            let radiance_marker_color = select(select(display_radiance(trace.radiance.rgb), vec3<f32>(1.0, 0.5, 0.08), !hit), invalid_color, !valid);
+            let ray_color = select(select(geometry_color, vec3<f32>(0.92), radiance_mode), invalid_color, !valid);
             let termination_color = select(trace_termination_color(termination_reason), invalid_color, !valid);
             let sampled_distance = select(trace.hit_normal_distance.x, 0.0, hit);
             let distance_color = select(sampled_sdf_distance_color(sampled_distance), invalid_color, !valid);
             let marker_position = select(origin + direction * 0.2, hit_position, valid);
+            let trace_alpha = select(0.2, 0.95, selected_ray_active);
+            if (termination_reason == 5u || trace.probe_position.w <= 0.5) && vertex_index < 28u {
+                return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
+            }
             if vertex_index < 2u {
-                return make_vertex(select(origin, marker_position, vertex_index == 1u), vec4<f32>(ray_color, 0.95));
+                return make_vertex(select(origin, marker_position, vertex_index == 1u), vec4<f32>(ray_color, trace_alpha));
             }
             if vertex_index < 4u {
                 if !valid || !hit {
@@ -281,9 +266,64 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
                 }
                 let normal_start = marker_position;
                 let normal_end = marker_position + normalize(trace.hit_normal_distance.xyz) * 0.22;
-                return make_vertex(select(normal_start, normal_end, vertex_index == 3u), vec4<f32>(ray_color, 0.95));
+                let normal_color = select(ray_color, vec3<f32>(0.15, 0.5, 1.0), radiance_mode);
+                return make_vertex(select(normal_start, normal_end, vertex_index == 3u), vec4<f32>(normal_color, trace_alpha));
+            }
+            if vertex_index >= 28u && vertex_index < 34u {
+                if !selected_ray_active || abs(trace.cell_position.w) < 0.5 {
+                    return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
+                }
+                let marker_vertex = vertex_index - 28u;
+                let axis = marker_vertex / 2u;
+                let endpoint = marker_vertex % 2u == 1u;
+                var direction = vec3<f32>(1.0, 0.0, 0.0);
+                if axis == 1u {
+                    direction = vec3<f32>(0.0, 1.0, 0.0);
+                } else if axis == 2u {
+                    direction = vec3<f32>(0.0, 0.0, 1.0);
+                }
+                let position = trace.cell_position.xyz + select(-direction, direction, endpoint) * 0.1;
+                return make_vertex(position, vec4<f32>(0.15, 0.85, 1.0, 0.95));
+            }
+            if vertex_index >= 34u && vertex_index < 40u {
+                if !selected_ray_active || abs(trace.cell_position.w) < 0.5 {
+                    return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
+                }
+                let marker_vertex = vertex_index - 34u;
+                let axis = marker_vertex / 2u;
+                let endpoint = marker_vertex % 2u == 1u;
+                var direction = vec3<f32>(1.0, 0.0, 0.0);
+                if axis == 1u {
+                    direction = vec3<f32>(0.0, 1.0, 0.0);
+                } else if axis == 2u {
+                    direction = vec3<f32>(0.0, 0.0, 1.0);
+                }
+                let position = origin + select(-direction, direction, endpoint) * 0.075;
+                let origin_color = select(vec3<f32>(0.2, 1.0, 0.28), vec3<f32>(1.0, 0.15, 0.08), trace.cell_position.w < 0.0);
+                return make_vertex(position, vec4<f32>(origin_color, 0.95));
+            }
+            if vertex_index >= 40u && vertex_index < 42u {
+                if !selected_ray_active || distance(trace.cell_position.xyz, origin) < 0.02 {
+                    return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
+                }
+                return make_vertex(select(trace.cell_position.xyz, origin, vertex_index == 41u), vec4<f32>(1.0, 0.72, 0.12, 0.95));
             }
             let sphere_vertex = vertex_index - 4u;
+            if radiance_mode {
+                if sphere_vertex >= 6u {
+                    return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
+                }
+                let axis_index = sphere_vertex / 2u;
+                let endpoint = sphere_vertex % 2u == 1u;
+                var marker_axis = vec3<f32>(1.0, 0.0, 0.0);
+                if axis_index == 1u {
+                    marker_axis = vec3<f32>(0.0, 1.0, 0.0);
+                } else if axis_index == 2u {
+                    marker_axis = vec3<f32>(0.0, 0.0, 1.0);
+                }
+                let dot_position = marker_position + select(-marker_axis, marker_axis, endpoint) * 0.06;
+                return make_vertex(dot_position, vec4<f32>(radiance_marker_color, trace_alpha));
+            }
             let ring = sphere_vertex / 8u;
             let segment = (sphere_vertex % 8u) / 2u;
             let angle = f32(segment) * 1.5707963 + select(0.0, 1.5707963, sphere_vertex % 2u == 1u);
@@ -296,32 +336,29 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
                 axis_v = vec3<f32>(0.0, 0.0, 1.0);
             }
             let sphere_offset = (axis_u * cos(angle) + axis_v * sin(angle)) * 0.045;
-            var marker_color = lighting_color;
+            var marker_color = geometry_color;
             if ring == 1u {
                 marker_color = termination_color;
             } else if ring == 2u {
                 marker_color = distance_color;
             }
-            return make_vertex(marker_position + sphere_offset, vec4<f32>(marker_color, 0.95));
+            return make_vertex(marker_position + sphere_offset, vec4<f32>(marker_color, trace_alpha));
         }
-        if trace_instance < RADIANCE_FIELD_DIRECTIONS + 12u {
-            let line_index = trace_instance - RADIANCE_FIELD_DIRECTIONS;
+        if trace_instance < RADIANCE_FIELD_RAY_COUNT + 12u {
+            let line_index = trace_instance - RADIANCE_FIELD_RAY_COUNT;
             let edge = array<vec2<u32>, 12>(vec2<u32>(0, 1), vec2<u32>(0, 2), vec2<u32>(0, 4), vec2<u32>(1, 3), vec2<u32>(1, 5), vec2<u32>(2, 3), vec2<u32>(2, 6), vec2<u32>(3, 7), vec2<u32>(4, 5), vec2<u32>(4, 6), vec2<u32>(5, 7), vec2<u32>(6, 7));
             let corners = array<vec3<f32>, 8>(vec3<f32>(0, 0, 0), vec3<f32>(1, 0, 0), vec3<f32>(0, 1, 0), vec3<f32>(1, 1, 0), vec3<f32>(0, 0, 1), vec3<f32>(1, 0, 1), vec3<f32>(0, 1, 1), vec3<f32>(1, 1, 1));
             let cell_minimum = trace_field.minimum.xyz + vec3<f32>(cell) * (trace_field.maximum.xyz - trace_field.minimum.xyz) / vec3<f32>(trace_field.resolution.xyz);
             let cell_size = (trace_field.maximum.xyz - trace_field.minimum.xyz) / vec3<f32>(trace_field.resolution.xyz);
             let edge_corners = edge[line_index];
             let position = cell_minimum + corners[select(edge_corners.x, edge_corners.y, vertex_index == 1u)] * cell_size;
-            let valid = radiance_field_trace_debug.values[trace_offset + physical_cell_index * RADIANCE_FIELD_DIRECTIONS].probe_position.w > 0.5;
+            let valid = radiance_field_trace_debug.values[trace_offset + physical_cell_index * RADIANCE_FIELD_RAY_COUNT].probe_position.w > 0.5;
             return make_vertex(position, vec4<f32>(select(vec3<f32>(1.0, 0.08, 0.05), vec3<f32>(0.2, 0.85, 1.0), valid), 0.95));
         }
         return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
     }
-    var field = far_radiance_field;
-    if is_near {
-        field = near_radiance_field;
-    }
-    let cell_index = select(field_instance - field_cell_count, field_instance, is_near);
+    let field = radiance_field;
+    let cell_index = field_instance;
     let center = field_cell_position(cell_index, field);
     let cell_size = (field.maximum.xyz - field.minimum.xyz) / vec3<f32>(field.resolution.xyz);
     let radius = max(min(min(cell_size.x, cell_size.y), cell_size.z) * 0.12, 0.025);
@@ -335,9 +372,8 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
     }
     let direction = select(-axis, axis, endpoint == 1u);
     let position = center + select(vec3<f32>(0.0), direction * radius, axis_index < 3u);
-    let radiance = field_radiance(cell_index, field, is_near);
-    let alpha = select(0.35, 0.68, is_near);
-    return make_vertex(position, vec4<f32>(display_radiance(radiance), alpha));
+    let radiance = field_radiance(cell_index, field);
+    return make_vertex(position, vec4<f32>(display_radiance(radiance), 0.58));
 }
 
 @fragment

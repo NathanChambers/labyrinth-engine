@@ -12,7 +12,7 @@ Each implemented engine system gets one page named for its responsibility. Use [
 | [Mesh](mesh.md) | `crates/mesh` | Implemented |
 | [Primitives](primitives.md) | `crates/engine` | Implemented |
 | [Rendering](rendering.md) | `crates/renderer` | Implemented |
-| [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Authored volumes, variable-density clipmap, and experimental AABB-SDF hybrid with a coarse world field and deterministic fixed-lattice surface probes |
+| [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Authored volumes and experimental static scene-bounded AABB-SDF plus one uniform scene-sized radiance field; deterministic fixed-lattice surface probes remain optional |
 | [Scripting](scripting.md) | `crates/scripting` | Implemented for debug capture |
 | [Debug Capture](capture.md) | `crates/engine`, `crates/renderer` | Implemented |
 
