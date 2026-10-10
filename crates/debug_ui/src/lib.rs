@@ -71,6 +71,7 @@ pub struct DebugPanels {
     display_mode_buttons: [UiButtonId; 4],
     irradiance_button: UiButtonId,
     screen_probe_gi_button: UiButtonId,
+    triangle_probe_occlusion_button: UiButtonId,
     shadows_button: UiButtonId,
     gizmos_button: UiButtonId,
     normals_button: UiButtonId,
@@ -120,10 +121,11 @@ impl DebugPanels {
         context.ui.add_label_layout(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 16.0)), "GI Support: R valid cells · G spatial weight", 9.0, Color::rgb(0.72, 0.76, 0.82));
         context.ui.add_label_layout(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 16.0)), "B directional support · magenta no usable cells", 9.0, Color::rgb(0.72, 0.76, 0.82));
 
-        let render_options_drawer = add_drawer(context, inspector_content, "RENDER OPTIONS", 3.0 * CHECKBOX_ROW_HEIGHT);
+        let render_options_drawer = add_drawer(context, inspector_content, "RENDER OPTIONS", 4.0 * CHECKBOX_ROW_HEIGHT);
         let render_options_content = render_options_drawer.content.expect("render options drawer content exists");
         let irradiance_button = add_checkbox(context, render_options_content, "Global illumination", context.render_settings.irradiance_enabled);
         let screen_probe_gi_button = add_checkbox(context, render_options_content, "Screen probe GI", context.render_settings.surface_probes_enabled);
+        let triangle_probe_occlusion_button = add_checkbox(context, render_options_content, "Triangle probe occlusion", context.render_settings.triangle_probe_occlusion_enabled);
         let shadows_button = add_checkbox(context, render_options_content, "Shadows", context.render_settings.shadows_enabled);
 
         let gizmo_content_height = 6.0 * CHECKBOX_ROW_HEIGHT + config.extra_gizmo_content_height + 44.0;
@@ -165,6 +167,7 @@ impl DebugPanels {
             display_mode_buttons,
             irradiance_button,
             screen_probe_gi_button,
+            triangle_probe_occlusion_button,
             shadows_button,
             gizmos_button,
             normals_button,
@@ -210,6 +213,7 @@ impl DebugPanels {
         let mut settings = context.render_settings;
         settings.irradiance_enabled = read_checkbox(context, self.irradiance_button, settings.irradiance_enabled);
         settings.surface_probes_enabled = read_checkbox(context, self.screen_probe_gi_button, settings.surface_probes_enabled);
+        settings.triangle_probe_occlusion_enabled = read_checkbox(context, self.triangle_probe_occlusion_button, settings.triangle_probe_occlusion_enabled);
         settings.shadows_enabled = read_checkbox(context, self.shadows_button, settings.shadows_enabled);
         context.render_settings = settings;
         context.gizmos_enabled = read_checkbox(context, self.gizmos_button, context.gizmos_enabled);

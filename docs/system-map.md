@@ -17,11 +17,12 @@ renderer visibility grid ──occupancy/regions──> probe placement and boun
 instance AABBs ──> renderer fixed conservative-occupancy + clearance grid ──voxel-confirmed visibility/material──> world-space radiance field compute pass
 light-change bounds ──> per-field radiance refresh flags ──24-ray all-cell initialization, then six rays per cell per frame; distance-tiered in-frustum snapshots add four samples per channel; scene-change snapshots are coalesced to one per 60 frames──> radiance ray batches
 world-cell-seeded hemisphere samples ──> 4 equal-weight initial rays per cardinal channel ──> 6 directional radiance channels ──24-ray all-cell initialization plus six-ray-per-cell-per-frame running-average refinement and additive camera-priority snapshots──> scene radiance field
+transformed source triangles ──> renderer-built triangle BVH ──Render Options toggle──> GPU probe-segment visibility filter in radiance-field sampling
 selected field cell + ray/mode/overview options ──> selected-ray gizmo pass ──raw radiance + stored lobe + direction/count/blend/update diagnostics──> async readback ──> GI radiance popout
-clicked viewport pixel ──> depth-prepass depth + world normal + surface ID ──> shared GPU candidate evaluator ──async weights and RGB contributions──> async readback ──> bounded CPU SDF and unexpanded scene-AABB segment checks ──> side-by-side visibility status and blocker bounds ──> GI Surface Inspector and diagnostic gizmos
+clicked viewport pixel ──> depth-prepass depth + world normal + surface ID ──> shared GPU candidate evaluator + SDF voxel segment checks ──async weights and RGB contributions──> readback ──> renderer CPU exact transformed-triangle segment checks ──> per-probe mesh/SDF visibility comparison, hit triangle and hit geometry ──> GI Surface Inspector and diagnostic gizmos
 panel header input ──click/drag──> shared UI window state ──collapse/position/size──> shared panels and Genos inspector
 depth + normals + surface IDs ──fixed 32px screen lattice──> retained optional screen-space probe cache (updates disabled by default)
-uniform radiance field + relocation validity ──trilinear + soft receiver-plane weighting ──SDF voxel + direct scene-AABB segment filters──> cosine-weighted six-lobe lighting ──> full-resolution raster GI
+uniform radiance field + relocation validity ──trilinear + soft receiver-plane weighting ──SDF voxel + direct scene-AABB segment filters + optional source-triangle BVH segment filter──> cosine-weighted six-lobe lighting ──> full-resolution raster GI
 SDF build/upload timings + radiance-field GPU timing/availability ──> renderer performance stats ──> lighting diagnostics
 ```
 
@@ -36,6 +37,8 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Input](systems/input.md) | [Primitives example](../examples/primitives/src/main.rs) | Key state and mouse delta | Each update |
 | [Input](systems/input.md) | [UI](systems/ui.md) | Cursor position and left-button state | Each frame |
 | [Shared debug panels](../crates/debug_ui/src/lib.rs) | [UI](systems/ui.md) | Reusable display mode, render options, gizmos, performance panel, and GI radiance inspector used by Lighting, Genos, and Primitives | Setup and each update |
+| [Shared debug panels](../crates/debug_ui/src/lib.rs) | [Rendering](systems/rendering.md) | `Triangle probe occlusion` render setting toggled from Render Options | Each UI update |
+| [Rendering](systems/rendering.md) | [Mesh](systems/mesh.md) | Transformed indexed triangles flattened into a world-space BVH and queried by radiance-field probe segments | Renderer initialization or changed scene instances; query during GI sampling when enabled |
 | [Primitives example](../examples/primitives/src/main.rs) | [Shared debug panels](../crates/debug_ui/src/lib.rs) | Render debug panels alongside the local lighting controls | Setup and each update |
 | [Lighting example](../examples/lighting/src/main.rs) | [Shared debug panels](../crates/debug_ui/src/lib.rs) | Render debug panels with the GI radiance inspector launch button | Setup and each update |
 | [Genos stress example](../examples/genos/src/main.rs) | [Shared debug panels](../crates/debug_ui/src/lib.rs) | Render debugging panels alongside the local stress-scene inspector | Setup and each update |

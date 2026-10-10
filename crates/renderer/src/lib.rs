@@ -266,6 +266,7 @@ pub struct RenderSettings {
     pub ambient_intensity: f32,
     pub irradiance_enabled: bool,
     pub surface_probes_enabled: bool,
+    pub triangle_probe_occlusion_enabled: bool,
     pub shadow_cascade_count: u32,
     pub shadow_resolution: u32,
     pub shadow_depth_bias: f32,
@@ -285,6 +286,7 @@ impl Default for RenderSettings {
             ambient_intensity: 0.02,
             irradiance_enabled: true,
             surface_probes_enabled: false,
+            triangle_probe_occlusion_enabled: false,
             shadow_cascade_count: SHADOW_CASCADE_COUNT as u32,
             shadow_resolution: SHADOW_MAP_SIZE,
             shadow_depth_bias: 0.00005,
@@ -427,6 +429,55 @@ struct SdfGeometry {
     bounds: GeometryBounds,
     albedo: Vec3,
     emission: Vec3,
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceInspectionTriangle {
+    vertices: [Vec3; 3],
+    triangle_index: u32,
+}
+
+#[derive(Clone)]
+struct SurfaceInspectionMesh {
+    instance_index: u32,
+    bounds: GeometryBounds,
+    triangles: Vec<SurfaceInspectionTriangle>,
+}
+
+struct SurfaceInspectionTriangleHit {
+    instance_index: u32,
+    triangle_index: u32,
+    distance: f32,
+    position: Vec3,
+    normal: Vec3,
+    barycentric: Vec3,
+    vertices: [Vec3; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TriangleBvhNode {
+    minimum: [f32; 4],
+    maximum: [f32; 4],
+    metadata: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TriangleBvhTriangle {
+    vertices: [[f32; 4]; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TriangleBvhSettings {
+    counts: [u32; 4],
+}
+
+struct TriangleBvhBuildItem {
+    triangle: TriangleBvhTriangle,
+    bounds: GeometryBounds,
+    centroid: Vec3,
 }
 
 struct SdfClipmap {
@@ -613,6 +664,15 @@ pub struct RendererRadianceSurfaceCandidate {
     pub has_occupied_voxel_after_start: bool,
     pub first_occupied_after_start_minimum: [f32; 3],
     pub first_occupied_after_start_maximum: [f32; 3],
+    pub triangle_occlusion_tested: bool,
+    pub triangle_occluded: bool,
+    pub triangle_instance_index: u32,
+    pub triangle_index: u32,
+    pub triangle_hit_distance: f32,
+    pub triangle_hit_position: [f32; 3],
+    pub triangle_hit_normal: [f32; 3],
+    pub triangle_hit_barycentric: [f32; 3],
+    pub triangle_hit_vertices: [[f32; 3]; 3],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -719,6 +779,7 @@ pub struct Renderer {
     irradiance_volume_layout: Vec<RendererIrradianceVolume>,
     sdf_clipmap: SdfClipmap,
     sdf_geometry_cache: Vec<SdfGeometry>,
+    surface_inspection_meshes: Vec<SurfaceInspectionMesh>,
     sdf_uniform_buffer: wgpu::Buffer,
     _sdf_texture: wgpu::Texture,
     _sdf_emission_texture: wgpu::Texture,
@@ -737,6 +798,7 @@ pub struct Renderer {
     radiance_surface_inspection_readback_buffer: wgpu::Buffer,
     radiance_surface_inspection_readback_receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     radiance_surface_inspection_request: Option<[u32; 2]>,
+    radiance_surface_inspection_mesh_snapshot: Option<Vec<SurfaceInspectionMesh>>,
     radiance_surface_inspection: RendererRadianceSurfaceInspection,
     surface_probe_uniform_buffer: wgpu::Buffer,
     _surface_probe_buffer: wgpu::Buffer,
@@ -787,6 +849,10 @@ pub struct Renderer {
     surface_id_view: wgpu::TextureView,
     depth_bind_group_layout: wgpu::BindGroupLayout,
     depth_bind_group: wgpu::BindGroup,
+    triangle_bvh_node_buffer: wgpu::Buffer,
+    triangle_bvh_triangle_buffer: wgpu::Buffer,
+    triangle_bvh_settings_buffer: wgpu::Buffer,
+    triangle_bvh_settings: TriangleBvhSettings,
     _depth_sampler: wgpu::Sampler,
     has_presented: bool,
     camera: Camera,
@@ -1059,6 +1125,16 @@ impl Renderer {
         let visibility_bounds = geometry_bounds(instances);
         let visibility_grid = VisibilityGrid::from_bounds(&visibility_bounds);
         let sdf_geometries = sdf_geometries(instances);
+        let surface_inspection_meshes = surface_inspection_meshes(instances);
+        let (triangle_bvh_nodes, triangle_bvh_triangles) = build_triangle_bvh(&surface_inspection_meshes);
+        let triangle_bvh_settings = TriangleBvhSettings { counts: [triangle_bvh_nodes.len() as u32, triangle_bvh_triangles.len() as u32, 0, 0] };
+        let triangle_bvh_node_buffer = storage_buffer_or_dummy(&device, "triangle visibility BVH nodes", &triangle_bvh_nodes);
+        let triangle_bvh_triangle_buffer = storage_buffer_or_dummy(&device, "triangle visibility BVH triangles", &triangle_bvh_triangles);
+        let triangle_bvh_settings_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("triangle visibility BVH settings"),
+            contents: bytemuck::bytes_of(&triangle_bvh_settings),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
         let sdf_clipmap = SdfClipmap::new(scene_bounds, &sdf_geometries);
         let sdf_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1205,6 +1281,24 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let depth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1215,6 +1309,9 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&depth_sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&surface_normal_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_id_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: triangle_bvh_node_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: triangle_bvh_triangle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: triangle_bvh_settings_buffer.as_entire_binding() },
             ],
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1700,6 +1797,7 @@ impl Renderer {
             irradiance_volume_layout: irradiance_volumes.to_vec(),
             sdf_clipmap,
             sdf_geometry_cache: sdf_geometries,
+            surface_inspection_meshes,
             sdf_uniform_buffer,
             _sdf_texture: sdf_texture,
             _sdf_emission_texture: sdf_emission_texture,
@@ -1718,6 +1816,7 @@ impl Renderer {
             radiance_surface_inspection_readback_buffer,
             radiance_surface_inspection_readback_receiver: None,
             radiance_surface_inspection_request: None,
+            radiance_surface_inspection_mesh_snapshot: None,
             radiance_surface_inspection: RendererRadianceSurfaceInspection::default(),
             surface_probe_uniform_buffer,
             _surface_probe_buffer: surface_probe_buffer,
@@ -1772,6 +1871,10 @@ impl Renderer {
             surface_id_view,
             depth_bind_group_layout,
             depth_bind_group,
+            triangle_bvh_node_buffer,
+            triangle_bvh_triangle_buffer,
+            triangle_bvh_settings_buffer,
+            triangle_bvh_settings,
             _depth_sampler: depth_sampler,
             has_presented: false,
             camera: *camera,
@@ -1861,6 +1964,25 @@ impl Renderer {
         }
         let sdf_geometry_cache = sdf_geometries(instances);
         self.sdf_geometry_cache = sdf_geometry_cache;
+        self.surface_inspection_meshes = surface_inspection_meshes(instances);
+        let (nodes, triangles) = build_triangle_bvh(&self.surface_inspection_meshes);
+        self.triangle_bvh_node_buffer = storage_buffer_or_dummy(&self.device, "triangle visibility BVH nodes", &nodes);
+        self.triangle_bvh_triangle_buffer = storage_buffer_or_dummy(&self.device, "triangle visibility BVH triangles", &triangles);
+        self.triangle_bvh_settings = TriangleBvhSettings { counts: [nodes.len() as u32, triangles.len() as u32, 0, 0] };
+        self.queue.write_buffer(&self.triangle_bvh_settings_buffer, 0, bytemuck::bytes_of(&self.triangle_bvh_settings));
+        self.depth_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene depth bind group"),
+            layout: &self.depth_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.depth_sample_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._depth_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.surface_normal_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.surface_id_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.triangle_bvh_settings_buffer.as_entire_binding() },
+            ],
+        });
         self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
         Ok(())
     }
@@ -1893,6 +2015,9 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._depth_sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.surface_normal_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.surface_id_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.triangle_bvh_settings_buffer.as_entire_binding() },
             ],
         });
         let surface_probe_uniform = SurfaceProbeUniform {
@@ -2428,12 +2553,14 @@ impl Renderer {
             Err(mpsc::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.radiance_surface_inspection_readback_receiver = None;
+                self.radiance_surface_inspection_mesh_snapshot = None;
                 self.radiance_surface_inspection = RendererRadianceSurfaceInspection::default();
                 return Ok(());
             }
         };
         self.radiance_surface_inspection_readback_receiver = None;
         if result.is_err() {
+            self.radiance_surface_inspection_mesh_snapshot = None;
             self.radiance_surface_inspection = RendererRadianceSurfaceInspection::default();
             return Ok(());
         }
@@ -2480,9 +2607,11 @@ impl Renderer {
                 ..RendererRadianceSurfaceCandidate::default()
             };
         }
-        self.radiance_surface_inspection = inspection;
         drop(mapped);
         self.radiance_surface_inspection_readback_buffer.unmap();
+        let mesh_snapshot = self.radiance_surface_inspection_mesh_snapshot.take().unwrap_or_default();
+        populate_surface_triangle_visibility(&mut inspection, &mesh_snapshot);
+        self.radiance_surface_inspection = inspection;
         Ok(())
     }
 
@@ -2521,6 +2650,9 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._depth_sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&surface_normal_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_id_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.triangle_bvh_settings_buffer.as_entire_binding() },
             ],
         });
         let capture_uniform = camera_uniform(width, height, camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
@@ -2708,6 +2840,7 @@ impl Renderer {
         let surface_inspection_copied =
             self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.radiance_surface_inspection_request.is_some() && self.radiance_surface_inspection_readback_receiver.is_none();
         if surface_inspection_copied {
+            self.radiance_surface_inspection_mesh_snapshot = Some(self.surface_inspection_meshes.clone());
             let pixel = self.radiance_surface_inspection_request.unwrap_or_default();
             self.queue.write_buffer(&self.radiance_surface_inspection_settings_buffer, 0, bytemuck::bytes_of(&RadianceSurfaceInspectionSettings { pixel: [pixel[0], pixel[1], 0, 0] }));
         }
@@ -3222,7 +3355,7 @@ fn camera_uniform(width: u32, height: u32, camera: &Camera, lights: &[Light], mo
             u32::from(settings.direct_light_visibility_enabled),
         ],
         ambient_light: [settings.ambient_intensity.max(0.0), 0.0, 0.0, 0.0],
-        gi_settings: [u32::from(settings.surface_probes_enabled), 0, 0, 0],
+        gi_settings: [u32::from(settings.surface_probes_enabled), u32::from(settings.triangle_probe_occlusion_enabled), 0, 0],
     }
 }
 
@@ -4661,6 +4794,203 @@ fn sdf_geometries(instances: &[MeshInstance]) -> Vec<SdfGeometry> {
             Some(SdfGeometry { bounds: GeometryBounds { minimum, maximum }, albedo: vertex_color * material_color, emission: emission_color })
         })
         .collect()
+}
+
+fn surface_inspection_meshes(instances: &[MeshInstance]) -> Vec<SurfaceInspectionMesh> {
+    instances
+        .iter()
+        .enumerate()
+        .filter_map(|(instance_index, instance)| {
+            let mut minimum = Vec3::splat(f32::INFINITY);
+            let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+            for vertex in instance.mesh.vertices() {
+                let position = instance.transform.transform_point(Vec3::from_array(vertex.position));
+                minimum = minimum.min(position);
+                maximum = maximum.max(position);
+            }
+            if !minimum.is_finite() || !maximum.is_finite() {
+                return None;
+            }
+            let triangles = instance
+                .mesh
+                .indices()
+                .chunks_exact(3)
+                .enumerate()
+                .map(|(triangle_index, indices)| SurfaceInspectionTriangle {
+                    vertices: [indices[0], indices[1], indices[2]].map(|index| instance.transform.transform_point(Vec3::from_array(instance.mesh.vertices()[index as usize].position))),
+                    triangle_index: triangle_index as u32,
+                })
+                .collect();
+            Some(SurfaceInspectionMesh { instance_index: instance_index as u32, bounds: GeometryBounds { minimum, maximum }, triangles })
+        })
+        .collect()
+}
+
+fn storage_buffer_or_dummy<T: Pod + Zeroable>(device: &wgpu::Device, label: &str, values: &[T]) -> wgpu::Buffer {
+    let dummy = T::zeroed();
+    let contents = if values.is_empty() { bytemuck::bytes_of(&dummy) } else { bytemuck::cast_slice(values) };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST })
+}
+
+fn build_triangle_bvh(meshes: &[SurfaceInspectionMesh]) -> (Vec<TriangleBvhNode>, Vec<TriangleBvhTriangle>) {
+    let items = meshes
+        .iter()
+        .flat_map(|mesh| mesh.triangles.iter())
+        .map(|triangle| {
+            let minimum = triangle.vertices.iter().copied().fold(Vec3::splat(f32::INFINITY), Vec3::min);
+            let maximum = triangle.vertices.iter().copied().fold(Vec3::splat(f32::NEG_INFINITY), Vec3::max);
+            TriangleBvhBuildItem {
+                triangle: TriangleBvhTriangle { vertices: triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]) },
+                bounds: GeometryBounds { minimum, maximum },
+                centroid: (minimum + maximum) * 0.5,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    let mut triangles = Vec::new();
+    if !items.is_empty() {
+        build_triangle_bvh_node(items, &mut nodes, &mut triangles);
+    }
+    (nodes, triangles)
+}
+
+fn build_triangle_bvh_node(mut items: Vec<TriangleBvhBuildItem>, nodes: &mut Vec<TriangleBvhNode>, triangles: &mut Vec<TriangleBvhTriangle>) -> u32 {
+    let node_index = nodes.len() as u32;
+    let minimum = items.iter().fold(Vec3::splat(f32::INFINITY), |minimum, item| minimum.min(item.bounds.minimum));
+    let maximum = items.iter().fold(Vec3::splat(f32::NEG_INFINITY), |maximum, item| maximum.max(item.bounds.maximum));
+    nodes.push(TriangleBvhNode::zeroed());
+    let mut metadata = [0; 4];
+    if items.len() <= 4 {
+        metadata[1] = triangles.len() as u32;
+        metadata[2] = items.len() as u32;
+        triangles.extend(items.into_iter().map(|item| item.triangle));
+    } else {
+        let centroid_minimum = items.iter().fold(Vec3::splat(f32::INFINITY), |minimum, item| minimum.min(item.centroid));
+        let centroid_maximum = items.iter().fold(Vec3::splat(f32::NEG_INFINITY), |maximum, item| maximum.max(item.centroid));
+        let centroid_extent = centroid_maximum - centroid_minimum;
+        let axis = if centroid_extent.x >= centroid_extent.y && centroid_extent.x >= centroid_extent.z {
+            0
+        } else if centroid_extent.y >= centroid_extent.z {
+            1
+        } else {
+            2
+        };
+        items.sort_by(|left, right| left.centroid[axis].total_cmp(&right.centroid[axis]));
+        let right_items = items.split_off(items.len() / 2);
+        build_triangle_bvh_node(items, nodes, triangles);
+        metadata[0] = build_triangle_bvh_node(right_items, nodes, triangles);
+    }
+    metadata[3] = nodes.len() as u32;
+    nodes[node_index as usize] = TriangleBvhNode { minimum: [minimum.x, minimum.y, minimum.z, 0.0], maximum: [maximum.x, maximum.y, maximum.z, 0.0], metadata };
+    node_index
+}
+
+fn populate_surface_triangle_visibility(inspection: &mut RendererRadianceSurfaceInspection, meshes: &[SurfaceInspectionMesh]) {
+    if !inspection.valid || !inspection.inside_field {
+        return;
+    }
+    let start = Vec3::from_array(inspection.world_position) + Vec3::from_array(inspection.sdf_origin_offset);
+    for candidate in &mut inspection.candidates {
+        if !candidate.probe_valid {
+            continue;
+        }
+        candidate.triangle_occlusion_tested = true;
+        if let Some(hit) = closest_surface_triangle_hit(start, Vec3::from_array(candidate.probe_position), meshes) {
+            candidate.triangle_occluded = true;
+            candidate.triangle_instance_index = hit.instance_index;
+            candidate.triangle_index = hit.triangle_index;
+            candidate.triangle_hit_distance = hit.distance;
+            candidate.triangle_hit_position = hit.position.to_array();
+            candidate.triangle_hit_normal = hit.normal.to_array();
+            candidate.triangle_hit_barycentric = hit.barycentric.to_array();
+            candidate.triangle_hit_vertices = hit.vertices.map(|vertex| vertex.to_array());
+        }
+    }
+}
+
+fn closest_surface_triangle_hit(start: Vec3, end: Vec3, meshes: &[SurfaceInspectionMesh]) -> Option<SurfaceInspectionTriangleHit> {
+    let segment = end - start;
+    let segment_length = segment.length();
+    if segment_length <= 0.001 {
+        return None;
+    }
+    let direction = segment / segment_length;
+    let endpoint_epsilon = 0.001_f32.max(segment_length * 0.00001);
+    let mut closest_hit = None;
+    for mesh in meshes {
+        if !segment_intersects_bounds(start, direction, segment_length, mesh.bounds) {
+            continue;
+        }
+        for triangle in &mesh.triangles {
+            let Some((distance, barycentric)) = segment_triangle_intersection(start, direction, segment_length, endpoint_epsilon, triangle.vertices) else {
+                continue;
+            };
+            if closest_hit.as_ref().is_some_and(|hit: &SurfaceInspectionTriangleHit| hit.distance <= distance) {
+                continue;
+            }
+            let [first, second, third] = triangle.vertices;
+            closest_hit = Some(SurfaceInspectionTriangleHit {
+                instance_index: mesh.instance_index,
+                triangle_index: triangle.triangle_index,
+                distance,
+                position: start + direction * distance,
+                normal: (second - first).cross(third - first).normalize_or_zero(),
+                barycentric,
+                vertices: triangle.vertices,
+            });
+        }
+    }
+    closest_hit
+}
+
+fn segment_intersects_bounds(start: Vec3, direction: Vec3, segment_length: f32, bounds: GeometryBounds) -> bool {
+    let mut minimum_distance: f32 = 0.0;
+    let mut maximum_distance = segment_length;
+    for axis in 0..3 {
+        let origin = start[axis];
+        let direction = direction[axis];
+        if direction.abs() <= 0.000001 {
+            if origin < bounds.minimum[axis] || origin > bounds.maximum[axis] {
+                return false;
+            }
+            continue;
+        }
+        let first_distance = (bounds.minimum[axis] - origin) / direction;
+        let second_distance = (bounds.maximum[axis] - origin) / direction;
+        minimum_distance = minimum_distance.max(first_distance.min(second_distance));
+        maximum_distance = maximum_distance.min(first_distance.max(second_distance));
+        if maximum_distance < minimum_distance {
+            return false;
+        }
+    }
+    true
+}
+
+fn segment_triangle_intersection(start: Vec3, direction: Vec3, segment_length: f32, endpoint_epsilon: f32, vertices: [Vec3; 3]) -> Option<(f32, Vec3)> {
+    let [first, second, third] = vertices;
+    let edge_one = second - first;
+    let edge_two = third - first;
+    let perpendicular = direction.cross(edge_two);
+    let determinant = edge_one.dot(perpendicular);
+    if determinant.abs() <= 0.0000001 {
+        return None;
+    }
+    let inverse_determinant = determinant.recip();
+    let offset = start - first;
+    let barycentric_u = offset.dot(perpendicular) * inverse_determinant;
+    if !(0.0..=1.0).contains(&barycentric_u) {
+        return None;
+    }
+    let cross = offset.cross(edge_one);
+    let barycentric_v = direction.dot(cross) * inverse_determinant;
+    if barycentric_v < 0.0 || barycentric_u + barycentric_v > 1.0 {
+        return None;
+    }
+    let distance = edge_two.dot(cross) * inverse_determinant;
+    if distance <= 0.001 || distance >= segment_length - endpoint_epsilon {
+        return None;
+    }
+    Some((distance, Vec3::new(1.0 - barycentric_u - barycentric_v, barycentric_u, barycentric_v)))
 }
 
 fn shadow_draw_data(instances: &[MeshInstance]) -> (Vec<Range<u32>>, Vec<GeometryBounds>) {

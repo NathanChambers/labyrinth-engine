@@ -143,6 +143,7 @@ fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection:
         return;
     }
     let cell_size = (Vec3::from_array(grid.maximum) - Vec3::from_array(grid.minimum)) / resolution;
+    let ray_start = visibility_origin;
     for candidate in inspection.candidates {
         let grid_position = Vec3::new(candidate.grid_position[0] as f32, candidate.grid_position[1] as f32, candidate.grid_position[2] as f32);
         let logical_position = Vec3::from_array(grid.minimum) + (grid_position + Vec3::splat(0.5)) * cell_size;
@@ -152,11 +153,30 @@ fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection:
         } else {
             Color::rgb(1.0, 0.25, 0.18)
         };
-        gizmos.line(surface, probe, if candidate.probe_valid { Color::rgb(0.58, 0.65, 0.72) } else { color });
+        let ray_color = if !candidate.triangle_occlusion_tested {
+            Color::rgb(0.42, 0.46, 0.52)
+        } else if candidate.triangle_occluded {
+            Color::rgb(1.0, 0.12, 0.08)
+        } else {
+            Color::rgb(0.18, 1.0, 0.35)
+        };
+        if candidate.triangle_occluded {
+            let hit_position = Vec3::from_array(candidate.triangle_hit_position);
+            let triangle = candidate.triangle_hit_vertices.map(Vec3::from_array);
+            gizmos.line(ray_start, hit_position, ray_color);
+            gizmos.line(hit_position, probe, Color::rgba(0.85, 0.18, 0.16, 0.42));
+            gizmos.dot(hit_position, 0.1, Color::rgb(1.0, 0.82, 0.16));
+            gizmos.line(triangle[0], triangle[1], Color::rgb(1.0, 0.5, 0.12));
+            gizmos.line(triangle[1], triangle[2], Color::rgb(1.0, 0.5, 0.12));
+            gizmos.line(triangle[2], triangle[0], Color::rgb(1.0, 0.5, 0.12));
+            gizmos.line(hit_position, hit_position + Vec3::from_array(candidate.triangle_hit_normal) * 0.3, Color::rgb(0.1, 0.9, 1.0));
+        } else {
+            gizmos.line(ray_start, probe, ray_color);
+        }
+        if candidate.has_occupied_voxel_after_start && (candidate.final_weight > 0.001 || candidate.triangle_occluded) {
+            gizmos.wire_box(Vec3::from_array(candidate.first_occupied_after_start_minimum), Vec3::from_array(candidate.first_occupied_after_start_maximum), Color::rgba(1.0, 0.52, 0.08, 0.62));
+        }
         gizmos.dot(probe, 0.06 + candidate.final_weight.sqrt() * 0.24, color);
-    }
-    if let Some(candidate) = inspection.candidates.iter().filter(|candidate| candidate.has_occupied_voxel_after_start).max_by(|first, second| first.final_weight.total_cmp(&second.final_weight)) {
-        gizmos.wire_box(Vec3::from_array(candidate.first_occupied_after_start_minimum), Vec3::from_array(candidate.first_occupied_after_start_maximum), Color::rgba(1.0, 0.52, 0.08, 0.38));
     }
 }
 

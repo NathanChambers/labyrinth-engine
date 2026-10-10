@@ -65,6 +65,20 @@ struct RadianceFieldSample {
     valid_interpolation_weight: f32,
 };
 
+struct TriangleBvhNode {
+    minimum: vec4<f32>,
+    maximum: vec4<f32>,
+    metadata: vec4<u32>,
+};
+
+struct TriangleBvhTriangle {
+    vertices: array<vec4<f32>, 3>,
+};
+
+struct TriangleBvhSettings {
+    counts: vec4<u32>,
+};
+
 struct RadianceFieldCandidate {
     directional_radiance: vec3<f32>,
     directional_support: f32,
@@ -258,6 +272,15 @@ var surface_normal_texture: texture_2d<f32>;
 
 @group(1) @binding(3)
 var surface_id_texture: texture_2d<u32>;
+
+@group(1) @binding(4)
+var<storage, read> triangle_bvh_nodes: array<TriangleBvhNode>;
+
+@group(1) @binding(5)
+var<storage, read> triangle_bvh_triangles: array<TriangleBvhTriangle>;
+
+@group(1) @binding(6)
+var<uniform> triangle_bvh_settings: TriangleBvhSettings;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -1302,6 +1325,71 @@ fn inspect_sdf_segment(start_position: vec3<f32>, end_position: vec3<f32>, start
     return SdfSegmentInspection(first_blocking_voxel, first_occupied_after_start, first_occupied_after_start_minimum, first_occupied_after_start_maximum);
 }
 
+fn triangle_bvh_segment_intersects_bounds(start: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, node: TriangleBvhNode) -> bool {
+    let inverse_direction = select(vec3<f32>(1.0e30), 1.0 / direction, abs(direction) > vec3<f32>(0.000001));
+    let first = (node.minimum.xyz - start) * inverse_direction;
+    let second = (node.maximum.xyz - start) * inverse_direction;
+    let entry = max(max(min(first.x, second.x), min(first.y, second.y)), max(min(first.z, second.z), 0.001));
+    let exit = min(min(max(first.x, second.x), max(first.y, second.y)), min(max(first.z, second.z), maximum_distance));
+    return exit >= entry;
+}
+
+fn triangle_bvh_segment_hits_triangle(start: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, triangle: TriangleBvhTriangle) -> bool {
+    let edge_a = triangle.vertices[1].xyz - triangle.vertices[0].xyz;
+    let edge_b = triangle.vertices[2].xyz - triangle.vertices[0].xyz;
+    let cross_direction = cross(direction, edge_b);
+    let determinant = dot(edge_a, cross_direction);
+    if abs(determinant) <= 0.000001 {
+        return false;
+    }
+    let inverse_determinant = 1.0 / determinant;
+    let offset = start - triangle.vertices[0].xyz;
+    let barycentric_u = dot(offset, cross_direction) * inverse_determinant;
+    if barycentric_u < 0.0 || barycentric_u > 1.0 {
+        return false;
+    }
+    let cross_offset = cross(offset, edge_a);
+    let barycentric_v = dot(direction, cross_offset) * inverse_determinant;
+    if barycentric_v < 0.0 || barycentric_u + barycentric_v > 1.0 {
+        return false;
+    }
+    let hit_distance = dot(edge_b, cross_offset) * inverse_determinant;
+    return hit_distance >= 0.001 && hit_distance <= maximum_distance;
+}
+
+fn triangle_bvh_segment_occluded(start: vec3<f32>, end: vec3<f32>) -> bool {
+    let segment = end - start;
+    let segment_length = length(segment);
+    if segment_length <= 0.002 || triangle_bvh_settings.counts.x == 0u {
+        return false;
+    }
+    let direction = segment / segment_length;
+    let maximum_distance = segment_length - max(0.001, segment_length * 0.00001);
+    var node_index = 0u;
+    for (var visit = 0u; visit < triangle_bvh_settings.counts.x; visit++) {
+        if node_index >= triangle_bvh_settings.counts.x {
+            break;
+        }
+        let node = triangle_bvh_nodes[node_index];
+        if !triangle_bvh_segment_intersects_bounds(start, direction, maximum_distance, node) {
+            node_index = node.metadata.w;
+            continue;
+        }
+        let triangle_count = node.metadata.z;
+        if triangle_count > 0u {
+            let triangle_start = node.metadata.y;
+            for (var triangle_offset = 0u; triangle_offset < triangle_count; triangle_offset++) {
+                let triangle_index = triangle_start + triangle_offset;
+                if triangle_index < triangle_bvh_settings.counts.y && triangle_bvh_segment_hits_triangle(start, direction, maximum_distance, triangle_bvh_triangles[triangle_index]) {
+                    return true;
+                }
+            }
+        }
+        node_index += 1u;
+    }
+    return false;
+}
+
 fn sample_radiance_field(position: vec3<f32>, normal: vec3<f32>, field: RadianceFieldData) -> RadianceFieldSample {
     if any(position < field.minimum.xyz) || any(position >= field.maximum.xyz) {
         return RadianceFieldSample(vec3<f32>(0.0), 0.0, 0.0, 0.0, 0.0);
@@ -1321,6 +1409,9 @@ fn sample_radiance_field(position: vec3<f32>, normal: vec3<f32>, field: Radiance
         let candidate = evaluate_radiance_field_candidate(vec3<u32>(interpolation.xyz), surface_normal, field);
         let side_weight = radiance_field_probe_side_weight(position, surface_normal, candidate.probe_position);
         if candidate.validity <= 0.0 || candidate.directional_support <= 0.0001 || side_weight <= 0.001 {
+            continue;
+        }
+        if camera.gi_settings.y != 0u && triangle_bvh_segment_occluded(position, candidate.probe_position) {
             continue;
         }
         valid_cell_count += 1.0;
