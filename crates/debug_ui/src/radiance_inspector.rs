@@ -1,13 +1,12 @@
 use labyrinth::{
-    Color, KeyCode, RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererRadianceFieldGrid, RuntimeContext, UiAnchor, UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout,
-    UiPanelWindowId, Vec2, Vec3,
+    Color, KeyCode, RadianceAngularResolution, RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererRadianceFieldGrid, RuntimeContext, UiAnchor, UiAutoLayout, UiButtonId, UiContainerId,
+    UiLabelId, UiLayout, UiPanelWindowId, Vec2, Vec3,
 };
 
 const INSPECTOR_WIDTH: f32 = 440.0;
 const INSPECTOR_TOP: f32 = 220.0;
 const RAY_COUNT: usize = labyrinth::RADIANCE_FIELD_RAY_COUNT;
-const CHANNEL_COUNT: usize = labyrinth::RADIANCE_FIELD_CHANNEL_COUNT;
-const RAYS_PER_CHANNEL: usize = labyrinth::RADIANCE_FIELD_RAYS_PER_CHANNEL;
+const ANGULAR_SAMPLE_PAGE_SIZE: usize = 8;
 const MOVE_REPEAT_SECONDS: f32 = 0.12;
 
 #[derive(Clone, Copy, Default)]
@@ -36,12 +35,16 @@ pub struct RadianceInspector {
     ray_buttons: [UiButtonId; RAY_COUNT],
     geometry_button: UiButtonId,
     radiance_button: UiButtonId,
-    overview_button: UiButtonId,
     show_other_gizmos_button: UiButtonId,
-    cell_swatches: [UiButtonId; CHANNEL_COUNT],
-    cell_rgb_labels: [UiLabelId; CHANNEL_COUNT],
-    cell_sample_labels: [UiLabelId; CHANNEL_COUNT],
-    cell_refresh_label: UiLabelId,
+    angular_resolution_buttons: [UiButtonId; 3],
+    angular_coverage_label: UiLabelId,
+    angular_legend_label: UiLabelId,
+    angular_sample_previous_button: UiButtonId,
+    angular_sample_next_button: UiButtonId,
+    angular_sample_page_label: UiLabelId,
+    angular_sample_swatches: [UiButtonId; ANGULAR_SAMPLE_PAGE_SIZE],
+    angular_sample_labels: [UiLabelId; ANGULAR_SAMPLE_PAGE_SIZE],
+    angular_sample_page: usize,
     ray_weights_label: UiLabelId,
     direct_swatch: UiButtonId,
     emission_swatch: UiButtonId,
@@ -106,39 +109,46 @@ impl RadianceInspector {
         let grid_metrics_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Field size: -- · Cell size: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let cell_world_position_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Cell center: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
 
-        let cell_drawer = add_drawer(context, content, "RADIANCE CELL", true, 155.0);
+        let cell_drawer = add_drawer(context, content, "RADIANCE CELL", true, 250.0);
         let cell_content = cell_drawer.content.expect("radiance cell content exists");
-        let mut cell_swatches = [None; CHANNEL_COUNT];
-        let mut cell_rgb_labels = [None; CHANNEL_COUNT];
-        let mut cell_sample_labels = [None; CHANNEL_COUNT];
-        for channel_index in 0..CHANNEL_COUNT {
-            let row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 20.0)), UiAutoLayout::row(0.0, 5.0));
-            context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(28.0, 18.0)), format!("L{channel_index}"), 10.0, Color::rgb(0.72, 0.76, 0.82));
-            cell_swatches[channel_index] = Some(add_color_swatch(context, row, [0.0; 3], 16.0));
-            cell_rgb_labels[channel_index] = Some(context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(118.0, 18.0)), "RGB --", 10.0, Color::WHITE));
-            cell_sample_labels[channel_index] = Some(context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(145.0, 18.0)), "0 samples", 10.0, Color::rgb(0.72, 0.76, 0.82)));
+        let angular_resolution_row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 5.0));
+        context.ui.add_label_layout(Some(angular_resolution_row), UiLayout::new(Vec2::new(66.0, 18.0)), "Sphere bins", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_resolution_buttons = [
+            add_mode_button(context, angular_resolution_row, "8", context.gi_angular_resolution == RadianceAngularResolution::Low),
+            add_mode_button(context, angular_resolution_row, "32", context.gi_angular_resolution == RadianceAngularResolution::Balanced),
+            add_mode_button(context, angular_resolution_row, "64", context.gi_angular_resolution == RadianceAngularResolution::High),
+        ];
+        let angular_coverage_label = context.ui.add_label_layout(Some(cell_content), UiLayout::new(Vec2::new(0.0, 16.0)), "Angular coverage: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_legend_label =
+            context.ui.add_label_layout(Some(cell_content), UiLayout::new(Vec2::new(0.0, 16.0)), "White = recent sample · fades to black when stale or missed", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_sample_page_row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 20.0)), UiAutoLayout::row(0.0, 5.0));
+        let angular_sample_previous_button = context.ui.add_toggle_button_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(24.0, 20.0)), false);
+        context.ui.set_button_text(angular_sample_previous_button, "<", 11.0, Color::WHITE);
+        let angular_sample_page_label = context.ui.add_label_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(155.0, 18.0)), "Regions 1-8 / 32", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_sample_next_button = context.ui.add_toggle_button_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(24.0, 20.0)), false);
+        context.ui.set_button_text(angular_sample_next_button, ">", 11.0, Color::WHITE);
+        let mut angular_sample_swatches = [None; ANGULAR_SAMPLE_PAGE_SIZE];
+        let mut angular_sample_labels = [None; ANGULAR_SAMPLE_PAGE_SIZE];
+        for sample_index in 0..ANGULAR_SAMPLE_PAGE_SIZE {
+            let row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 18.0)), UiAutoLayout::row(0.0, 5.0));
+            angular_sample_swatches[sample_index] = Some(add_color_swatch(context, row, [0.0; 3], 14.0));
+            angular_sample_labels[sample_index] = Some(context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 16.0)), "Region -- · RGB -- · --/--", 9.0, Color::WHITE));
         }
-        let cell_refresh_label = context.ui.add_label_layout(Some(cell_content), UiLayout::new(Vec2::new(0.0, 16.0)), "Last refresh: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
 
         let rays_drawer = add_drawer(context, content, "RAY INSPECTOR", false, 475.0);
         let ray_content = rays_drawer.content.expect("ray inspector content exists");
+        let ray_row = context.ui.add_container(Some(ray_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 5.0));
+        context.ui.add_label_layout(Some(ray_row), UiLayout::new(Vec2::new(125.0, 18.0)), "Latest rays (both shown)", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let mut ray_buttons = [None; RAY_COUNT];
-        let channel_names = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"];
-        for (channel_index, channel_name) in channel_names.into_iter().enumerate() {
-            let row = context.ui.add_container(Some(ray_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 3.0));
-            context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(30.0, 18.0)), channel_name, 10.0, Color::rgb(0.72, 0.76, 0.82));
-            for sample_index in 0..RAYS_PER_CHANNEL {
-                let ray_index = channel_index * RAYS_PER_CHANNEL + sample_index;
-                let button = context.ui.add_toggle_button_layout(Some(row), UiLayout::new(Vec2::new(44.0, 22.0)), ray_index as u32 == context.gi_trace_selected_ray);
-                context.ui.set_button_text(button, format!("R{ray_index}"), 10.0, Color::WHITE);
-                context.ui.set_button_toggled_colors(button, Color::rgb(0.2, 0.48, 0.62), Color::rgb(0.15, 0.2, 0.28));
-                ray_buttons[ray_index] = Some(button);
-            }
+        for (ray_index, ray_button) in ray_buttons.iter_mut().enumerate() {
+            let button = context.ui.add_toggle_button_layout(Some(ray_row), UiLayout::new(Vec2::new(44.0, 22.0)), ray_index as u32 == context.gi_trace_selected_ray);
+            context.ui.set_button_text(button, format!("R{ray_index}"), 10.0, Color::WHITE);
+            context.ui.set_button_toggled_colors(button, Color::rgb(0.2, 0.48, 0.62), Color::rgb(0.15, 0.2, 0.28));
+            *ray_button = Some(button);
         }
         let mode_row = context.ui.add_container(Some(ray_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 6.0));
         let geometry_button = add_mode_button(context, mode_row, "Geometry", context.gi_trace_debug_mode == RendererGiTraceDebugMode::Geometry);
         let radiance_button = add_mode_button(context, mode_row, "Radiance", context.gi_trace_debug_mode == RendererGiTraceDebugMode::Radiance);
-        let overview_button = add_checkbox(context, ray_content, "All-ray overview", context.gi_trace_overview_enabled);
         let show_other_gizmos_button = add_checkbox(context, ray_content, "Show other gizmos", false);
         let status_trace_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Waiting for trace data", 11.0, Color::WHITE);
         let sampling_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Direction: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
@@ -175,12 +185,16 @@ impl RadianceInspector {
             ray_buttons: ray_buttons.map(Option::unwrap),
             geometry_button,
             radiance_button,
-            overview_button,
             show_other_gizmos_button,
-            cell_swatches: cell_swatches.map(Option::unwrap),
-            cell_rgb_labels: cell_rgb_labels.map(Option::unwrap),
-            cell_sample_labels: cell_sample_labels.map(Option::unwrap),
-            cell_refresh_label,
+            angular_resolution_buttons,
+            angular_coverage_label,
+            angular_legend_label,
+            angular_sample_previous_button,
+            angular_sample_next_button,
+            angular_sample_page_label,
+            angular_sample_swatches: angular_sample_swatches.map(Option::unwrap),
+            angular_sample_labels: angular_sample_labels.map(Option::unwrap),
+            angular_sample_page: 0,
             ray_weights_label,
             direct_swatch,
             emission_swatch,
@@ -215,6 +229,7 @@ impl RadianceInspector {
         update_drawer(context, self.cell_drawer, "RADIANCE CELL");
         update_drawer(context, self.rays_drawer, "RAY INSPECTOR");
 
+        self.update_angular_resolution(context);
         self.update_cell_selection(context);
         let was_pick_armed = self.pick_armed;
         let was_move_enabled = self.movement_keys_active;
@@ -253,9 +268,6 @@ impl RadianceInspector {
             context.ui.set_button_toggled(self.gpu_timing_button, false);
         }
         context.ui.set_label_text(self.gpu_timing_label, format!("Scene pass GPU: {:.2} ms", context.performance_stats.gpu_scene_ms));
-        context.gi_trace_overview_enabled = context.ui.button_toggled(self.overview_button).unwrap_or(false);
-        set_checkbox_mark(context, self.overview_button);
-
         self.update_ray_selection(context);
         self.update_trace_display(context);
         self.movement_keys_active = move_enabled && inspector_open;
@@ -383,6 +395,17 @@ impl RadianceInspector {
         context.ui.set_button_toggled(self.radiance_button, context.gi_trace_debug_mode == RendererGiTraceDebugMode::Radiance);
     }
 
+    fn update_angular_resolution(&mut self, context: &mut RuntimeContext) {
+        let choices = [RadianceAngularResolution::Low, RadianceAngularResolution::Balanced, RadianceAngularResolution::High];
+        let selected_index = choices.iter().position(|choice| *choice == context.gi_angular_resolution).unwrap_or(1);
+        if let Some((index, _)) = self.angular_resolution_buttons.iter().enumerate().find(|(index, button)| *index != selected_index && context.ui.button_toggled(**button).unwrap_or(false)) {
+            context.gi_angular_resolution = choices[index];
+        }
+        for (index, button) in self.angular_resolution_buttons.iter().enumerate() {
+            context.ui.set_button_toggled(*button, choices[index] == context.gi_angular_resolution);
+        }
+    }
+
     fn update_trace_display(&mut self, context: &mut RuntimeContext) {
         let cell = context.gi_selected_radiance_cell;
         let selected_trace = context.gi_trace_diagnostics[context.gi_trace_selected_ray as usize];
@@ -390,28 +413,17 @@ impl RadianceInspector {
         let trace_is_current = selected_trace.valid && trace_matches_cell;
         let relocation_is_current = selected_trace.relocation_data_valid && trace_matches_cell;
         let displayed_trace = if trace_is_current { selected_trace } else { RendererGiRayDiagnostic::default() };
-        let cell_is_current = context.gi_trace_diagnostics.iter().any(|diagnostic| diagnostic.valid && diagnostic.selected_cell == cell);
-        for channel_index in 0..CHANNEL_COUNT {
-            let diagnostic = context.gi_trace_diagnostics[channel_index * RAYS_PER_CHANNEL];
-            let channel_is_current = diagnostic.valid && diagnostic.selected_cell == cell;
-            let channel_value = if channel_is_current { diagnostic.stored_radiance } else { [0.0; 3] };
-            update_swatch(context, self.cell_swatches[channel_index], channel_value);
-            context.ui.set_label_text(self.cell_rgb_labels[channel_index], if channel_is_current { format!("RGB {}", format_rgb(channel_value)) } else { "RGB --".to_owned() });
-            let samples = if channel_is_current {
-                format!("{} valid / {} tried · blend {:.2}", diagnostic.accumulated_sample_count, diagnostic.attempted_sample_count, diagnostic.blend_factor)
-            } else {
-                "-- valid / -- tried".to_owned()
-            };
-            context.ui.set_label_text(self.cell_sample_labels[channel_index], samples);
-        }
-        let refresh_text = if cell_is_current {
-            let age =
-                context.gi_trace_diagnostics.iter().filter(|diagnostic| diagnostic.valid && diagnostic.selected_cell == cell).map(|diagnostic| diagnostic.last_update_age_frames).min().unwrap_or(0);
-            format!("Last refresh: {age} frames ago")
+        let active_region_count = context.gi_angular_resolution.segment_count() as usize;
+        let angular_data_is_current = context.gi_angular_segments_cell == cell;
+        if angular_data_is_current {
+            let sampled_region_count = context.gi_angular_segments.iter().take(active_region_count).filter(|segment| segment.sampled).count();
+            let fresh_region_count = context.gi_angular_segments.iter().take(active_region_count).filter(|segment| segment.sampled && segment.age_frames <= 60).count();
+            context.ui.set_label_text(self.angular_coverage_label, format!("Coverage: {sampled_region_count}/{active_region_count} sampled · {fresh_region_count} fresh"));
         } else {
-            "Last refresh: waiting for trace data".to_owned()
-        };
-        context.ui.set_label_text(self.cell_refresh_label, refresh_text);
+            context.ui.set_label_text(self.angular_coverage_label, "Coverage: reading selected cell…");
+        }
+        context.ui.set_label_text(self.angular_legend_label, "White = recent sample · fades to black when stale or missed");
+        self.update_angular_sample_page(context, cell, angular_data_is_current, active_region_count);
         context.ui.set_label_text(
             self.status_trace_label,
             if trace_is_current {
@@ -447,22 +459,53 @@ impl RadianceInspector {
             update_swatch(context, swatch, value);
             context.ui.set_label_text(label, if trace_is_current { format!("RGB {}", format_rgb(value)) } else { "RGB --".to_owned() });
         }
-        let channel_index = context.gi_trace_selected_ray as usize / RAYS_PER_CHANNEL;
-        let sample_index = context.gi_trace_selected_ray as usize % RAYS_PER_CHANNEL + 1;
-        let channel_names = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"];
         let sampling = if trace_is_current {
-            format!("{} sample {sample_index}/{RAYS_PER_CHANNEL} · Direction: {}", channel_names[channel_index], format_vec3(displayed_trace.ray_direction))
+            format!(
+                "Region {} · {}/{} valid/tried · Direction: {}",
+                displayed_trace.angular_segment_index,
+                displayed_trace.segment_sample_count,
+                displayed_trace.segment_attempt_count,
+                format_vec3(displayed_trace.ray_direction)
+            )
         } else {
             "Direction: --".to_owned()
         };
         context.ui.set_label_text(self.sampling_label, sampling);
-        let weights = displayed_trace.directional_weights.map(|weight| format!("{weight:.2}"));
-        let weight_text = if trace_is_current {
-            format!("L0 {} · L1 {} · L2 {} · L3 {} · L4 {} · L5 {}", weights[0], weights[1], weights[2], weights[3], weights[4], weights[5])
-        } else {
-            "Directional weights: --".to_owned()
-        };
-        context.ui.set_label_text(self.ray_weights_label, weight_text);
+        let region_text =
+            if trace_is_current { format!("Region mean: RGB {} · blend {:.2}", format_rgb(displayed_trace.stored_radiance), displayed_trace.blend_factor) } else { "Region mean: --".to_owned() };
+        context.ui.set_label_text(self.ray_weights_label, region_text);
+    }
+
+    fn update_angular_sample_page(&mut self, context: &mut RuntimeContext, selected_cell: [u32; 3], data_is_current: bool, active_region_count: usize) {
+        let page_count = active_region_count.div_ceil(ANGULAR_SAMPLE_PAGE_SIZE);
+        let last_page = page_count.saturating_sub(1);
+        if context.ui.button_toggled(self.angular_sample_previous_button).unwrap_or(false) && self.angular_sample_page > 0 {
+            self.angular_sample_page -= 1;
+        } else if context.ui.button_toggled(self.angular_sample_next_button).unwrap_or(false) {
+            self.angular_sample_page = (self.angular_sample_page + 1).min(last_page);
+        }
+        context.ui.set_button_toggled(self.angular_sample_previous_button, false);
+        context.ui.set_button_toggled(self.angular_sample_next_button, false);
+        self.angular_sample_page = self.angular_sample_page.min(last_page);
+        let first_region = self.angular_sample_page * ANGULAR_SAMPLE_PAGE_SIZE;
+        let last_region = (first_region + ANGULAR_SAMPLE_PAGE_SIZE).min(active_region_count);
+        context.ui.set_label_text(self.angular_sample_page_label, format!("Regions {}-{} / {}", first_region + 1, last_region, active_region_count));
+        for sample_index in 0..ANGULAR_SAMPLE_PAGE_SIZE {
+            let region_index = first_region + sample_index;
+            if region_index < active_region_count && data_is_current && context.gi_angular_segments_cell == selected_cell {
+                let segment = context.gi_angular_segments[region_index];
+                update_swatch(context, self.angular_sample_swatches[sample_index], segment.radiance);
+                let samples =
+                    if segment.sampled { format!("{} / {} · {}f", segment.sample_count, segment.attempt_count, segment.age_frames) } else { format!("0 / {} · unsampled", segment.attempt_count) };
+                context.ui.set_label_text(
+                    self.angular_sample_labels[sample_index],
+                    format!("Region {region_index:02} · RGB {} · {samples}", if segment.sampled { format_rgb(segment.radiance) } else { "--".to_owned() }),
+                );
+            } else {
+                update_swatch(context, self.angular_sample_swatches[sample_index], [0.0; 3]);
+                context.ui.set_label_text(self.angular_sample_labels[sample_index], "");
+            }
+        }
     }
 }
 

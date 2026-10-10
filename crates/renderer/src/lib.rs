@@ -24,7 +24,7 @@ const MAX_IRRADIANCE_VOLUMES: usize = 4;
 const MAX_IRRADIANCE_PROBES: usize = 4096;
 const PROBE_SURFACE_SAMPLE_SCALE: f32 = 1.25;
 const VISIBILITY_REBUILD_INTERVAL: u32 = 4;
-const GPU_TIMESTAMP_COUNT: u32 = 12;
+const GPU_TIMESTAMP_COUNT: u32 = 14;
 const SDF_CLIPMAP_RESOLUTION: [u32; 3] = [128, 32, 128];
 const SDF_CLIPMAP_EXTENT: Vec3 = Vec3::new(64.0, 16.0, 64.0);
 const SCENE_GI_PADDING: Vec3 = Vec3::new(8.0, 4.0, 8.0);
@@ -35,19 +35,15 @@ const RADIANCE_FIELD_MAX_RESOLUTION: [u32; 3] = [40, 10, 40];
 const SURFACE_PROBE_STRIDE: u32 = 16;
 const SURFACE_PROBE_CAPACITY: u32 = 131_072;
 const RADIANCE_FIELD_EXTENT: Vec3 = SDF_CLIPMAP_EXTENT;
-pub const RADIANCE_FIELD_CHANNEL_COUNT: usize = 6;
-pub const RADIANCE_FIELD_RAY_COUNT: usize = 24;
-pub const RADIANCE_FIELD_RAYS_PER_CHANNEL: usize = RADIANCE_FIELD_RAY_COUNT / RADIANCE_FIELD_CHANNEL_COUNT;
+pub const RADIANCE_FIELD_RAY_COUNT: usize = 2;
+pub const RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS: usize = 64;
 pub const RADIANCE_SURFACE_CANDIDATE_COUNT: usize = 8;
 const RADIANCE_SURFACE_INSPECTION_VEC4_COUNT: usize = 4 + RADIANCE_SURFACE_CANDIDATE_COUNT * 9;
 const RADIANCE_SURFACE_INSPECTION_SIZE: u64 = (RADIANCE_SURFACE_INSPECTION_VEC4_COUNT * mem::size_of::<[f32; 4]>()) as u64;
 const RADIANCE_FIELD_REFRESH_COOLDOWN_FRAMES: u32 = 60;
 const RADIANCE_FIELD_DIRTY_CELL_BUDGET: usize = 16;
-const RADIANCE_FIELD_NEW_CELL_BUDGET: usize = RADIANCE_FIELD_DIRTY_CELL_BUDGET / 2;
-const RADIANCE_FIELD_SAMPLE_ROUND_MAX: u32 = u16::MAX as u32;
 const RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT: usize = 13;
 const RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE: u64 = (RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT * mem::size_of::<[f32; 4]>()) as u64;
-const RADIANCE_FIELD_VALUE_SIZE: u64 = mem::size_of::<[f32; 4]>() as u64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -286,7 +282,7 @@ impl Default for RenderSettings {
             ambient_intensity: 0.02,
             irradiance_enabled: true,
             surface_probes_enabled: false,
-            triangle_probe_occlusion_enabled: false,
+            triangle_probe_occlusion_enabled: true,
             shadow_cascade_count: SHADOW_CASCADE_COUNT as u32,
             shadow_resolution: SHADOW_MAP_SIZE,
             shadow_depth_bias: 0.00005,
@@ -415,6 +411,24 @@ struct SdfClipmapUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct SdfGpuGeometry {
+    minimum: [f32; 4],
+    maximum: [f32; 4],
+    albedo: [f32; 4],
+    emission: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SdfGpuUpdateSettings {
+    minimum: [f32; 4],
+    voxel_size: [f32; 4],
+    counts: [u32; 4],
+    update: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct RadianceFieldUniform {
     minimum: [f32; 4],
     maximum: [f32; 4],
@@ -422,6 +436,13 @@ struct RadianceFieldUniform {
     settings: [u32; 4],
     scheduled_cells: [[u32; 4]; 4],
     schedule_metadata: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RadianceFieldAngularSample {
+    radiance: [f32; 4],
+    sampling: [u32; 4],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -466,6 +487,7 @@ struct TriangleBvhNode {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TriangleBvhTriangle {
     vertices: [[f32; 4]; 3],
+    source: [u32; 4],
 }
 
 #[repr(C)]
@@ -474,10 +496,23 @@ struct TriangleBvhSettings {
     counts: [u32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TriangleBvhCounterBuffer {
+    counters: [u32; 4],
+}
+
 struct TriangleBvhBuildItem {
     triangle: TriangleBvhTriangle,
     bounds: GeometryBounds,
     centroid: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TriangleBvhBuildStrategy {
+    Median,
+    #[default]
+    Sah,
 }
 
 struct SdfClipmap {
@@ -511,14 +546,9 @@ struct WorldRadianceField {
     maximum: Vec3,
     cell_size: Vec3,
     frame_index: u32,
-    sample_rounds: Vec<u32>,
     refresh_cooldown_frames: u32,
-    refresh_snapshot_pending: bool,
+    refresh_pending: bool,
     needs_full_refresh: bool,
-    queued_new_cells: VecDeque<u32>,
-    queued_new_cell_mask: Vec<bool>,
-    queued_initial_sample_cells: VecDeque<u32>,
-    queued_initial_sample_cell_mask: Vec<bool>,
     queued_priority_cells: VecDeque<u32>,
     queued_priority_cell_mask: Vec<bool>,
     queued_dirty_cells: VecDeque<u32>,
@@ -539,7 +569,18 @@ struct SdfTextureRegion {
 
 struct SdfClipmapUpdate {
     texture_regions: Vec<SdfTextureRegion>,
+    clearance_regions: Vec<SdfTextureRegion>,
     voxels_updated: u32,
+    geometry_bvh_build_ms: f32,
+    voxel_build_ms: f32,
+    clearance_build_ms: f32,
+}
+
+#[derive(Default)]
+struct SdfClipmapBuildTiming {
+    geometry_bvh_build_ms: f32,
+    voxel_build_ms: f32,
+    clearance_build_ms: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -591,6 +632,9 @@ pub struct RendererPerformanceStats {
     pub light_update_ms: f32,
     pub instance_update_ms: f32,
     pub sdf_build_cpu_ms: f32,
+    pub sdf_geometry_bvh_build_ms: f32,
+    pub sdf_voxel_build_ms: f32,
+    pub sdf_clearance_build_ms: f32,
     pub sdf_upload_ms: f32,
     pub sdf_voxels_updated: u32,
     pub gi_history_valid_percent: f32,
@@ -605,11 +649,20 @@ pub struct RendererPerformanceStats {
     pub gpu_shadow_ms: f32,
     pub gpu_scene_ms: f32,
     pub gpu_sdf_gi_ms: f32,
+    pub gpu_sdf_update_ms: f32,
     pub gpu_gizmo_ms: f32,
     pub gpu_ui_ms: f32,
     pub gpu_total_ms: f32,
     pub scheduled_shadow_lights: u32,
     pub dirty_shadow_lights: u32,
+    pub triangle_bvh_segments: u32,
+    pub triangle_bvh_bounds_tests: u32,
+    pub triangle_bvh_triangle_tests: u32,
+    pub triangle_bvh_hits: u32,
+    pub triangle_bvh_build_ms: f32,
+    pub triangle_bvh_refit_ms: f32,
+    pub triangle_bvh_node_count: u32,
+    pub triangle_bvh_triangle_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -618,6 +671,39 @@ pub enum RendererGiTraceDebugMode {
     #[default]
     Geometry,
     Radiance,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RadianceAngularResolution {
+    Low = 8,
+    #[default]
+    Balanced = 32,
+    High = 64,
+}
+
+impl RadianceAngularResolution {
+    pub fn segment_count(self) -> u32 {
+        self as u32
+    }
+
+    fn bands_and_sectors(self) -> (u32, u32) {
+        match self {
+            Self::Low => (2, 4),
+            Self::Balanced => (4, 8),
+            Self::High => (8, 8),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererRadianceAngularSegment {
+    pub sampled: bool,
+    pub direction: [f32; 3],
+    pub radiance: [f32; 3],
+    pub sample_count: u32,
+    pub attempt_count: u32,
+    pub age_frames: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -644,7 +730,9 @@ pub struct RendererGiRayDiagnostic {
     pub accumulated_sample_count: u32,
     pub attempted_sample_count: u32,
     pub blend_factor: f32,
-    pub directional_weights: [f32; RADIANCE_FIELD_CHANNEL_COUNT],
+    pub angular_segment_index: u32,
+    pub segment_sample_count: u32,
+    pub segment_attempt_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -762,6 +850,7 @@ pub struct Renderer {
     depth_prepass_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
     gi_gizmo_pipeline: wgpu::RenderPipeline,
+    angular_segment_pipeline: wgpu::RenderPipeline,
     sdf_occupancy_gizmo_pipeline: wgpu::RenderPipeline,
     gi_gizmo_bind_group: wgpu::BindGroup,
     gi_gizmo_selection_buffer: wgpu::Buffer,
@@ -783,6 +872,16 @@ pub struct Renderer {
     sdf_uniform_buffer: wgpu::Buffer,
     _sdf_texture: wgpu::Texture,
     _sdf_emission_texture: wgpu::Texture,
+    sdf_view: wgpu::TextureView,
+    sdf_emission_view: wgpu::TextureView,
+    _sdf_clearance_texture: wgpu::Texture,
+    _sdf_clearance_work_texture: wgpu::Texture,
+    sdf_clearance_work_view: wgpu::TextureView,
+    _sdf_clearance_sdf_input_texture: wgpu::Texture,
+    sdf_clearance_sdf_input_view: wgpu::TextureView,
+    sdf_update_pipeline: wgpu::ComputePipeline,
+    sdf_clearance_pipeline: wgpu::ComputePipeline,
+    sdf_update_bind_group_layout: wgpu::BindGroupLayout,
     radiance_field: WorldRadianceField,
     radiance_field_uniform_buffer: wgpu::Buffer,
     _radiance_field_buffer: wgpu::Buffer,
@@ -792,6 +891,7 @@ pub struct Renderer {
     gi_trace_readback_receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     gi_trace_readback_cell: [u32; 3],
     gi_trace_readback_frame: u32,
+    gi_trace_readback_angular_resolution: RadianceAngularResolution,
     gi_trace_diagnostics: [RendererGiRayDiagnostic; RADIANCE_FIELD_RAY_COUNT],
     radiance_surface_inspection_settings_buffer: wgpu::Buffer,
     radiance_surface_inspection_values_buffer: wgpu::Buffer,
@@ -851,8 +951,14 @@ pub struct Renderer {
     depth_bind_group: wgpu::BindGroup,
     triangle_bvh_node_buffer: wgpu::Buffer,
     triangle_bvh_triangle_buffer: wgpu::Buffer,
+    triangle_bvh_nodes: Vec<TriangleBvhNode>,
+    triangle_bvh_triangles: Vec<TriangleBvhTriangle>,
     triangle_bvh_settings_buffer: wgpu::Buffer,
     triangle_bvh_settings: TriangleBvhSettings,
+    triangle_bvh_diagnostics_buffer: wgpu::Buffer,
+    triangle_bvh_diagnostics_readback_buffer: wgpu::Buffer,
+    triangle_bvh_diagnostics_enabled: bool,
+    triangle_bvh_build_strategy: TriangleBvhBuildStrategy,
     _depth_sampler: wgpu::Sampler,
     has_presented: bool,
     camera: Camera,
@@ -865,6 +971,12 @@ pub struct Renderer {
     gizmo_vertex_buffer: wgpu::Buffer,
     gizmo_vertex_capacity: usize,
     gizmo_vertex_count: u32,
+    angular_segment_vertex_buffer: wgpu::Buffer,
+    angular_segment_vertex_capacity: usize,
+    angular_segment_vertex_count: u32,
+    radiance_angular_resolution: RadianceAngularResolution,
+    radiance_angular_segments: [RendererRadianceAngularSegment; RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS],
+    radiance_angular_segments_cell: [u32; 3],
     surface_probe_gizmos_enabled: bool,
     world_radiance_gizmos_enabled: bool,
     world_radiance_trace_gizmos_enabled: bool,
@@ -873,6 +985,7 @@ pub struct Renderer {
     render_debug_mode: RenderDebugMode,
     render_settings: RenderSettings,
     gpu_timestamps: Option<GpuTimestampState>,
+    sdf_gpu_updated_this_frame: bool,
 }
 
 impl Renderer {
@@ -1126,7 +1239,10 @@ impl Renderer {
         let visibility_grid = VisibilityGrid::from_bounds(&visibility_bounds);
         let sdf_geometries = sdf_geometries(instances);
         let surface_inspection_meshes = surface_inspection_meshes(instances);
-        let (triangle_bvh_nodes, triangle_bvh_triangles) = build_triangle_bvh(&surface_inspection_meshes);
+        let triangle_bvh_build_strategy = TriangleBvhBuildStrategy::default();
+        let triangle_bvh_build_start = Instant::now();
+        let (triangle_bvh_nodes, triangle_bvh_triangles) = build_triangle_bvh(&surface_inspection_meshes, triangle_bvh_build_strategy);
+        let triangle_bvh_build_ms = triangle_bvh_build_start.elapsed().as_secs_f32() * 1000.0;
         let triangle_bvh_settings = TriangleBvhSettings { counts: [triangle_bvh_nodes.len() as u32, triangle_bvh_triangles.len() as u32, 0, 0] };
         let triangle_bvh_node_buffer = storage_buffer_or_dummy(&device, "triangle visibility BVH nodes", &triangle_bvh_nodes);
         let triangle_bvh_triangle_buffer = storage_buffer_or_dummy(&device, "triangle visibility BVH triangles", &triangle_bvh_triangles);
@@ -1135,8 +1251,19 @@ impl Renderer {
             contents: bytemuck::bytes_of(&triangle_bvh_settings),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let triangle_bvh_diagnostics_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("triangle visibility BVH diagnostics"),
+            contents: bytemuck::bytes_of(&TriangleBvhCounterBuffer::zeroed()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+        let triangle_bvh_diagnostics_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("triangle visibility BVH diagnostics readback"),
+            size: mem::size_of::<TriangleBvhCounterBuffer>() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
-        let sdf_clipmap = SdfClipmap::new(scene_bounds, &sdf_geometries);
+        let mut sdf_clipmap = SdfClipmap::new(scene_bounds, &sdf_geometries);
         let sdf_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("AABB SDF geometry and albedo clipmap"),
             size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
@@ -1144,7 +1271,7 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let sdf_view = sdf_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
@@ -1155,10 +1282,50 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let sdf_emission_view = sdf_emission_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
+        let sdf_clearance_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SDF conservative clearance clipmap"),
+            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let sdf_clearance_work_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SDF conservative clearance update target"),
+            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let sdf_clearance_view = sdf_clearance_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
+        let sdf_clearance_work_view = sdf_clearance_work_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
+        let sdf_clearance_sdf_input_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SDF clearance source snapshot"),
+            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let sdf_clearance_sdf_input_view = sdf_clearance_sdf_input_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
+        let initial_clearance = sdf_clipmap.emission_values.iter().map(|value| value[3]).collect::<Vec<_>>();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &sdf_clearance_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&initial_clearance),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 4), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
+            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+        );
         let radiance_field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, radiance_field_resolution.resolution);
         let radiance_field_uniform = RadianceFieldUniform::zeroed();
         let radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1166,9 +1333,9 @@ impl Renderer {
             contents: bytemuck::bytes_of(&radiance_field_uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let radiance_field_values = vec![[0.0_f32; 4]; radiance_field_resolution.resolution.iter().product::<u32>() as usize * RADIANCE_FIELD_CHANNEL_COUNT];
+        let radiance_field_values = vec![RadianceFieldAngularSample::zeroed(); radiance_field_resolution.resolution.iter().product::<u32>() as usize * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS];
         let radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("world radiance field directional lobes"),
+            label: Some("world radiance field angular regions"),
             contents: bytemuck::cast_slice(&radiance_field_values),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
@@ -1187,7 +1354,7 @@ impl Renderer {
         });
         let gi_trace_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("selected GI ray radiance readback"),
-            size: RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64 + RADIANCE_FIELD_VALUE_SIZE * RADIANCE_FIELD_CHANNEL_COUNT as u64,
+            size: RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64 + mem::size_of::<RadianceFieldAngularSample>() as u64 * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1240,6 +1407,7 @@ impl Renderer {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 16), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
             wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
         );
+        sdf_clipmap.release_cpu_fields();
         let sdf_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SDF clipmap uniform"),
             contents: bytemuck::bytes_of(&sdf_clipmap.uniform(false, sky_lighting)),
@@ -1299,6 +1467,12 @@ impl Renderer {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let depth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1312,6 +1486,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 4, resource: triangle_bvh_node_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: triangle_bvh_triangle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: triangle_bvh_settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: triangle_bvh_diagnostics_buffer.as_entire_binding() },
             ],
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1416,6 +1591,12 @@ impl Renderer {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 25,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1441,6 +1622,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 22, resource: radiance_field_probe_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 23, resource: radiance_surface_inspection_settings_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 24, resource: radiance_surface_inspection_values_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(&sdf_clearance_view) },
             ],
         });
         let gi_gizmo_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1511,6 +1693,76 @@ impl Renderer {
             ],
         });
 
+        let sdf_update_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("incremental SDF update layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba32Float, view_dimension: wgpu::TextureViewDimension::D3 },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba32Float, view_dimension: wgpu::TextureViewDimension::D3 },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::R32Float, view_dimension: wgpu::TextureViewDimension::D3 },
+                    count: None,
+                },
+            ],
+        });
+        let sdf_update_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("incremental SDF update shader"), source: wgpu::ShaderSource::Wgsl(include_str!("sdf_update.wgsl").into()) });
+        let sdf_update_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("incremental SDF update pipeline layout"),
+            bind_group_layouts: &[Some(&sdf_update_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let sdf_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("incremental SDF voxel update"),
+            layout: Some(&sdf_update_layout),
+            module: &sdf_update_shader,
+            entry_point: Some("update_voxels"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let sdf_clearance_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("incremental SDF clearance update"),
+            layout: Some(&sdf_update_layout),
+            module: &sdf_update_shader,
+            entry_point: Some("update_clearance"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse shader"), source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
@@ -1721,6 +1973,37 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let angular_segment_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("radiance angular segment heatmap pipeline"),
+            layout: Some(&gi_gizmo_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &gizmo_shader,
+                entry_point: Some("vertex_main"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: mem::size_of::<RendererGizmoVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+                })],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &gizmo_shader,
+                entry_point: Some("fragment_main"),
+                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let sdf_occupancy_gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("SDF occupancy gizmo pipeline"),
             layout: Some(&gi_gizmo_pipeline_layout),
@@ -1766,6 +2049,11 @@ impl Renderer {
             contents: bytemuck::cast_slice(&[RendererGizmoVertex { position: [0.0; 3], color: [0.0; 4] }; 2]),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let angular_segment_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("radiance angular segment vertices"),
+            contents: bytemuck::cast_slice(&[RendererGizmoVertex { position: [0.0; 3], color: [0.0; 4] }; 3]),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
 
         Ok(Self {
             window,
@@ -1782,6 +2070,7 @@ impl Renderer {
             depth_prepass_pipeline,
             wireframe_pipeline,
             gi_gizmo_pipeline,
+            angular_segment_pipeline,
             sdf_occupancy_gizmo_pipeline,
             vertex_buffer,
             index_buffer,
@@ -1801,6 +2090,16 @@ impl Renderer {
             sdf_uniform_buffer,
             _sdf_texture: sdf_texture,
             _sdf_emission_texture: sdf_emission_texture,
+            sdf_view,
+            sdf_emission_view,
+            _sdf_clearance_texture: sdf_clearance_texture,
+            _sdf_clearance_work_texture: sdf_clearance_work_texture,
+            sdf_clearance_work_view,
+            _sdf_clearance_sdf_input_texture: sdf_clearance_sdf_input_texture,
+            sdf_clearance_sdf_input_view,
+            sdf_update_pipeline,
+            sdf_clearance_pipeline,
+            sdf_update_bind_group_layout,
             radiance_field,
             radiance_field_uniform_buffer,
             _radiance_field_buffer: radiance_field_buffer,
@@ -1810,6 +2109,7 @@ impl Renderer {
             gi_trace_readback_receiver: None,
             gi_trace_readback_cell: [4, 1, 4],
             gi_trace_readback_frame: 0,
+            gi_trace_readback_angular_resolution: RadianceAngularResolution::default(),
             gi_trace_diagnostics: [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT],
             radiance_surface_inspection_settings_buffer,
             radiance_surface_inspection_values_buffer,
@@ -1833,7 +2133,12 @@ impl Renderer {
             dynamic_probe_samples,
             static_probe_signature,
             shadow_bounds,
-            performance_stats: RendererPerformanceStats::default(),
+            performance_stats: RendererPerformanceStats {
+                triangle_bvh_build_ms,
+                triangle_bvh_node_count: triangle_bvh_nodes.len() as u32,
+                triangle_bvh_triangle_count: triangle_bvh_triangles.len() as u32,
+                ..RendererPerformanceStats::default()
+            },
             frame_index: 0,
             shadow_scheduler: {
                 let mut scheduler = ShadowScheduler::default();
@@ -1873,8 +2178,14 @@ impl Renderer {
             depth_bind_group,
             triangle_bvh_node_buffer,
             triangle_bvh_triangle_buffer,
+            triangle_bvh_nodes: triangle_bvh_nodes.clone(),
+            triangle_bvh_triangles: triangle_bvh_triangles.clone(),
             triangle_bvh_settings_buffer,
             triangle_bvh_settings,
+            triangle_bvh_diagnostics_buffer,
+            triangle_bvh_diagnostics_readback_buffer,
+            triangle_bvh_diagnostics_enabled: false,
+            triangle_bvh_build_strategy,
             _depth_sampler: depth_sampler,
             has_presented: false,
             camera: *camera,
@@ -1889,6 +2200,12 @@ impl Renderer {
             gizmo_vertex_buffer,
             gizmo_vertex_capacity: 2,
             gizmo_vertex_count: 0,
+            angular_segment_vertex_buffer,
+            angular_segment_vertex_capacity: 3,
+            angular_segment_vertex_count: 0,
+            radiance_angular_resolution: RadianceAngularResolution::default(),
+            radiance_angular_segments: [RendererRadianceAngularSegment::default(); RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS],
+            radiance_angular_segments_cell: [u32::MAX; 3],
             surface_probe_gizmos_enabled: false,
             world_radiance_gizmos_enabled: false,
             world_radiance_trace_gizmos_enabled: false,
@@ -1897,6 +2214,7 @@ impl Renderer {
             render_debug_mode: RenderDebugMode::default(),
             render_settings: RenderSettings::default(),
             gpu_timestamps,
+            sdf_gpu_updated_this_frame: false,
         })
     }
 
@@ -1965,10 +2283,26 @@ impl Renderer {
         let sdf_geometry_cache = sdf_geometries(instances);
         self.sdf_geometry_cache = sdf_geometry_cache;
         self.surface_inspection_meshes = surface_inspection_meshes(instances);
-        let (nodes, triangles) = build_triangle_bvh(&self.surface_inspection_meshes);
-        self.triangle_bvh_node_buffer = storage_buffer_or_dummy(&self.device, "triangle visibility BVH nodes", &nodes);
-        self.triangle_bvh_triangle_buffer = storage_buffer_or_dummy(&self.device, "triangle visibility BVH triangles", &triangles);
-        self.triangle_bvh_settings = TriangleBvhSettings { counts: [nodes.len() as u32, triangles.len() as u32, 0, 0] };
+        if topology_changed || !self.refit_triangle_bvh() {
+            self.rebuild_triangle_bvh();
+        }
+        self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
+        Ok(())
+    }
+
+    fn rebuild_triangle_bvh(&mut self) {
+        let triangle_bvh_build_start = Instant::now();
+        let (nodes, triangles) = build_triangle_bvh(&self.surface_inspection_meshes, self.triangle_bvh_build_strategy);
+        self.performance_stats.triangle_bvh_build_ms = triangle_bvh_build_start.elapsed().as_secs_f32() * 1000.0;
+        self.performance_stats.triangle_bvh_refit_ms = 0.0;
+        self.performance_stats.triangle_bvh_node_count = nodes.len() as u32;
+        self.performance_stats.triangle_bvh_triangle_count = triangles.len() as u32;
+        self.triangle_bvh_nodes = nodes;
+        self.triangle_bvh_triangles = triangles;
+        self.triangle_bvh_node_buffer = storage_buffer_or_dummy(&self.device, "triangle visibility BVH nodes", &self.triangle_bvh_nodes);
+        self.triangle_bvh_triangle_buffer = storage_buffer_or_dummy(&self.device, "triangle visibility BVH triangles", &self.triangle_bvh_triangles);
+        self.triangle_bvh_settings =
+            TriangleBvhSettings { counts: [self.triangle_bvh_nodes.len() as u32, self.triangle_bvh_triangles.len() as u32, u32::from(self.triangle_bvh_diagnostics_enabled), 0] };
         self.queue.write_buffer(&self.triangle_bvh_settings_buffer, 0, bytemuck::bytes_of(&self.triangle_bvh_settings));
         self.depth_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene depth bind group"),
@@ -1981,10 +2315,24 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 4, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.triangle_bvh_settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.triangle_bvh_diagnostics_buffer.as_entire_binding() },
             ],
         });
-        self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
-        Ok(())
+    }
+
+    fn refit_triangle_bvh(&mut self) -> bool {
+        let refit_start = Instant::now();
+        if !refit_triangle_bvh_data(&mut self.triangle_bvh_nodes, &mut self.triangle_bvh_triangles, &self.surface_inspection_meshes) {
+            return false;
+        }
+        if !self.triangle_bvh_nodes.is_empty() {
+            self.queue.write_buffer(&self.triangle_bvh_node_buffer, 0, bytemuck::cast_slice(&self.triangle_bvh_nodes));
+        }
+        if !self.triangle_bvh_triangles.is_empty() {
+            self.queue.write_buffer(&self.triangle_bvh_triangle_buffer, 0, bytemuck::cast_slice(&self.triangle_bvh_triangles));
+        }
+        self.performance_stats.triangle_bvh_refit_ms = refit_start.elapsed().as_secs_f32() * 1000.0;
+        true
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -2018,6 +2366,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 4, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.triangle_bvh_settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.triangle_bvh_diagnostics_buffer.as_entire_binding() },
             ],
         });
         let surface_probe_uniform = SurfaceProbeUniform {
@@ -2099,11 +2448,15 @@ impl Renderer {
     }
 
     pub fn update_irradiance_volumes(&mut self, volumes: &[RendererIrradianceVolume], instances: &[MeshInstance], lights: &[Light], sdf_gi_enabled: bool) {
+        self.sdf_gpu_updated_this_frame = false;
         if sdf_gi_enabled != self.sdf_gi_enabled {
             self.sdf_gi_enabled = sdf_gi_enabled;
             self.radiance_field.invalidate();
         }
         self.performance_stats.sdf_build_cpu_ms = 0.0;
+        self.performance_stats.sdf_geometry_bvh_build_ms = 0.0;
+        self.performance_stats.sdf_voxel_build_ms = 0.0;
+        self.performance_stats.sdf_clearance_build_ms = 0.0;
         self.performance_stats.sdf_upload_ms = 0.0;
         self.performance_stats.sdf_voxels_updated = 0;
         self.performance_stats.gi_history_valid_percent = 0.0;
@@ -2122,10 +2475,14 @@ impl Renderer {
             let sdf_build_start = Instant::now();
             let geometry_changed = self.sdf_clipmap.geometry_bounds != self.sdf_geometry_cache;
             let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
-            let sdf_update = self.sdf_clipmap.update(scene_bounds, &self.sdf_geometry_cache);
+            let sdf_update = self.sdf_clipmap.update_gpu(scene_bounds, &self.sdf_geometry_cache);
             let field_reanchored = self.radiance_field.reanchor(scene_bounds, RADIANCE_FIELD_EXTENT);
             if field_reanchored {
-                self.queue.write_buffer(&self._radiance_field_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count() * RADIANCE_FIELD_CHANNEL_COUNT]));
+                self.queue.write_buffer(
+                    &self._radiance_field_buffer,
+                    0,
+                    bytemuck::cast_slice(&vec![RadianceFieldAngularSample::zeroed(); self.radiance_field.cell_count() * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS]),
+                );
                 self.queue.write_buffer(&self._radiance_field_probe_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count()]));
             }
             self.performance_stats.sdf_build_cpu_ms = sdf_build_start.elapsed().as_secs_f32() * 1000.0;
@@ -2137,14 +2494,15 @@ impl Renderer {
             }
             if let Some(sdf_update) = sdf_update {
                 self.performance_stats.sdf_voxels_updated = sdf_update.voxels_updated;
+                self.performance_stats.sdf_geometry_bvh_build_ms = sdf_update.geometry_bvh_build_ms;
+                self.performance_stats.sdf_voxel_build_ms = sdf_update.voxel_build_ms;
+                self.performance_stats.sdf_clearance_build_ms = sdf_update.clearance_build_ms;
                 let sdf_upload_start = Instant::now();
-                for region in sdf_update.texture_regions {
-                    upload_sdf_region(&self.queue, &self._sdf_texture, &self.sdf_clipmap.values, region);
-                }
-                upload_sdf_region(&self.queue, &self._sdf_emission_texture, &self.sdf_clipmap.emission_values, SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION });
+                self.update_sdf_gpu(&sdf_update);
+                self.sdf_gpu_updated_this_frame = true;
                 self.performance_stats.sdf_upload_ms = sdf_upload_start.elapsed().as_secs_f32() * 1000.0;
             }
-            let radiance_field_uniform = self.radiance_field.uniform(self.gi_radiance_temporal_accumulation_enabled, Some(self.selected_radiance_cell));
+            let radiance_field_uniform = self.radiance_field.uniform(self.gi_radiance_temporal_accumulation_enabled, self.radiance_angular_resolution.segment_count());
             self.queue.write_buffer(&self.radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&radiance_field_uniform));
             self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(true, self.sky_lighting)));
             self.performance_stats.probe_update_ms = 0.0;
@@ -2240,17 +2598,29 @@ impl Renderer {
         self.performance_stats = RendererPerformanceStats {
             frame_cpu_ms: self.performance_stats.frame_cpu_ms,
             sdf_build_cpu_ms: self.performance_stats.sdf_build_cpu_ms,
+            sdf_geometry_bvh_build_ms: self.performance_stats.sdf_geometry_bvh_build_ms,
+            sdf_voxel_build_ms: self.performance_stats.sdf_voxel_build_ms,
+            sdf_clearance_build_ms: self.performance_stats.sdf_clearance_build_ms,
             sdf_upload_ms: self.performance_stats.sdf_upload_ms,
             sdf_voxels_updated: self.performance_stats.sdf_voxels_updated,
             gi_history_valid_percent: self.performance_stats.gi_history_valid_percent,
             gpu_shadow_ms: self.performance_stats.gpu_shadow_ms,
             gpu_scene_ms: self.performance_stats.gpu_scene_ms,
             gpu_sdf_gi_ms: self.performance_stats.gpu_sdf_gi_ms,
+            gpu_sdf_update_ms: self.performance_stats.gpu_sdf_update_ms,
             gpu_gizmo_ms: self.performance_stats.gpu_gizmo_ms,
             gpu_ui_ms: self.performance_stats.gpu_ui_ms,
             gpu_total_ms: self.performance_stats.gpu_total_ms,
             scheduled_shadow_lights: self.performance_stats.scheduled_shadow_lights,
             dirty_shadow_lights: self.performance_stats.dirty_shadow_lights,
+            triangle_bvh_segments: self.performance_stats.triangle_bvh_segments,
+            triangle_bvh_bounds_tests: self.performance_stats.triangle_bvh_bounds_tests,
+            triangle_bvh_triangle_tests: self.performance_stats.triangle_bvh_triangle_tests,
+            triangle_bvh_hits: self.performance_stats.triangle_bvh_hits,
+            triangle_bvh_build_ms: self.performance_stats.triangle_bvh_build_ms,
+            triangle_bvh_refit_ms: self.performance_stats.triangle_bvh_refit_ms,
+            triangle_bvh_node_count: self.performance_stats.triangle_bvh_node_count,
+            triangle_bvh_triangle_count: self.performance_stats.triangle_bvh_triangle_count,
             light_update_ms: self.performance_stats.light_update_ms,
             instance_update_ms: self.performance_stats.instance_update_ms,
             probe_update_ms: probe_start.elapsed().as_secs_f32() * 1000.0,
@@ -2270,6 +2640,55 @@ impl Renderer {
 
     pub fn performance_stats(&self) -> RendererPerformanceStats {
         self.performance_stats
+    }
+
+    pub fn set_triangle_bvh_diagnostics_enabled(&mut self, enabled: bool) {
+        if self.triangle_bvh_diagnostics_enabled == enabled {
+            return;
+        }
+        self.triangle_bvh_diagnostics_enabled = enabled;
+        self.triangle_bvh_settings.counts[2] = u32::from(enabled);
+        self.queue.write_buffer(&self.triangle_bvh_settings_buffer, 0, bytemuck::bytes_of(&self.triangle_bvh_settings));
+        if !enabled {
+            self.performance_stats.triangle_bvh_segments = 0;
+            self.performance_stats.triangle_bvh_bounds_tests = 0;
+            self.performance_stats.triangle_bvh_triangle_tests = 0;
+            self.performance_stats.triangle_bvh_hits = 0;
+        }
+    }
+
+    pub fn set_triangle_bvh_sah_enabled(&mut self, enabled: bool) {
+        let build_strategy = if enabled { TriangleBvhBuildStrategy::Sah } else { TriangleBvhBuildStrategy::Median };
+        if self.triangle_bvh_build_strategy == build_strategy {
+            return;
+        }
+        self.triangle_bvh_build_strategy = build_strategy;
+        self.rebuild_triangle_bvh();
+    }
+
+    pub fn read_triangle_bvh_diagnostics(&mut self) -> Result<(), String> {
+        if !self.triangle_bvh_diagnostics_enabled {
+            return Ok(());
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("triangle BVH diagnostics readback") });
+        encoder.copy_buffer_to_buffer(&self.triangle_bvh_diagnostics_buffer, 0, &self.triangle_bvh_diagnostics_readback_buffer, 0, mem::size_of::<TriangleBvhCounterBuffer>() as u64);
+        self.queue.submit([encoder.finish()]);
+        let slice = self.triangle_bvh_diagnostics_readback_buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|error| error.to_string())?;
+        receiver.recv().map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+        let mapped = slice.get_mapped_range().map_err(|error| error.to_string())?;
+        let counters = bytemuck::from_bytes::<TriangleBvhCounterBuffer>(&mapped);
+        self.performance_stats.triangle_bvh_segments = counters.counters[0];
+        self.performance_stats.triangle_bvh_bounds_tests = counters.counters[1];
+        self.performance_stats.triangle_bvh_triangle_tests = counters.counters[2];
+        self.performance_stats.triangle_bvh_hits = counters.counters[3];
+        drop(mapped);
+        self.triangle_bvh_diagnostics_readback_buffer.unmap();
+        Ok(())
     }
 
     pub fn radiance_field_grid(&self) -> RendererRadianceFieldGrid {
@@ -2307,6 +2726,7 @@ impl Renderer {
         };
         let scene_ms = to_ms(6, 7);
         let sdf_gi_ms = if self.sdf_gi_enabled && self.render_settings.irradiance_enabled { to_ms(4, 5) } else { 0.0 };
+        let sdf_update_ms = if self.sdf_gpu_updated_this_frame { to_ms(12, 13) } else { 0.0 };
         let gizmo_ms = if self.gizmo_vertex_count > 0 { to_ms(8, 9) } else { 0.0 };
         let ui_ms = if self.ui_vertex_count > 0 { to_ms(10, 11) } else { 0.0 };
         let mut shadow_ms = 0.0;
@@ -2325,7 +2745,9 @@ impl Renderer {
         self.performance_stats.gpu_gizmo_ms = gizmo_ms;
         self.performance_stats.gpu_ui_ms = ui_ms;
         self.performance_stats.gpu_sdf_gi_ms = sdf_gi_ms;
-        self.performance_stats.gpu_total_ms = shadow_ms + scene_ms + sdf_gi_ms + gizmo_ms + ui_ms;
+        self.performance_stats.gpu_sdf_update_ms = sdf_update_ms;
+        self.performance_stats.gpu_total_ms = shadow_ms + scene_ms + sdf_gi_ms + sdf_update_ms + gizmo_ms + ui_ms;
+        self.sdf_gpu_updated_this_frame = false;
         Ok(())
     }
 
@@ -2428,6 +2850,34 @@ impl Renderer {
         self.gi_radiance_temporal_accumulation_enabled = enabled;
     }
 
+    pub fn set_radiance_angular_resolution(&mut self, resolution: RadianceAngularResolution) {
+        if self.radiance_angular_resolution == resolution {
+            return;
+        }
+        self.radiance_angular_resolution = resolution;
+        self.radiance_angular_segments = [RendererRadianceAngularSegment::default(); RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS];
+        self.radiance_angular_segments_cell = [u32::MAX; 3];
+        self.gi_trace_diagnostics = [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT];
+        self.queue.write_buffer(
+            &self._radiance_field_buffer,
+            0,
+            bytemuck::cast_slice(&vec![RadianceFieldAngularSample::zeroed(); self.radiance_field.cell_count() * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS]),
+        );
+        self.radiance_field.invalidate();
+    }
+
+    pub fn radiance_angular_resolution(&self) -> RadianceAngularResolution {
+        self.radiance_angular_resolution
+    }
+
+    pub fn radiance_angular_segments(&self) -> [RendererRadianceAngularSegment; RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS] {
+        self.radiance_angular_segments
+    }
+
+    pub fn radiance_angular_segments_cell(&self) -> [u32; 3] {
+        self.radiance_angular_segments_cell
+    }
+
     fn packed_surface_probe_frame_index(&self) -> u32 {
         (self.frame_index & 0x7fff_ffff) | if self.gi_radiance_frozen { 0x8000_0000 } else { 0 }
     }
@@ -2451,8 +2901,8 @@ impl Renderer {
         self.queue.write_buffer(&self.gi_gizmo_selection_buffer, 0, bytemuck::cast_slice(&selection));
     }
 
-    pub fn set_selected_radiance_trace_options(&mut self, selected_ray: u32, mode: RendererGiTraceDebugMode, overview_enabled: bool) {
-        let options = [selected_ray.min(RADIANCE_FIELD_RAY_COUNT as u32 - 1), mode as u32, u32::from(overview_enabled), 0];
+    pub fn set_selected_radiance_trace_options(&mut self, selected_ray: u32, mode: RendererGiTraceDebugMode) {
+        let options = [selected_ray.min(RADIANCE_FIELD_RAY_COUNT as u32 - 1), mode as u32, 0, 0];
         self.queue.write_buffer(&self.gi_gizmo_selection_buffer, 16, bytemuck::cast_slice(&options));
     }
 
@@ -2478,9 +2928,11 @@ impl Renderer {
         let coordinate = self.selected_radiance_cell;
         let cell_index = coordinate[0] + coordinate[1] * field.resolution[0] + coordinate[2] * field.resolution[0] * field.resolution[1];
         let copy_size = RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64;
-        encoder.copy_buffer_to_buffer(&self._radiance_field_trace_debug_buffer, 0, &self.gi_trace_readback_buffer, 0, copy_size);
-        let radiance_offset = (cell_index as u64 * RADIANCE_FIELD_CHANNEL_COUNT as u64) * RADIANCE_FIELD_VALUE_SIZE;
-        encoder.copy_buffer_to_buffer(&self._radiance_field_buffer, radiance_offset, &self.gi_trace_readback_buffer, copy_size, RADIANCE_FIELD_VALUE_SIZE * RADIANCE_FIELD_CHANNEL_COUNT as u64);
+        let trace_offset = cell_index as u64 * RADIANCE_FIELD_RAY_COUNT as u64 * RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE;
+        encoder.copy_buffer_to_buffer(&self._radiance_field_trace_debug_buffer, trace_offset, &self.gi_trace_readback_buffer, 0, copy_size);
+        let region_offset = cell_index as u64 * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS as u64 * mem::size_of::<RadianceFieldAngularSample>() as u64;
+        let region_size = RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS as u64 * mem::size_of::<RadianceFieldAngularSample>() as u64;
+        encoder.copy_buffer_to_buffer(&self._radiance_field_buffer, region_offset, &self.gi_trace_readback_buffer, copy_size, region_size);
     }
 
     fn poll_gi_trace_readback(&mut self) -> Result<(), String> {
@@ -2502,14 +2954,41 @@ impl Renderer {
             self.gi_trace_diagnostics = [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT];
             return Ok(());
         }
+        if self.gi_trace_readback_angular_resolution != self.radiance_angular_resolution {
+            let mapped = self.gi_trace_readback_buffer.slice(..).get_mapped_range().map_err(|error| error.to_string())?;
+            drop(mapped);
+            self.gi_trace_readback_buffer.unmap();
+            self.gi_trace_diagnostics = [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT];
+            self.radiance_angular_segments_cell = [u32::MAX; 3];
+            return Ok(());
+        }
         let slice = self.gi_trace_readback_buffer.slice(..);
         let mapped = slice.get_mapped_range().map_err(|error| error.to_string())?;
         let debug_size = (RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE * RADIANCE_FIELD_RAY_COUNT as u64) as usize;
         let records = bytemuck::cast_slice::<u8, [[f32; 4]; RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT]>(&mapped[..debug_size]);
-        let stored_values = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped[debug_size..]);
+        let angular_samples = bytemuck::cast_slice::<u8, RadianceFieldAngularSample>(&mapped[debug_size..]);
+        self.radiance_angular_segments_cell = self.gi_trace_readback_cell;
+        let (bands, sectors) = self.radiance_angular_resolution.bands_and_sectors();
+        for segment_index in 0..RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS {
+            let sample = angular_samples[segment_index];
+            let sampled = sample.sampling[0] > 0;
+            let band = segment_index as u32 / sectors;
+            let sector = segment_index as u32 % sectors;
+            let height = 1.0 - 2.0 * (band as f32 + 0.5) / bands as f32;
+            let azimuth = std::f32::consts::TAU * (sector as f32 + 0.5) / sectors as f32;
+            let radius = (1.0 - height * height).max(0.0).sqrt();
+            self.radiance_angular_segments[segment_index] = RendererRadianceAngularSegment {
+                sampled,
+                direction: [radius * azimuth.cos(), height, radius * azimuth.sin()],
+                radiance: [sample.radiance[0], sample.radiance[1], sample.radiance[2]],
+                sample_count: sample.sampling[0],
+                attempt_count: sample.sampling[1],
+                age_frames: if sampled { self.gi_trace_readback_frame.wrapping_sub(sample.sampling[2]) } else { u32::MAX },
+            };
+        }
         for (index, record) in records.iter().enumerate() {
-            let channel_index = index / RADIANCE_FIELD_RAYS_PER_CHANNEL;
-            let stored_radiance = [stored_values[channel_index][0], stored_values[channel_index][1], stored_values[channel_index][2]];
+            let region_index = (record[10][0].max(0.0).round() as usize).min(RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS - 1);
+            let stored_radiance = self.radiance_angular_segments[region_index].radiance;
             let radiance = [record[4][0], record[4][1], record[4][2]];
             let last_update_frame = record[7][3].max(0.0).round() as u32;
             self.gi_trace_diagnostics[index] = RendererGiRayDiagnostic {
@@ -2532,10 +3011,12 @@ impl Renderer {
                 radiance_difference: [radiance[0] - stored_radiance[0], radiance[1] - stored_radiance[1], radiance[2] - stored_radiance[2]],
                 last_update_age_frames: self.gi_trace_readback_frame.wrapping_sub(last_update_frame),
                 ray_direction: [record[3][0], record[3][1], record[3][2]],
-                accumulated_sample_count: record[6][3].max(0.0).round() as u32,
-                attempted_sample_count: record[11][3].max(0.0).round() as u32,
+                accumulated_sample_count: record[10][1].max(0.0).round() as u32,
+                attempted_sample_count: record[10][2].max(0.0).round() as u32,
                 blend_factor: record[4][3].clamp(0.0, 1.0),
-                directional_weights: [record[8][0], record[8][1], record[8][2], record[8][3], record[9][0], record[9][1]],
+                angular_segment_index: record[10][0].max(0.0).round() as u32,
+                segment_sample_count: record[10][1].max(0.0).round() as u32,
+                segment_attempt_count: record[10][2].max(0.0).round() as u32,
             };
         }
         drop(mapped);
@@ -2653,6 +3134,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 4, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.triangle_bvh_settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.triangle_bvh_diagnostics_buffer.as_entire_binding() },
             ],
         });
         let capture_uniform = camera_uniform(width, height, camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
@@ -2800,9 +3282,99 @@ impl Renderer {
         Ok(CapturedFrame { width, height, rgba8, scene_depth, directional_shadow, spot_shadow, point_shadow })
     }
 
+    fn update_sdf_gpu(&self, update: &SdfClipmapUpdate) {
+        let mut voxel_indices = sdf_region_indices(&update.texture_regions).into_iter().map(|index| index as u32).collect::<Vec<_>>();
+        let clearance_indices = sdf_region_indices(&update.clearance_regions).into_iter().map(|index| index as u32).collect::<Vec<_>>();
+        let clearance_offset = voxel_indices.len() as u32;
+        voxel_indices.extend(clearance_indices);
+        if voxel_indices.is_empty() {
+            return;
+        }
+        let gpu_geometries = self
+            .sdf_clipmap
+            .geometry_bvh
+            .geometry_indices
+            .iter()
+            .map(|geometry_index| self.sdf_clipmap.geometry_bvh.geometries[*geometry_index])
+            .map(|geometry| SdfGpuGeometry {
+                minimum: geometry.bounds.minimum.extend(0.0).to_array(),
+                maximum: geometry.bounds.maximum.extend(0.0).to_array(),
+                albedo: geometry.albedo.extend(0.0).to_array(),
+                emission: geometry.emission.extend(0.0).to_array(),
+            })
+            .collect::<Vec<_>>();
+        let settings = SdfGpuUpdateSettings {
+            minimum: self.sdf_clipmap.minimum.extend(0.0).to_array(),
+            voxel_size: self.sdf_clipmap.voxel_size.extend(0.0).to_array(),
+            counts: [SDF_CLIPMAP_RESOLUTION[0], SDF_CLIPMAP_RESOLUTION[1], SDF_CLIPMAP_RESOLUTION[2], gpu_geometries.len() as u32],
+            update: [clearance_offset, (voxel_indices.len() as u32).saturating_sub(clearance_offset), clearance_offset, 0],
+        };
+        let settings_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("incremental SDF update settings"),
+            contents: bytemuck::bytes_of(&settings),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let geometry_buffer = storage_buffer_or_dummy(&self.device, "incremental SDF geometry", &gpu_geometries);
+        let dirty_buffer = storage_buffer_or_dummy(&self.device, "incremental SDF dirty voxels", &voxel_indices);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("incremental SDF update resources"),
+            layout: &self.sdf_update_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: geometry_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dirty_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sdf_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.sdf_emission_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.sdf_clearance_sdf_input_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.sdf_clearance_work_view) },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("incremental SDF GPU update") });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_work_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+        );
+        let clearance_count = settings.update[1];
+        if clearance_offset > 0 {
+            let timestamp_writes = self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
+                query_set: &timestamps.query_set,
+                beginning_of_pass_write_index: Some(12),
+                end_of_pass_write_index: if clearance_count == 0 { Some(13) } else { None },
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("incremental SDF voxel and emission update"), timestamp_writes });
+            pass.set_pipeline(&self.sdf_update_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(clearance_offset.div_ceil(64), 1, 1);
+        }
+        if clearance_count > 0 {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self._sdf_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_sdf_input_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            );
+            let timestamp_writes = self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
+                query_set: &timestamps.query_set,
+                beginning_of_pass_write_index: if clearance_offset == 0 { Some(12) } else { None },
+                end_of_pass_write_index: Some(13),
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("incremental SDF clearance update"), timestamp_writes });
+            pass.set_pipeline(&self.sdf_clearance_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(clearance_count.div_ceil(64), 1, 1);
+        }
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_work_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+        );
+        self.queue.submit(Some(encoder.finish()));
+    }
+
     pub fn render(&mut self) -> Result<(), String> {
         self.poll_gi_trace_readback()?;
         self.poll_radiance_surface_inspection()?;
+        self.update_angular_segment_vertices();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -2843,6 +3415,9 @@ impl Renderer {
             self.radiance_surface_inspection_mesh_snapshot = Some(self.surface_inspection_meshes.clone());
             let pixel = self.radiance_surface_inspection_request.unwrap_or_default();
             self.queue.write_buffer(&self.radiance_surface_inspection_settings_buffer, 0, bytemuck::bytes_of(&RadianceSurfaceInspectionSettings { pixel: [pixel[0], pixel[1], 0, 0] }));
+        }
+        if self.triangle_bvh_diagnostics_enabled {
+            self.queue.write_buffer(&self.triangle_bvh_diagnostics_buffer, 0, bytemuck::bytes_of(&TriangleBvhCounterBuffer::zeroed()));
         }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene encoder") });
         encoder.push_debug_group("GPU shadow passes");
@@ -2888,6 +3463,7 @@ impl Renderer {
         if trace_readback_copied {
             self.gi_trace_readback_cell = self.selected_radiance_cell;
             self.gi_trace_readback_frame = self.radiance_field.frame_index;
+            self.gi_trace_readback_angular_resolution = self.radiance_angular_resolution;
             let (sender, receiver) = mpsc::channel();
             self.gi_trace_readback_buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
@@ -3226,6 +3802,11 @@ impl Renderer {
             let trace_start = surface_probe_count + radiance_field_count;
             pass.draw(0..42, trace_start..trace_start + RADIANCE_FIELD_RAY_COUNT as u32);
             pass.draw(0..2, trace_start + RADIANCE_FIELD_RAY_COUNT as u32..trace_start + RADIANCE_FIELD_RAY_COUNT as u32 + 12);
+            if self.angular_segment_vertex_count > 0 {
+                pass.set_pipeline(&self.angular_segment_pipeline);
+                pass.set_vertex_buffer(0, self.angular_segment_vertex_buffer.slice(..));
+                pass.draw(0..self.angular_segment_vertex_count, 0..1);
+            }
         }
         if self.sdf_occupancy_gizmos_enabled {
             pass.set_pipeline(&self.sdf_occupancy_gizmo_pipeline);
@@ -3237,6 +3818,67 @@ impl Renderer {
         let has_debug_gizmos = self.surface_probe_gizmos_enabled || self.world_radiance_gizmos_enabled || self.world_radiance_trace_gizmos_enabled || self.sdf_occupancy_gizmos_enabled;
         has_debug_gizmos && self.sdf_gi_enabled && self.render_settings.irradiance_enabled
     }
+
+    fn update_angular_segment_vertices(&mut self) {
+        if !self.world_radiance_trace_gizmos_enabled || self.radiance_angular_segments_cell != self.selected_radiance_cell {
+            self.angular_segment_vertex_count = 0;
+            return;
+        }
+        let cell_size = self.radiance_field.cell_size;
+        let coordinate = Vec3::new(self.selected_radiance_cell[0] as f32, self.selected_radiance_cell[1] as f32, self.selected_radiance_cell[2] as f32);
+        let center = self.radiance_field.minimum + (coordinate + Vec3::splat(0.5)) * cell_size;
+        let radius = (cell_size.min_element() * 0.28).clamp(0.12, 0.7);
+        let (bands, sectors) = self.radiance_angular_resolution.bands_and_sectors();
+        let segment_count = self.radiance_angular_resolution.segment_count() as usize;
+        let mut vertices = Vec::with_capacity(segment_count * 4 * 4 * 6);
+        for segment_index in 0..segment_count {
+            let segment = self.radiance_angular_segments[segment_index];
+            let band = segment_index as u32 / sectors;
+            let sector = segment_index as u32 % sectors;
+            let color = angular_segment_heat_color(segment);
+            for band_step in 0..4 {
+                for sector_step in 0..4 {
+                    let u0 = band as f32 + band_step as f32 / 4.0;
+                    let u1 = band as f32 + (band_step + 1) as f32 / 4.0;
+                    let v0 = sector as f32 + sector_step as f32 / 4.0;
+                    let v1 = sector as f32 + (sector_step + 1) as f32 / 4.0;
+                    let p00 = angular_segment_sphere_position(center, radius, bands, sectors, u0, v0);
+                    let p10 = angular_segment_sphere_position(center, radius, bands, sectors, u1, v0);
+                    let p01 = angular_segment_sphere_position(center, radius, bands, sectors, u0, v1);
+                    let p11 = angular_segment_sphere_position(center, radius, bands, sectors, u1, v1);
+                    for position in [p00, p11, p10, p00, p01, p11] {
+                        vertices.push(RendererGizmoVertex { position: position.to_array(), color });
+                    }
+                }
+            }
+        }
+        if vertices.len() > self.angular_segment_vertex_capacity {
+            self.angular_segment_vertex_capacity = vertices.len().next_power_of_two();
+            self.angular_segment_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("radiance angular segment vertices"),
+                size: (self.angular_segment_vertex_capacity * mem::size_of::<RendererGizmoVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(&self.angular_segment_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.angular_segment_vertex_count = vertices.len() as u32;
+    }
+}
+
+fn angular_segment_sphere_position(center: Vec3, radius: f32, bands: u32, sectors: u32, band_position: f32, sector_position: f32) -> Vec3 {
+    let height = 1.0 - 2.0 * band_position / bands as f32;
+    let azimuth = std::f32::consts::TAU * sector_position / sectors as f32;
+    let radial = (1.0 - height * height).max(0.0).sqrt();
+    center + Vec3::new(radial * azimuth.cos(), height, radial * azimuth.sin()) * radius
+}
+
+fn angular_segment_heat_color(segment: RendererRadianceAngularSegment) -> [f32; 4] {
+    if !segment.sampled {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let freshness = (-(segment.age_frames as f32) / 180.0).exp();
+    [freshness, freshness, freshness, 1.0]
 }
 
 fn camera_uniform(width: u32, height: u32, camera: &Camera, lights: &[Light], mode: RenderDebugMode, settings: RenderSettings, _shadow_bounds: GeometryBounds) -> CameraUniform {
@@ -3951,7 +4593,16 @@ impl SdfClipmap {
         clipmap
     }
 
+    #[cfg(test)]
     fn update(&mut self, scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry]) -> Option<SdfClipmapUpdate> {
+        self.update_with_cpu_fields(scene_bounds, geometry_bounds, true)
+    }
+
+    fn update_gpu(&mut self, scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry]) -> Option<SdfClipmapUpdate> {
+        self.update_with_cpu_fields(scene_bounds, geometry_bounds, false)
+    }
+
+    fn update_with_cpu_fields(&mut self, scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry], compute_cpu_fields: bool) -> Option<SdfClipmapUpdate> {
         let extent = scene_sdf_extent(scene_bounds);
         let voxel_size = extent / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
         let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
@@ -3959,11 +4610,62 @@ impl SdfClipmap {
         if self.geometry_bounds == geometry_bounds && !bounds_changed {
             return None;
         }
+        if bounds_changed || self.geometry_bounds.len() != geometry_bounds.len() {
+            self.minimum = minimum;
+            self.maximum = minimum + extent;
+            self.voxel_size = voxel_size;
+            let build_timing = if compute_cpu_fields {
+                self.rebuild(geometry_bounds)
+            } else {
+                self.geometry_bounds.clear();
+                self.geometry_bounds.extend_from_slice(geometry_bounds);
+                let geometry_bvh_build_start = Instant::now();
+                self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
+                SdfClipmapBuildTiming { geometry_bvh_build_ms: geometry_bvh_build_start.elapsed().as_secs_f32() * 1000.0, ..SdfClipmapBuildTiming::default() }
+            };
+            let full_region = SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION };
+            return Some(SdfClipmapUpdate {
+                texture_regions: vec![full_region],
+                clearance_regions: vec![full_region],
+                voxels_updated: SDF_CLIPMAP_RESOLUTION.iter().product(),
+                geometry_bvh_build_ms: build_timing.geometry_bvh_build_ms,
+                voxel_build_ms: build_timing.voxel_build_ms,
+                clearance_build_ms: build_timing.clearance_build_ms,
+            });
+        }
+        let changed_bounds = self.geometry_bounds.iter().zip(geometry_bounds).filter(|(old, new)| old != new).flat_map(|(old, new)| [old.bounds, new.bounds]).collect::<Vec<_>>();
+        if changed_bounds.is_empty() {
+            return None;
+        }
+        let texture_regions = changed_bounds.iter().filter_map(|bounds| self.sdf_bounds_region(*bounds, Vec3::splat(SDF_MAX_DISTANCE) + self.voxel_size * 0.5)).collect::<Vec<_>>();
+        let texture_regions = merge_sdf_texture_regions(texture_regions);
+        let clearance_regions = changed_bounds
+            .iter()
+            .filter_map(|bounds| self.sdf_bounds_region(*bounds, self.voxel_size * 0.5))
+            .map(|region| expand_sdf_texture_region(region, SDF_CLEARANCE_RADIUS_VOXELS as u32))
+            .collect::<Vec<_>>();
+        let clearance_regions = merge_sdf_texture_regions(clearance_regions);
         self.minimum = minimum;
         self.maximum = minimum + extent;
         self.voxel_size = voxel_size;
-        self.rebuild(geometry_bounds);
-        Some(SdfClipmapUpdate { texture_regions: vec![SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION }], voxels_updated: SDF_CLIPMAP_RESOLUTION.iter().product() })
+        self.geometry_bounds.clear();
+        self.geometry_bounds.extend_from_slice(geometry_bounds);
+        let geometry_bvh_build_start = Instant::now();
+        self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
+        let geometry_bvh_build_ms = geometry_bvh_build_start.elapsed().as_secs_f32() * 1000.0;
+        let (voxel_build_ms, clearance_build_ms) = if compute_cpu_fields {
+            let voxel_build_start = Instant::now();
+            self.rebuild_voxel_regions(&texture_regions);
+            let voxel_build_ms = voxel_build_start.elapsed().as_secs_f32() * 1000.0;
+            let clearance_build_start = Instant::now();
+            self.rebuild_clearance_regions(&clearance_regions);
+            let clearance_build_ms = clearance_build_start.elapsed().as_secs_f32() * 1000.0;
+            (voxel_build_ms, clearance_build_ms)
+        } else {
+            (0.0, 0.0)
+        };
+        let voxels_updated = texture_regions.iter().map(|region| region.size.iter().product::<u32>()).sum();
+        return Some(SdfClipmapUpdate { texture_regions, clearance_regions, voxels_updated, geometry_bvh_build_ms, voxel_build_ms, clearance_build_ms });
     }
 
     fn uniform(&self, enabled: bool, sky_lighting: RendererSkyLighting) -> SdfClipmapUniform {
@@ -3976,16 +4678,141 @@ impl SdfClipmap {
         }
     }
 
-    fn rebuild(&mut self, geometry_bounds: &[SdfGeometry]) {
+    fn release_cpu_fields(&mut self) {
+        self.values.clear();
+        self.values.shrink_to_fit();
+        self.emission_values.clear();
+        self.emission_values.shrink_to_fit();
+        self.geometry_bvh = SdfGeometryBvh::new(&[]);
+    }
+
+    fn rebuild(&mut self, geometry_bounds: &[SdfGeometry]) -> SdfClipmapBuildTiming {
         // This field represents the union of per-instance AABBs, not the source mesh surfaces.
         self.geometry_bounds.clear();
         self.geometry_bounds.extend_from_slice(geometry_bounds);
+        let geometry_bvh_build_start = Instant::now();
         self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
+        let geometry_bvh_build_ms = geometry_bvh_build_start.elapsed().as_secs_f32() * 1000.0;
         let voxel_count = SDF_CLIPMAP_RESOLUTION.iter().product::<u32>() as usize;
         self.values = vec![[SDF_MAX_DISTANCE, 0.0, 0.0, 0.0]; voxel_count];
         self.emission_values = vec![[0.0; 4]; voxel_count];
+        let voxel_build_start = Instant::now();
         self.rebuild_all_voxels();
+        let voxel_build_ms = voxel_build_start.elapsed().as_secs_f32() * 1000.0;
+        let clearance_build_start = Instant::now();
         self.rebuild_conservative_clearance();
+        let clearance_build_ms = clearance_build_start.elapsed().as_secs_f32() * 1000.0;
+        SdfClipmapBuildTiming { geometry_bvh_build_ms, voxel_build_ms, clearance_build_ms }
+    }
+
+    fn sdf_bounds_region(&self, bounds: GeometryBounds, margin: Vec3) -> Option<SdfTextureRegion> {
+        let minimum = ((bounds.minimum - margin - self.minimum) / self.voxel_size - Vec3::splat(0.5)).floor().max(Vec3::ZERO);
+        let maximum = ((bounds.maximum + margin - self.minimum) / self.voxel_size - Vec3::splat(0.5)).ceil().min(Vec3::new(
+            (SDF_CLIPMAP_RESOLUTION[0] - 1) as f32,
+            (SDF_CLIPMAP_RESOLUTION[1] - 1) as f32,
+            (SDF_CLIPMAP_RESOLUTION[2] - 1) as f32,
+        ));
+        if !minimum.cmple(maximum).all() {
+            return None;
+        }
+        Some(SdfTextureRegion { origin: minimum.as_uvec3().to_array(), size: (maximum - minimum).as_uvec3().to_array().map(|size| size + 1) })
+    }
+
+    fn rebuild_voxel_regions(&mut self, regions: &[SdfTextureRegion]) {
+        let mut dirty_indices = sdf_region_indices(regions);
+        dirty_indices.sort_unstable();
+        dirty_indices.dedup();
+        if dirty_indices.is_empty() {
+            return;
+        }
+        let worker_count = std::thread::available_parallelism().map(usize::from).unwrap_or(1).min(dirty_indices.len());
+        let indices_per_worker = dirty_indices.len().div_ceil(worker_count);
+        let mut updates = vec![(0_usize, [0.0_f32; 4], [0.0_f32; 3]); dirty_indices.len()];
+        let minimum = self.minimum;
+        let voxel_size = self.voxel_size;
+        let voxel_padding = voxel_size * 0.5;
+        let geometry_bvh = &self.geometry_bvh;
+        std::thread::scope(|scope| {
+            for (worker_index, updates) in updates.chunks_mut(indices_per_worker).enumerate() {
+                let indices = &dirty_indices[worker_index * indices_per_worker..worker_index * indices_per_worker + updates.len()];
+                scope.spawn(move || {
+                    for ((index, value, emission_value), voxel_index) in updates.iter_mut().zip(indices) {
+                        let x = *voxel_index % SDF_CLIPMAP_RESOLUTION[0] as usize;
+                        let y = (*voxel_index / SDF_CLIPMAP_RESOLUTION[0] as usize) % SDF_CLIPMAP_RESOLUTION[1] as usize;
+                        let z = *voxel_index / (SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                        let position = minimum + (Vec3::new(x as f32, y as f32, z as f32) + Vec3::splat(0.5)) * voxel_size;
+                        let (distance, albedo, emission) = geometry_bvh.nearest(position, voxel_padding);
+                        *index = *voxel_index;
+                        *value = [distance.clamp(-SDF_MAX_DISTANCE, SDF_MAX_DISTANCE), albedo.x, albedo.y, albedo.z];
+                        *emission_value = emission.to_array();
+                    }
+                });
+            }
+        });
+        for (index, value, emission) in updates {
+            self.values[index] = value;
+            self.emission_values[index][..3].copy_from_slice(&emission);
+        }
+    }
+
+    fn rebuild_clearance_regions(&mut self, regions: &[SdfTextureRegion]) {
+        let mut dirty_indices = sdf_region_indices(regions);
+        dirty_indices.sort_unstable();
+        dirty_indices.dedup();
+        if dirty_indices.is_empty() {
+            return;
+        }
+        let worker_count = std::thread::available_parallelism().map(usize::from).unwrap_or(1).min(dirty_indices.len());
+        let indices_per_worker = dirty_indices.len().div_ceil(worker_count);
+        let mut updates = vec![(0_usize, 0.0_f32); dirty_indices.len()];
+        let half_voxel_diagonal = self.voxel_size.length() * 0.5;
+        let minimum_voxel_size = self.voxel_size.min_element();
+        let values = &self.values;
+        std::thread::scope(|scope| {
+            for (worker_index, updates) in updates.chunks_mut(indices_per_worker).enumerate() {
+                let indices = &dirty_indices[worker_index * indices_per_worker..worker_index * indices_per_worker + updates.len()];
+                scope.spawn(move || {
+                    for ((index, safe_distance), voxel_index) in updates.iter_mut().zip(indices) {
+                        let x = *voxel_index % SDF_CLIPMAP_RESOLUTION[0] as usize;
+                        let y = (*voxel_index / SDF_CLIPMAP_RESOLUTION[0] as usize) % SDF_CLIPMAP_RESOLUTION[1] as usize;
+                        let z = *voxel_index / (SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                        let mut distance = SDF_CLEARANCE_RADIUS_VOXELS;
+                        'neighborhood: for offset_z in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
+                            for offset_y in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
+                                for offset_x in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
+                                    let neighbor_x = x as i32 + offset_x;
+                                    let neighbor_y = y as i32 + offset_y;
+                                    let neighbor_z = z as i32 + offset_z;
+                                    if neighbor_x < 0
+                                        || neighbor_y < 0
+                                        || neighbor_z < 0
+                                        || neighbor_x >= SDF_CLIPMAP_RESOLUTION[0] as i32
+                                        || neighbor_y >= SDF_CLIPMAP_RESOLUTION[1] as i32
+                                        || neighbor_z >= SDF_CLIPMAP_RESOLUTION[2] as i32
+                                    {
+                                        continue;
+                                    }
+                                    let neighbor_index = neighbor_x as usize
+                                        + neighbor_y as usize * SDF_CLIPMAP_RESOLUTION[0] as usize
+                                        + neighbor_z as usize * SDF_CLIPMAP_RESOLUTION[0] as usize * SDF_CLIPMAP_RESOLUTION[1] as usize;
+                                    if values[neighbor_index][0] <= 0.0 {
+                                        distance = distance.min(offset_x.unsigned_abs().max(offset_y.unsigned_abs()).max(offset_z.unsigned_abs()) as u16);
+                                        if distance == 0 {
+                                            break 'neighborhood;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        *index = *voxel_index;
+                        *safe_distance = (distance as f32 * minimum_voxel_size - half_voxel_diagonal).max(0.0);
+                    }
+                });
+            }
+        });
+        for (index, safe_distance) in updates {
+            self.emission_values[index][3] = safe_distance;
+        }
     }
 
     fn rebuild_conservative_clearance(&mut self) {
@@ -4112,14 +4939,9 @@ impl WorldRadianceField {
             maximum: minimum + extent,
             cell_size,
             frame_index: 0,
-            sample_rounds: vec![0; resolution.iter().product::<u32>() as usize],
             refresh_cooldown_frames: 0,
-            refresh_snapshot_pending: false,
+            refresh_pending: false,
             needs_full_refresh: true,
-            queued_new_cells: VecDeque::new(),
-            queued_new_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
-            queued_initial_sample_cells: VecDeque::new(),
-            queued_initial_sample_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
             queued_priority_cells: VecDeque::new(),
             queued_priority_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
             queued_dirty_cells: VecDeque::new(),
@@ -4141,62 +4963,52 @@ impl WorldRadianceField {
         true
     }
 
-    fn uniform(&mut self, temporal_accumulation_enabled: bool, selected_cell: Option<[u32; 3]>) -> RadianceFieldUniform {
+    fn uniform(&mut self, temporal_accumulation_enabled: bool, angular_region_count: u32) -> RadianceFieldUniform {
         let full_refresh = self.needs_full_refresh;
         if full_refresh {
             self.needs_full_refresh = false;
             self.clear_pending_cells();
-            self.sample_rounds.fill(0);
         }
         self.frame_index = self.frame_index.wrapping_add(1);
         self.refresh_cooldown_frames = self.refresh_cooldown_frames.saturating_sub(1);
-        let dirty_refresh = !full_refresh && self.refresh_snapshot_pending && self.refresh_cooldown_frames == 0;
+        let dirty_refresh = !full_refresh && self.refresh_pending && self.refresh_cooldown_frames == 0;
         if full_refresh {
-            self.refresh_snapshot_pending = false;
+            self.refresh_pending = false;
         } else if dirty_refresh {
-            self.refresh_snapshot_pending = false;
+            self.refresh_pending = false;
             self.refresh_cooldown_frames = RADIANCE_FIELD_REFRESH_COOLDOWN_FRAMES;
         }
-        let flags = u32::from(full_refresh) | (u32::from(dirty_refresh) << 1) | (u32::from(temporal_accumulation_enabled) << 2);
-        if !temporal_accumulation_enabled {
-            self.queued_initial_sample_cells.clear();
-            self.queued_initial_sample_cell_mask.fill(false);
-        }
-        let (scheduled_cells, refine_all_cells) = if temporal_accumulation_enabled || full_refresh {
+        let scheduled_cells = if temporal_accumulation_enabled || full_refresh {
             self.clear_pending_cells();
-            (Vec::new(), true)
+            Vec::new()
         } else {
-            self.schedule_cells(false, selected_cell)
+            self.schedule_cells()
         };
         let mut packed_scheduled_cells = [[u32::MAX; 4]; 4];
-        for (index, (cell, sample_round)) in scheduled_cells.iter().enumerate() {
-            packed_scheduled_cells[index / 4][index % 4] = (*sample_round << 16) | *cell;
+        for (index, cell) in scheduled_cells.iter().enumerate() {
+            packed_scheduled_cells[index / 4][index % 4] = *cell;
         }
         RadianceFieldUniform {
             minimum: self.minimum.extend(0.0).to_array(),
             maximum: self.maximum.extend(0.0).to_array(),
             resolution: [self.resolution[0], self.resolution[1], self.resolution[2], 0],
-            settings: [self.frame_index, RADIANCE_FIELD_RAY_COUNT as u32, RADIANCE_FIELD_CHANNEL_COUNT as u32, flags],
+            settings: [self.frame_index, RADIANCE_FIELD_RAY_COUNT as u32, angular_region_count, u32::from(full_refresh)],
             scheduled_cells: packed_scheduled_cells,
-            schedule_metadata: [scheduled_cells.len() as u32, u32::from(refine_all_cells), 0, 0],
+            schedule_metadata: [scheduled_cells.len() as u32, u32::from(temporal_accumulation_enabled || full_refresh), 0, 0],
         }
     }
 
     fn invalidate(&mut self) {
         self.needs_full_refresh = true;
         self.refresh_cooldown_frames = 0;
-        self.refresh_snapshot_pending = false;
+        self.refresh_pending = false;
         self.clear_pending_cells();
     }
 
     fn refresh_temporally(&mut self, refinement_enabled: bool) {
-        let new_refresh_request = !self.refresh_snapshot_pending && self.refresh_cooldown_frames == 0;
-        self.refresh_snapshot_pending = true;
+        self.refresh_pending = true;
         if refinement_enabled {
             return;
-        }
-        if new_refresh_request {
-            self.sample_rounds.fill(0);
         }
         self.queued_priority_cells.clear();
         self.queued_priority_cell_mask.fill(false);
@@ -4206,13 +5018,9 @@ impl WorldRadianceField {
     }
 
     fn refresh_for_lighting_change(&mut self, priority: Option<RadianceFieldPriority>, refinement_enabled: bool) {
-        let new_refresh_request = !self.refresh_snapshot_pending && self.refresh_cooldown_frames == 0;
-        self.refresh_snapshot_pending = true;
+        self.refresh_pending = true;
         if refinement_enabled {
             return;
-        }
-        if new_refresh_request {
-            self.sample_rounds.fill(0);
         }
         if priority.is_none() {
             self.queued_priority_cells.clear();
@@ -4245,10 +5053,6 @@ impl WorldRadianceField {
     }
 
     fn clear_pending_cells(&mut self) {
-        self.queued_new_cells.clear();
-        self.queued_new_cell_mask.fill(false);
-        self.queued_initial_sample_cells.clear();
-        self.queued_initial_sample_cell_mask.fill(false);
         self.queued_priority_cells.clear();
         self.queued_priority_cell_mask.fill(false);
         self.queued_dirty_cells.clear();
@@ -4259,139 +5063,20 @@ impl WorldRadianceField {
         enqueue_cell(&mut self.queued_priority_cells, &mut self.queued_priority_cell_mask, index);
     }
 
-    fn enqueue_initial_sample_cell(&mut self, index: u32) {
-        enqueue_cell(&mut self.queued_initial_sample_cells, &mut self.queued_initial_sample_cell_mask, index);
-    }
-
     fn enqueue_dirty_cell(&mut self, index: u32) {
         enqueue_cell(&mut self.queued_dirty_cells, &mut self.queued_dirty_cell_mask, index);
     }
 
-    fn schedule_cells(&mut self, refinement_enabled: bool, selected_cell: Option<[u32; 3]>) -> (Vec<(u32, u32)>, bool) {
-        let has_queued_work = self.queued_new_cell_mask.iter().any(|queued| *queued)
-            || self.queued_initial_sample_cell_mask.iter().any(|queued| *queued)
-            || self.queued_priority_cell_mask.iter().any(|queued| *queued)
-            || self.queued_dirty_cell_mask.iter().any(|queued| *queued);
-        if refinement_enabled && !has_queued_work {
-            for index in 0..self.cell_count() as u32 {
-                self.enqueue_dirty_cell(index);
-            }
-        }
-        let has_queued_work = self.queued_new_cell_mask.iter().any(|queued| *queued)
-            || self.queued_initial_sample_cell_mask.iter().any(|queued| *queued)
-            || self.queued_priority_cell_mask.iter().any(|queued| *queued)
-            || self.queued_dirty_cell_mask.iter().any(|queued| *queued);
-        if has_queued_work {
-            let mut scheduled = Vec::with_capacity(RADIANCE_FIELD_DIRTY_CELL_BUDGET);
-            let mut scheduled_mask = vec![false; self.cell_count()];
-            let mut follow_up_cells = Vec::new();
-            if refinement_enabled {
-                if let Some([x, y, z]) = selected_cell {
-                    let index = x + y * self.resolution[0] + z * self.resolution[0] * self.resolution[1];
-                    if (index as usize) < self.sample_rounds.len() {
-                        scheduled_mask[index as usize] = true;
-                        let sample_round = self.sample_rounds[index as usize];
-                        scheduled.push((index, sample_round));
-                        self.sample_rounds[index as usize] = sample_round.saturating_add(1).min(RADIANCE_FIELD_SAMPLE_ROUND_MAX);
-                        if sample_round == 0 {
-                            follow_up_cells.push(index);
-                        }
-                    }
-                }
-            }
-            let initial_samples_pending = self.queued_initial_sample_cell_mask.iter().any(|queued| *queued);
-            let new_cell_budget = if initial_samples_pending { RADIANCE_FIELD_NEW_CELL_BUDGET } else { RADIANCE_FIELD_DIRTY_CELL_BUDGET };
-            schedule_queued_cells(
-                &mut self.queued_new_cells,
-                &mut self.queued_new_cell_mask,
-                &mut scheduled,
-                &mut scheduled_mask,
-                &mut self.sample_rounds,
-                &mut follow_up_cells,
-                true,
-                refinement_enabled,
-                new_cell_budget,
-            );
-            schedule_queued_cells(
-                &mut self.queued_priority_cells,
-                &mut self.queued_priority_cell_mask,
-                &mut scheduled,
-                &mut scheduled_mask,
-                &mut self.sample_rounds,
-                &mut follow_up_cells,
-                true,
-                refinement_enabled,
-                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
-            );
-            schedule_queued_cells(
-                &mut self.queued_initial_sample_cells,
-                &mut self.queued_initial_sample_cell_mask,
-                &mut scheduled,
-                &mut scheduled_mask,
-                &mut self.sample_rounds,
-                &mut follow_up_cells,
-                false,
-                refinement_enabled,
-                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
-            );
-            schedule_queued_cells(
-                &mut self.queued_new_cells,
-                &mut self.queued_new_cell_mask,
-                &mut scheduled,
-                &mut scheduled_mask,
-                &mut self.sample_rounds,
-                &mut follow_up_cells,
-                true,
-                refinement_enabled,
-                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
-            );
-            schedule_queued_cells(
-                &mut self.queued_priority_cells,
-                &mut self.queued_priority_cell_mask,
-                &mut scheduled,
-                &mut scheduled_mask,
-                &mut self.sample_rounds,
-                &mut follow_up_cells,
-                true,
-                refinement_enabled,
-                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
-            );
-            schedule_queued_cells(
-                &mut self.queued_dirty_cells,
-                &mut self.queued_dirty_cell_mask,
-                &mut scheduled,
-                &mut scheduled_mask,
-                &mut self.sample_rounds,
-                &mut follow_up_cells,
-                false,
-                refinement_enabled,
-                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
-            );
-            for index in follow_up_cells {
-                self.enqueue_initial_sample_cell(index);
-            }
-            return (scheduled, false);
-        }
-
-        if !refinement_enabled {
-            return (Vec::new(), false);
-        }
-
-        (Vec::new(), false)
+    fn schedule_cells(&mut self) -> Vec<u32> {
+        let mut scheduled = Vec::with_capacity(RADIANCE_FIELD_DIRTY_CELL_BUDGET);
+        let mut scheduled_mask = vec![false; self.cell_count()];
+        schedule_queued_cells(&mut self.queued_priority_cells, &mut self.queued_priority_cell_mask, &mut scheduled, &mut scheduled_mask, RADIANCE_FIELD_DIRTY_CELL_BUDGET);
+        schedule_queued_cells(&mut self.queued_dirty_cells, &mut self.queued_dirty_cell_mask, &mut scheduled, &mut scheduled_mask, RADIANCE_FIELD_DIRTY_CELL_BUDGET);
+        scheduled
     }
 }
 
-fn schedule_queued_cells(
-    queue: &mut VecDeque<u32>,
-    queued_mask: &mut Vec<bool>,
-    scheduled: &mut Vec<(u32, u32)>,
-    scheduled_mask: &mut Vec<bool>,
-    sample_rounds: &mut [u32],
-    follow_up_cells: &mut Vec<u32>,
-    enqueue_follow_up: bool,
-    refinement_enabled: bool,
-    maximum_count: usize,
-) {
+fn schedule_queued_cells(queue: &mut VecDeque<u32>, queued_mask: &mut Vec<bool>, scheduled: &mut Vec<u32>, scheduled_mask: &mut Vec<bool>, maximum_count: usize) {
     let mut selected_count = 0;
     while selected_count < maximum_count && scheduled.len() < RADIANCE_FIELD_DIRTY_CELL_BUDGET {
         let Some(index) = pop_queued_cell(queue, queued_mask) else { break };
@@ -4400,12 +5085,7 @@ fn schedule_queued_cells(
             continue;
         }
         scheduled_mask[slot] = true;
-        let sample_round = if refinement_enabled { sample_rounds[slot] } else { 0 };
-        scheduled.push((index, sample_round));
-        sample_rounds[slot] = if refinement_enabled { sample_round.saturating_add(1).min(RADIANCE_FIELD_SAMPLE_ROUND_MAX) } else { sample_rounds[slot].max(1) };
-        if enqueue_follow_up && refinement_enabled && sample_round == 0 {
-            follow_up_cells.push(index);
-        }
+        scheduled.push(index);
         selected_count += 1;
     }
 }
@@ -4465,21 +5145,50 @@ fn changed_light_priority(previous: &[Light], current: &[Light]) -> Option<Radia
     Some(RadianceFieldPriority { position: center, radius: (maximum - minimum).length() * 0.5 })
 }
 
-fn upload_sdf_region(queue: &wgpu::Queue, texture: &wgpu::Texture, values: &[[f32; 4]], region: SdfTextureRegion) {
-    let mut packed_values = Vec::with_capacity((region.size[0] * region.size[1] * region.size[2]) as usize);
-    for z in region.origin[2]..region.origin[2] + region.size[2] {
-        for y in region.origin[1]..region.origin[1] + region.size[1] {
-            let start = (region.origin[0] + y * SDF_CLIPMAP_RESOLUTION[0] + z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
-            let end = start + region.size[0] as usize;
-            packed_values.extend_from_slice(&values[start..end]);
+fn expand_sdf_texture_region(region: SdfTextureRegion, amount: u32) -> SdfTextureRegion {
+    let end = [region.origin[0] + region.size[0], region.origin[1] + region.size[1], region.origin[2] + region.size[2]];
+    let origin = [region.origin[0].saturating_sub(amount), region.origin[1].saturating_sub(amount), region.origin[2].saturating_sub(amount)];
+    let expanded_end =
+        [end[0].saturating_add(amount).min(SDF_CLIPMAP_RESOLUTION[0]), end[1].saturating_add(amount).min(SDF_CLIPMAP_RESOLUTION[1]), end[2].saturating_add(amount).min(SDF_CLIPMAP_RESOLUTION[2])];
+    SdfTextureRegion { origin, size: [expanded_end[0] - origin[0], expanded_end[1] - origin[1], expanded_end[2] - origin[2]] }
+}
+
+fn sdf_region_indices(regions: &[SdfTextureRegion]) -> Vec<usize> {
+    let voxel_count = regions.iter().map(|region| region.size.iter().product::<u32>() as usize).sum();
+    let mut indices = Vec::with_capacity(voxel_count);
+    for region in regions {
+        for z in region.origin[2]..region.origin[2] + region.size[2] {
+            for y in region.origin[1]..region.origin[1] + region.size[1] {
+                let row_start = (region.origin[0] + y * SDF_CLIPMAP_RESOLUTION[0] + z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                indices.extend(row_start..row_start + region.size[0] as usize);
+            }
         }
     }
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x: region.origin[0], y: region.origin[1], z: region.origin[2] }, aspect: wgpu::TextureAspect::All },
-        bytemuck::cast_slice(&packed_values),
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(region.size[0] * 16), rows_per_image: Some(region.size[1]) },
-        wgpu::Extent3d { width: region.size[0], height: region.size[1], depth_or_array_layers: region.size[2] },
-    );
+    indices
+}
+
+fn merge_sdf_texture_regions(mut regions: Vec<SdfTextureRegion>) -> Vec<SdfTextureRegion> {
+    let mut index = 0;
+    while index < regions.len() {
+        let mut merge_index = index + 1;
+        while merge_index < regions.len() {
+            let first = regions[index];
+            let second = regions[merge_index];
+            let first_end = [first.origin[0] + first.size[0], first.origin[1] + first.size[1], first.origin[2] + first.size[2]];
+            let second_end = [second.origin[0] + second.size[0], second.origin[1] + second.size[1], second.origin[2] + second.size[2]];
+            let overlaps = (0..3).all(|axis| first.origin[axis] <= second_end[axis] && second.origin[axis] <= first_end[axis]);
+            if overlaps {
+                let origin = [first.origin[0].min(second.origin[0]), first.origin[1].min(second.origin[1]), first.origin[2].min(second.origin[2])];
+                let end = [first_end[0].max(second_end[0]), first_end[1].max(second_end[1]), first_end[2].max(second_end[2])];
+                regions[index] = SdfTextureRegion { origin, size: [end[0] - origin[0], end[1] - origin[1], end[2] - origin[2]] };
+                regions.swap_remove(merge_index);
+            } else {
+                merge_index += 1;
+            }
+        }
+        index += 1;
+    }
+    regions
 }
 
 fn signed_distance_to_bounds(position: Vec3, bounds: GeometryBounds) -> f32 {
@@ -4832,15 +5541,15 @@ fn storage_buffer_or_dummy<T: Pod + Zeroable>(device: &wgpu::Device, label: &str
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST })
 }
 
-fn build_triangle_bvh(meshes: &[SurfaceInspectionMesh]) -> (Vec<TriangleBvhNode>, Vec<TriangleBvhTriangle>) {
+fn build_triangle_bvh(meshes: &[SurfaceInspectionMesh], strategy: TriangleBvhBuildStrategy) -> (Vec<TriangleBvhNode>, Vec<TriangleBvhTriangle>) {
     let items = meshes
         .iter()
-        .flat_map(|mesh| mesh.triangles.iter())
-        .map(|triangle| {
+        .flat_map(|mesh| mesh.triangles.iter().map(move |triangle| (mesh.instance_index, triangle)))
+        .map(|(instance_index, triangle)| {
             let minimum = triangle.vertices.iter().copied().fold(Vec3::splat(f32::INFINITY), Vec3::min);
             let maximum = triangle.vertices.iter().copied().fold(Vec3::splat(f32::NEG_INFINITY), Vec3::max);
             TriangleBvhBuildItem {
-                triangle: TriangleBvhTriangle { vertices: triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]) },
+                triangle: TriangleBvhTriangle { vertices: triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]), source: [instance_index, triangle.triangle_index, 0, 0] },
                 bounds: GeometryBounds { minimum, maximum },
                 centroid: (minimum + maximum) * 0.5,
             }
@@ -4849,12 +5558,51 @@ fn build_triangle_bvh(meshes: &[SurfaceInspectionMesh]) -> (Vec<TriangleBvhNode>
     let mut nodes = Vec::new();
     let mut triangles = Vec::new();
     if !items.is_empty() {
-        build_triangle_bvh_node(items, &mut nodes, &mut triangles);
+        build_triangle_bvh_node(items, &mut nodes, &mut triangles, strategy, 0);
     }
     (nodes, triangles)
 }
 
-fn build_triangle_bvh_node(mut items: Vec<TriangleBvhBuildItem>, nodes: &mut Vec<TriangleBvhNode>, triangles: &mut Vec<TriangleBvhTriangle>) -> u32 {
+fn refit_triangle_bvh_data(nodes: &mut [TriangleBvhNode], triangles: &mut [TriangleBvhTriangle], meshes: &[SurfaceInspectionMesh]) -> bool {
+    let meshes = meshes.iter().map(|mesh| (mesh.instance_index, mesh)).collect::<HashMap<_, _>>();
+    for triangle in triangles.iter_mut() {
+        let Some(mesh) = meshes.get(&triangle.source[0]) else {
+            return false;
+        };
+        let Some(source_triangle) = mesh.triangles.get(triangle.source[1] as usize) else {
+            return false;
+        };
+        triangle.vertices = source_triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]);
+    }
+    for node_index in (0..nodes.len()).rev() {
+        let metadata = nodes[node_index].metadata;
+        let (minimum, maximum) = if metadata[2] > 0 {
+            let mut minimum = Vec3::splat(f32::INFINITY);
+            let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+            for triangle_index in metadata[1]..metadata[1] + metadata[2] {
+                let triangle = triangles[triangle_index as usize];
+                for vertex in triangle.vertices {
+                    let position = Vec3::new(vertex[0], vertex[1], vertex[2]);
+                    minimum = minimum.min(position);
+                    maximum = maximum.max(position);
+                }
+            }
+            (minimum, maximum)
+        } else {
+            let left = nodes[node_index + 1];
+            let right = nodes[metadata[0] as usize];
+            (
+                Vec3::new(left.minimum[0], left.minimum[1], left.minimum[2]).min(Vec3::new(right.minimum[0], right.minimum[1], right.minimum[2])),
+                Vec3::new(left.maximum[0], left.maximum[1], left.maximum[2]).max(Vec3::new(right.maximum[0], right.maximum[1], right.maximum[2])),
+            )
+        };
+        nodes[node_index].minimum = [minimum.x, minimum.y, minimum.z, 0.0];
+        nodes[node_index].maximum = [maximum.x, maximum.y, maximum.z, 0.0];
+    }
+    true
+}
+
+fn build_triangle_bvh_node(mut items: Vec<TriangleBvhBuildItem>, nodes: &mut Vec<TriangleBvhNode>, triangles: &mut Vec<TriangleBvhTriangle>, strategy: TriangleBvhBuildStrategy, depth: u32) -> u32 {
     let node_index = nodes.len() as u32;
     let minimum = items.iter().fold(Vec3::splat(f32::INFINITY), |minimum, item| minimum.min(item.bounds.minimum));
     let maximum = items.iter().fold(Vec3::splat(f32::NEG_INFINITY), |maximum, item| maximum.max(item.bounds.maximum));
@@ -4865,24 +5613,103 @@ fn build_triangle_bvh_node(mut items: Vec<TriangleBvhBuildItem>, nodes: &mut Vec
         metadata[2] = items.len() as u32;
         triangles.extend(items.into_iter().map(|item| item.triangle));
     } else {
-        let centroid_minimum = items.iter().fold(Vec3::splat(f32::INFINITY), |minimum, item| minimum.min(item.centroid));
-        let centroid_maximum = items.iter().fold(Vec3::splat(f32::NEG_INFINITY), |maximum, item| maximum.max(item.centroid));
-        let centroid_extent = centroid_maximum - centroid_minimum;
-        let axis = if centroid_extent.x >= centroid_extent.y && centroid_extent.x >= centroid_extent.z {
-            0
-        } else if centroid_extent.y >= centroid_extent.z {
-            1
-        } else {
-            2
-        };
-        items.sort_by(|left, right| left.centroid[axis].total_cmp(&right.centroid[axis]));
-        let right_items = items.split_off(items.len() / 2);
-        build_triangle_bvh_node(items, nodes, triangles);
-        metadata[0] = build_triangle_bvh_node(right_items, nodes, triangles);
+        let split = if strategy == TriangleBvhBuildStrategy::Sah && depth < 32 { triangle_bvh_sah_split(&mut items) } else { None }.unwrap_or_else(|| triangle_bvh_median_split(&mut items));
+        let right_items = items.split_off(split);
+        build_triangle_bvh_node(items, nodes, triangles, strategy, depth + 1);
+        metadata[0] = build_triangle_bvh_node(right_items, nodes, triangles, strategy, depth + 1);
     }
     metadata[3] = nodes.len() as u32;
     nodes[node_index as usize] = TriangleBvhNode { minimum: [minimum.x, minimum.y, minimum.z, 0.0], maximum: [maximum.x, maximum.y, maximum.z, 0.0], metadata };
     node_index
+}
+
+fn triangle_bvh_median_split(items: &mut [TriangleBvhBuildItem]) -> usize {
+    let centroid_minimum = items.iter().fold(Vec3::splat(f32::INFINITY), |minimum, item| minimum.min(item.centroid));
+    let centroid_maximum = items.iter().fold(Vec3::splat(f32::NEG_INFINITY), |maximum, item| maximum.max(item.centroid));
+    let centroid_extent = centroid_maximum - centroid_minimum;
+    let axis = if centroid_extent.x >= centroid_extent.y && centroid_extent.x >= centroid_extent.z {
+        0
+    } else if centroid_extent.y >= centroid_extent.z {
+        1
+    } else {
+        2
+    };
+    items.sort_by(|left, right| left.centroid[axis].total_cmp(&right.centroid[axis]));
+    items.len() / 2
+}
+
+fn triangle_bvh_sah_split(items: &mut [TriangleBvhBuildItem]) -> Option<usize> {
+    const BIN_COUNT: usize = 16;
+    let centroid_minimum = items.iter().fold(Vec3::splat(f32::INFINITY), |minimum, item| minimum.min(item.centroid));
+    let centroid_maximum = items.iter().fold(Vec3::splat(f32::NEG_INFINITY), |maximum, item| maximum.max(item.centroid));
+    let mut best_split = None;
+    let mut best_cost = f32::INFINITY;
+    for axis in 0..3 {
+        let minimum = centroid_minimum[axis];
+        let extent = centroid_maximum[axis] - minimum;
+        if extent <= 0.000001 {
+            continue;
+        }
+        let mut bin_counts = [0_usize; BIN_COUNT];
+        let mut bin_bounds = [GeometryBounds { minimum: Vec3::splat(f32::INFINITY), maximum: Vec3::splat(f32::NEG_INFINITY) }; BIN_COUNT];
+        for item in items.iter() {
+            let bin = (((item.centroid[axis] - minimum) / extent * BIN_COUNT as f32) as usize).min(BIN_COUNT - 1);
+            bin_counts[bin] += 1;
+            bin_bounds[bin].minimum = bin_bounds[bin].minimum.min(item.bounds.minimum);
+            bin_bounds[bin].maximum = bin_bounds[bin].maximum.max(item.bounds.maximum);
+        }
+        let mut left_counts = [0_usize; BIN_COUNT - 1];
+        let mut right_counts = [0_usize; BIN_COUNT - 1];
+        let mut left_bounds = [GeometryBounds { minimum: Vec3::splat(f32::INFINITY), maximum: Vec3::splat(f32::NEG_INFINITY) }; BIN_COUNT - 1];
+        let mut right_bounds = left_bounds;
+        let mut count = 0;
+        let mut bounds = GeometryBounds { minimum: Vec3::splat(f32::INFINITY), maximum: Vec3::splat(f32::NEG_INFINITY) };
+        for bin in 0..BIN_COUNT - 1 {
+            count += bin_counts[bin];
+            if bin_counts[bin] > 0 {
+                bounds.minimum = bounds.minimum.min(bin_bounds[bin].minimum);
+                bounds.maximum = bounds.maximum.max(bin_bounds[bin].maximum);
+            }
+            left_counts[bin] = count;
+            left_bounds[bin] = bounds;
+        }
+        count = 0;
+        bounds = GeometryBounds { minimum: Vec3::splat(f32::INFINITY), maximum: Vec3::splat(f32::NEG_INFINITY) };
+        for bin in (1..BIN_COUNT).rev() {
+            count += bin_counts[bin];
+            if bin_counts[bin] > 0 {
+                bounds.minimum = bounds.minimum.min(bin_bounds[bin].minimum);
+                bounds.maximum = bounds.maximum.max(bin_bounds[bin].maximum);
+            }
+            right_counts[bin - 1] = count;
+            right_bounds[bin - 1] = bounds;
+        }
+        for split_bin in 0..BIN_COUNT - 1 {
+            if left_counts[split_bin] == 0 || right_counts[split_bin] == 0 {
+                continue;
+            }
+            let cost = bounds_surface_area(left_bounds[split_bin]) * left_counts[split_bin] as f32 + bounds_surface_area(right_bounds[split_bin]) * right_counts[split_bin] as f32;
+            if cost < best_cost {
+                best_cost = cost;
+                best_split = Some((axis, split_bin, minimum, extent));
+            }
+        }
+    }
+    let (axis, split_bin, minimum, extent) = best_split?;
+    let mut split = 0;
+    for index in 0..items.len() {
+        let bin = (((items[index].centroid[axis] - minimum) / extent * BIN_COUNT as f32) as usize).min(BIN_COUNT - 1);
+        if bin <= split_bin {
+            items.swap(index, split);
+            split += 1;
+        }
+    }
+    (split > 0 && split < items.len()).then_some(split)
+}
+
+fn bounds_surface_area(bounds: GeometryBounds) -> f32 {
+    let extent = (bounds.maximum - bounds.minimum).max(Vec3::ZERO);
+    2.0 * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x)
 }
 
 fn populate_surface_triangle_visibility(inspection: &mut RendererRadianceSurfaceInspection, meshes: &[SurfaceInspectionMesh]) {
@@ -5144,6 +5971,84 @@ fn probe_sky_visibility(position: Vec3, visibility_grid: &VisibilityGrid) -> f32
 }
 
 #[cfg(test)]
+mod triangle_bvh_tests {
+    use super::*;
+
+    fn bvh_segment_hit(start: Vec3, end: Vec3, nodes: &[TriangleBvhNode], triangles: &[TriangleBvhTriangle]) -> bool {
+        let segment = end - start;
+        let segment_length = segment.length();
+        let direction = segment / segment_length;
+        let endpoint_epsilon = 0.001_f32.max(segment_length * 0.00001);
+        let mut node_index = 0;
+        for _ in 0..nodes.len() {
+            if node_index >= nodes.len() {
+                break;
+            }
+            let node = nodes[node_index];
+            let node_bounds = GeometryBounds { minimum: Vec3::new(node.minimum[0], node.minimum[1], node.minimum[2]), maximum: Vec3::new(node.maximum[0], node.maximum[1], node.maximum[2]) };
+            if !segment_intersects_bounds(start, direction, segment_length, node_bounds) {
+                node_index = node.metadata[3] as usize;
+                continue;
+            }
+            for triangle_index in node.metadata[1]..node.metadata[1] + node.metadata[2] {
+                let triangle = triangles[triangle_index as usize];
+                let vertices = triangle.vertices.map(|vertex| Vec3::new(vertex[0], vertex[1], vertex[2]));
+                if segment_triangle_intersection(start, direction, segment_length, endpoint_epsilon, vertices).is_some() {
+                    return true;
+                }
+            }
+            node_index += 1;
+        }
+        false
+    }
+
+    #[test]
+    fn median_and_sah_bvhs_match_brute_force_segment_visibility() {
+        let triangles = (0..128)
+            .map(|triangle_index| {
+                let x = (triangle_index % 16) as f32 - 8.0;
+                let y = (triangle_index / 16) as f32 - 4.0;
+                let z = (triangle_index * 13 % 19) as f32 * 0.15;
+                let origin = Vec3::new(x, y, z);
+                SurfaceInspectionTriangle { vertices: [origin, origin + Vec3::X * 0.8, origin + Vec3::Y * 0.8], triangle_index }
+            })
+            .collect::<Vec<_>>();
+        let bounds = triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+            .fold((Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |(minimum, maximum), vertex| (minimum.min(vertex), maximum.max(vertex)));
+        let meshes = [SurfaceInspectionMesh { instance_index: 0, bounds: GeometryBounds { minimum: bounds.0, maximum: bounds.1 }, triangles }];
+        for strategy in [TriangleBvhBuildStrategy::Median, TriangleBvhBuildStrategy::Sah] {
+            let (nodes, bvh_triangles) = build_triangle_bvh(&meshes, strategy);
+            for ray_index in 0..512 {
+                let x = (ray_index * 37 % 240) as f32 * 0.1 - 12.0;
+                let y = (ray_index * 71 % 120) as f32 * 0.1 - 6.0;
+                let start = Vec3::new(x, y, -1.0);
+                let end = Vec3::new(x + 0.013 * (ray_index % 9) as f32, y - 0.017 * (ray_index % 7) as f32, 4.0);
+                assert_eq!(bvh_segment_hit(start, end, &nodes, &bvh_triangles), closest_surface_triangle_hit(start, end, &meshes).is_some(), "{strategy:?} ray {ray_index} visibility differed");
+            }
+        }
+
+        let (mut nodes, mut bvh_triangles) = build_triangle_bvh(&meshes, TriangleBvhBuildStrategy::Sah);
+        let mut moved_meshes = meshes.clone();
+        let translation = Vec3::new(14.0, -5.0, 2.0);
+        moved_meshes[0].bounds.minimum += translation;
+        moved_meshes[0].bounds.maximum += translation;
+        for triangle in &mut moved_meshes[0].triangles {
+            triangle.vertices = triangle.vertices.map(|vertex| vertex + translation);
+        }
+        assert!(refit_triangle_bvh_data(&mut nodes, &mut bvh_triangles, &moved_meshes));
+        for ray_index in 0..512 {
+            let x = (ray_index * 37 % 240) as f32 * 0.1 - 12.0;
+            let y = (ray_index * 71 % 120) as f32 * 0.1 - 6.0;
+            let start = Vec3::new(x, y, -1.0) + translation;
+            let end = Vec3::new(x + 0.013 * (ray_index % 9) as f32, y - 0.017 * (ray_index % 7) as f32, 4.0) + translation;
+            assert_eq!(bvh_segment_hit(start, end, &nodes, &bvh_triangles), closest_surface_triangle_hit(start, end, &moved_meshes).is_some(), "refitted ray {ray_index} visibility differed");
+        }
+    }
+}
+
+#[cfg(test)]
 mod sdf_clearance_tests {
     use super::*;
 
@@ -5178,6 +6083,24 @@ mod sdf_clearance_tests {
         assert!(clipmap.update(scene_bounds, &geometries).is_none(), "camera movement must not shift the static SDF");
         assert!(geometry_samples.iter().all(|position| occupied_at(&clipmap, *position)));
     }
+
+    #[test]
+    fn incremental_sdf_update_matches_full_rebuild_after_geometry_motion() {
+        let geometries = [
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) }, albedo: Vec3::new(0.7, 0.3, 0.1), emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+        ];
+        let moved_geometries = [geometries[0], SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.5, 0.0, -2.0), maximum: Vec3::new(3.52, 3.0, 2.0) }, ..geometries[1] }, geometries[2]];
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-8.0), maximum: Vec3::splat(8.0) };
+        let mut incremental = SdfClipmap::new(scene_bounds, &geometries);
+        let update = incremental.update(scene_bounds, &moved_geometries).expect("moving geometry must update the field");
+        let rebuilt = SdfClipmap::new(scene_bounds, &moved_geometries);
+
+        assert!(update.voxels_updated < SDF_CLIPMAP_RESOLUTION.iter().product());
+        assert_eq!(incremental.values, rebuilt.values);
+        assert_eq!(incremental.emission_values, rebuilt.emission_values);
+    }
 }
 
 #[cfg(test)]
@@ -5208,7 +6131,7 @@ mod radiance_field_tests {
         let sdf_minimum = static_grid_minimum(bounds_center(large_bounds), sdf_extent);
         let sdf_maximum = sdf_minimum + sdf_extent;
         let mut field = WorldRadianceField::new(small_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
-        field.uniform(false, None);
+        field.uniform(false, RadianceAngularResolution::default().segment_count());
 
         assert!(sdf_minimum.cmple(large_bounds.minimum - SCENE_GI_PADDING).all());
         assert!(sdf_maximum.cmpge(large_bounds.maximum + SCENE_GI_PADDING).all());
@@ -5217,7 +6140,7 @@ mod radiance_field_tests {
         assert!(field.minimum.cmple(large_bounds.minimum - SCENE_GI_PADDING).all());
         assert!(field.maximum.cmpge(large_bounds.maximum + SCENE_GI_PADDING).all());
         assert!(field.cell_size.x > 4.0);
-        field.uniform(false, None);
+        field.uniform(false, RadianceAngularResolution::default().segment_count());
         assert!(field.reanchor(small_bounds, RADIANCE_FIELD_EXTENT));
         assert!(field.needs_full_refresh);
         assert_eq!(field.cell_size, Vec3::splat(4.0));
@@ -5228,9 +6151,9 @@ mod radiance_field_tests {
         let resolution = RADIANCE_FIELD_DEFAULT_RESOLUTION;
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
         let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, resolution);
-        let initial = field.uniform(true, None);
+        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count());
         let fixed_minimum = field.minimum;
-        let next = field.uniform(true, None);
+        let next = field.uniform(true, RadianceAngularResolution::default().segment_count());
 
         assert_eq!(initial.settings[3] & 1, 1);
         assert_eq!(next.settings[3] & 1, 0);
@@ -5241,26 +6164,26 @@ mod radiance_field_tests {
     fn radiance_refinement_updates_the_full_field_and_refinement_is_toggleable() {
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
         let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
-        let initial = field.uniform(true, None);
+        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count());
         assert_eq!(initial.settings[3] & 1, 1);
         assert_eq!(initial.settings[3] & 4, 4);
         assert_eq!(initial.schedule_metadata[0], 0);
         assert_eq!(initial.schedule_metadata[1], 1);
 
-        let continuous_update = field.uniform(true, None);
+        let continuous_update = field.uniform(true, RadianceAngularResolution::default().segment_count());
         assert_eq!(continuous_update.schedule_metadata[0], 0);
         assert_eq!(continuous_update.schedule_metadata[1], 1);
 
         field.refresh_temporally(true);
-        let changed = field.uniform(true, None);
+        let changed = field.uniform(true, RadianceAngularResolution::default().segment_count());
         assert_eq!(changed.settings[3] & 2, 2);
         assert_eq!(changed.schedule_metadata[0], 0);
         assert_eq!(changed.schedule_metadata[1], 1);
 
-        let refinement_disabled = field.uniform(false, None);
+        let refinement_disabled = field.uniform(false, RadianceAngularResolution::default().segment_count());
         assert_eq!(refinement_disabled.settings[3] & 4, 0);
 
-        let disabled_update = field.uniform(false, None);
+        let disabled_update = field.uniform(false, RadianceAngularResolution::default().segment_count());
         assert_eq!(disabled_update.schedule_metadata[0], 0);
         assert_eq!(disabled_update.schedule_metadata[1], 0);
     }

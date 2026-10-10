@@ -22,8 +22,13 @@ struct RadianceFieldData {
     settings: vec4<u32>,
 };
 
+struct RadianceFieldAngularSample {
+    radiance: vec4<f32>,
+    sampling: vec4<u32>,
+};
+
 struct RadianceFieldValues {
-    values: array<vec4<f32>>,
+    values: array<RadianceFieldAngularSample>,
 };
 
 struct RadianceFieldTraceDebug {
@@ -90,8 +95,7 @@ var<storage, read> radiance_field_trace_debug: RadianceFieldTraceDebugValues;
 var<uniform> selected_radiance_cell: SelectedRadianceCell;
 
 const SURFACE_PROBE_CAPACITY: u32 = 131072u;
-const RADIANCE_FIELD_CHANNELS: u32 = 6u;
-const RADIANCE_FIELD_RAY_COUNT: u32 = 24u;
+const RADIANCE_FIELD_RAY_COUNT: u32 = 2u;
 const TRACE_TERMINATION_HIT: u32 = 1u;
 const TRACE_TERMINATION_MAX_STEPS: u32 = 2u;
 const TRACE_TERMINATION_MAX_DISTANCE: u32 = 3u;
@@ -148,11 +152,13 @@ fn field_radiance(index: u32, field: RadianceFieldData) -> vec3<f32> {
     let logical = vec3<u32>(index % resolution.x, (index / resolution.x) % resolution.y, index / (resolution.x * resolution.y));
     let physical = logical;
     let physical_index = field_cell_index(physical, resolution);
-    for (var lobe = 0u; lobe < RADIANCE_FIELD_CHANNELS; lobe++) {
-        let value = radiance_field_values.values[physical_index * RADIANCE_FIELD_CHANNELS + lobe];
-        result += value.rgb * value.a;
+    for (var region_index = 0u; region_index < field.settings.z; region_index++) {
+        let value = radiance_field_values.values[physical_index * 64u + region_index];
+        if value.sampling.x > 0u {
+            result += value.radiance.rgb;
+        }
     }
-    return result / f32(RADIANCE_FIELD_CHANNELS);
+    return result / f32(max(field.settings.z, 1u));
 }
 
 fn field_cell_position(index: u32, field: RadianceFieldData) -> vec3<f32> {
@@ -230,11 +236,7 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
         if trace_instance < RADIANCE_FIELD_RAY_COUNT {
             let selected_ray = selected_radiance_cell.trace_options.x;
             let radiance_mode = selected_radiance_cell.trace_options.y == 1u;
-            let overview_enabled = selected_radiance_cell.trace_options.z != 0u;
             let selected_ray_active = trace_instance == selected_ray;
-            if !overview_enabled && !selected_ray_active {
-                return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
-            }
             let trace_data_index = trace_offset + physical_cell_index * RADIANCE_FIELD_RAY_COUNT + trace_instance;
             let trace = radiance_field_trace_debug.values[trace_data_index];
             let origin = trace.probe_position.xyz;
@@ -246,14 +248,21 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
             let hit = termination_reason == TRACE_TERMINATION_HIT;
             let valid = trace.probe_position.w > 0.5 && direction_is_valid && all(abs(hit_position) < vec3<f32>(1e20));
             let invalid_color = vec3<f32>(1.0, 0.08, 0.05);
-            let geometry_color = select(vec3<f32>(1.0, 0.5, 0.08), vec3<f32>(0.1, 1.0, 0.2), hit);
+            var geometry_color = select(vec3<f32>(1.0, 0.5, 0.08), vec3<f32>(0.1, 1.0, 0.2), hit);
+            if trace_instance == 1u {
+                geometry_color = select(vec3<f32>(0.72, 0.28, 1.0), vec3<f32>(0.12, 0.78, 1.0), hit);
+            }
             let radiance_marker_color = select(select(display_radiance(trace.radiance.rgb), vec3<f32>(1.0, 0.5, 0.08), !hit), invalid_color, !valid);
-            let ray_color = select(select(geometry_color, vec3<f32>(0.92), radiance_mode), invalid_color, !valid);
+            var radiance_ray_color = vec3<f32>(0.92);
+            if trace_instance == 1u {
+                radiance_ray_color = vec3<f32>(0.35, 0.78, 1.0);
+            }
+            let ray_color = select(select(geometry_color, radiance_ray_color, radiance_mode), invalid_color, !valid);
             let termination_color = select(trace_termination_color(termination_reason), invalid_color, !valid);
             let sampled_distance = select(trace.hit_normal_distance.x, 0.0, hit);
             let distance_color = select(sampled_sdf_distance_color(sampled_distance), invalid_color, !valid);
             let marker_position = select(origin + direction * 0.2, hit_position, valid);
-            let trace_alpha = select(0.2, 0.95, selected_ray_active);
+            let trace_alpha = select(0.55, 0.95, selected_ray_active);
             if (termination_reason == 5u || trace.probe_position.w <= 0.5) && vertex_index < 28u {
                 return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
             }

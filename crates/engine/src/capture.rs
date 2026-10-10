@@ -18,6 +18,9 @@ pub struct DebugCapture {
     render_effects: Option<(bool, bool, bool)>,
     ambient_occlusion: Option<bool>,
     direct_light_visibility: Option<bool>,
+    triangle_probe_occlusion: Option<bool>,
+    triangle_probe_diagnostics: Option<bool>,
+    triangle_probe_bvh_sah: Option<bool>,
     shadow_quality: Option<u8>,
     render_mode: Option<CaptureRenderMode>,
     ui_enabled: Option<bool>,
@@ -45,6 +48,9 @@ impl DebugCapture {
             render_effects: None,
             ambient_occlusion: None,
             direct_light_visibility: None,
+            triangle_probe_occlusion: None,
+            triangle_probe_diagnostics: None,
+            triangle_probe_bvh_sah: None,
             shadow_quality: None,
             render_mode: None,
             ui_enabled: None,
@@ -72,6 +78,18 @@ impl DebugCapture {
                 }
                 CaptureAction::SetDirectLightVisibility(enabled) => {
                     self.direct_light_visibility = Some(*enabled);
+                    self.action_index += 1;
+                }
+                CaptureAction::SetTriangleProbeOcclusion(enabled) => {
+                    self.triangle_probe_occlusion = Some(*enabled);
+                    self.action_index += 1;
+                }
+                CaptureAction::SetTriangleProbeDiagnostics(enabled) => {
+                    self.triangle_probe_diagnostics = Some(*enabled);
+                    self.action_index += 1;
+                }
+                CaptureAction::SetTriangleProbeBvhSah(enabled) => {
+                    self.triangle_probe_bvh_sah = Some(*enabled);
                     self.action_index += 1;
                 }
                 CaptureAction::SetShadowQuality(quality) => {
@@ -175,17 +193,21 @@ impl DebugCapture {
         let path = directory.join(format!("{file_name}.txt"));
         let stats = renderer.performance_stats();
         let contents = format!(
-            "frame_cpu_ms={:.3}\ngpu_shadow_ms={:.3}\ngpu_scene_ms={:.3}\ngpu_sdf_gi_ms={:.3}\ngpu_gizmo_ms={:.3}\ngpu_ui_ms={:.3}\ngpu_total_ms={:.3}\nlight_update_ms={:.3}\ninstance_update_ms={:.3}\nsdf_build_cpu_ms={:.3}\nsdf_upload_ms={:.3}\nsdf_voxels_updated={}\ngi_history_valid_percent={:.1}\nprobe_update_ms={:.3}\nirradiance_upload_ms={:.3}\nvisibility_rebuild_ms={:.3}\nprobes_updated={}\nprobe_budget={}\nstatic_samples={}\ndynamic_samples={}\nregions={}\n",
+            "frame_cpu_ms={:.3}\ngpu_shadow_ms={:.3}\ngpu_scene_ms={:.3}\ngpu_sdf_gi_ms={:.3}\ngpu_sdf_update_ms={:.3}\ngpu_gizmo_ms={:.3}\ngpu_ui_ms={:.3}\ngpu_total_ms={:.3}\nlight_update_ms={:.3}\ninstance_update_ms={:.3}\nsdf_build_cpu_ms={:.3}\nsdf_geometry_bvh_build_ms={:.3}\nsdf_voxel_build_ms={:.3}\nsdf_clearance_build_ms={:.3}\nsdf_upload_ms={:.3}\nsdf_voxels_updated={}\ngi_history_valid_percent={:.1}\nprobe_update_ms={:.3}\nirradiance_upload_ms={:.3}\nvisibility_rebuild_ms={:.3}\nprobes_updated={}\nprobe_budget={}\nstatic_samples={}\ndynamic_samples={}\nregions={}\ntriangle_bvh_segments={}\ntriangle_bvh_bounds_tests={}\ntriangle_bvh_triangle_tests={}\ntriangle_bvh_hits={}\ntriangle_bvh_build_ms={:.3}\ntriangle_bvh_refit_ms={:.3}\ntriangle_bvh_node_count={}\ntriangle_bvh_triangle_count={}\n",
             stats.frame_cpu_ms,
             stats.gpu_shadow_ms,
             stats.gpu_scene_ms,
             stats.gpu_sdf_gi_ms,
+            stats.gpu_sdf_update_ms,
             stats.gpu_gizmo_ms,
             stats.gpu_ui_ms,
             stats.gpu_total_ms,
             stats.light_update_ms,
             stats.instance_update_ms,
             stats.sdf_build_cpu_ms,
+            stats.sdf_geometry_bvh_build_ms,
+            stats.sdf_voxel_build_ms,
+            stats.sdf_clearance_build_ms,
             stats.sdf_upload_ms,
             stats.sdf_voxels_updated,
             stats.gi_history_valid_percent,
@@ -197,6 +219,14 @@ impl DebugCapture {
             stats.static_sample_count,
             stats.dynamic_sample_count,
             stats.region_count,
+            stats.triangle_bvh_segments,
+            stats.triangle_bvh_bounds_tests,
+            stats.triangle_bvh_triangle_tests,
+            stats.triangle_bvh_hits,
+            stats.triangle_bvh_build_ms,
+            stats.triangle_bvh_refit_ms,
+            stats.triangle_bvh_node_count,
+            stats.triangle_bvh_triangle_count,
         );
         fs::write(&path, contents).map_err(|error| format!("failed to write performance report: {error}"))?;
         eprintln!("Performance report written to {}", path.display());
@@ -233,6 +263,18 @@ impl DebugCapture {
 
     pub fn direct_light_visibility(&self) -> Option<bool> {
         self.direct_light_visibility
+    }
+
+    pub fn triangle_probe_occlusion(&self) -> Option<bool> {
+        self.triangle_probe_occlusion
+    }
+
+    pub fn triangle_probe_diagnostics(&self) -> Option<bool> {
+        self.triangle_probe_diagnostics
+    }
+
+    pub fn triangle_probe_bvh_sah(&self) -> Option<bool> {
+        self.triangle_probe_bvh_sah
     }
 
     pub fn ui_enabled(&self) -> Option<bool> {

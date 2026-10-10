@@ -227,9 +227,10 @@ impl DebugPanels {
 
         let delta_seconds = context.time.delta_seconds().max(0.0001);
         let stats = context.performance_stats;
-        context
-            .ui
-            .set_label_text(self.performance_label, format!("CPU {:.1} ms | SDF {:.2}/{:.2} ms | GI {:.2} ms", stats.frame_cpu_ms, stats.sdf_build_cpu_ms, stats.sdf_upload_ms, stats.gpu_sdf_gi_ms));
+        context.ui.set_label_text(
+            self.performance_label,
+            format!("CPU {:.1} ms | SDF CPU {:.2} GPU {:.2} | GI {:.2} ms", stats.frame_cpu_ms, stats.sdf_build_cpu_ms, stats.gpu_sdf_update_ms, stats.gpu_sdf_gi_ms),
+        );
         let fps = 1.0 / delta_seconds;
         self.smoothed_fps = if self.smoothed_fps == 0.0 { fps } else { self.smoothed_fps + (fps - self.smoothed_fps) * 0.1 };
         self.frame_history.push(delta_seconds * 1000.0);

@@ -21,6 +21,7 @@ The host loads the script after application setup. On each redraw, the coordinat
 | [Scripting](scripting.md) | Capture | CapturePlan | After setup |
 | [Windowing](windowing.md) | Capture | Active camera, scene, and frame delta | Each redraw |
 | Capture | [Math](math.md) | Camera poses and interpolation | Camera actions |
+| Capture | [Rendering](rendering.md) | Scripted render-setting overrides, including triangle-BVH visibility filtering | Each redraw after application update |
 | Capture | [Rendering](rendering.md) | Custom-resolution capture request | After normal render |
 | Capture | Filesystem | Validated PNG path, RGBA pixels, and depth buffer exports | Screenshot action |
 | Capture | [Windowing](windowing.md) | Exit request | Plan completion |
@@ -31,6 +32,9 @@ The lighting example's scripts/capture.rhai produced multiple 1280×720 PNG imag
 Capture scripts can independently toggle ambient occlusion with capture.set_ambient_occlusion(bool), separate from direct shadows and irradiance.
 CaptureRenderMode supports shadow_visibility for direct-light visibility diagnostics.
 Capture scripts can toggle direct-light shadow multiplication with set_direct_light_visibility(bool).
+Capture scripts can toggle the triangle-BVH visibility filter for AABB-SDF radiance-field sampling with set_triangle_probe_occlusion(bool); this override remains active for the rest of the plan and is applied after the application update on each redraw.
+Capture scripts can enable opt-in triangle-BVH traversal counters with set_triangle_probe_diagnostics(bool). The next performance report reads segment, bounds-test, triangle-test, and hit counts from the rendered frame; counter collection is disabled by default and adds atomic operations when enabled.
+Capture scripts can switch the triangle-BVH builder with set_triangle_probe_bvh_sah(bool). The Genos builder A/B script records five median-builder reports, five SAH-builder reports, then five median repeat reports in one run; the repeat helps show timing drift across the capture.
 
 The renderer owns GPU readback staging and returns `CapturedFrame` with scene depth plus directional, spot, and point shadow depth layers. It leaves unused light-family layers empty, so a point-only scene does not produce directional or spot images. The engine capture coordinator owns filenames and encodes each depth layer as an occluder-presence grayscale PNG: cleared depth is black and nearer geometry is brighter, with a mild contrast curve. Scene-depth previews linearize using the active camera near/far clip range, improving contrast without changing the camera or renderer depth buffer. This keeps GPU resource ownership in rendering while making the relevant diagnostic depth surfaces available to offline analysis.
 CaptureRenderMode supports gi_only for viewing probe irradiance without direct lighting, shadows, material albedo, or emission. This isolates whether shadowed receivers still receive indirect lighting.

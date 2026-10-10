@@ -31,9 +31,9 @@ pub use input::InputState;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
 pub use mesh::{Material, Mesh, MeshInstance, MeshVertex};
 pub use renderer::{
-    GraphicsApi, RADIANCE_FIELD_CHANNEL_COUNT, RADIANCE_FIELD_RAY_COUNT, RADIANCE_FIELD_RAYS_PER_CHANNEL, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceFieldResolution, RenderDebugMode, RenderSettings,
-    RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceFieldGrid, RendererRadianceSurfaceCandidate,
-    RendererRadianceSurfaceInspection, RendererSkyLighting, ShadowQuality,
+    GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldResolution, RenderDebugMode, RenderSettings,
+    RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceAngularSegment, RendererRadianceFieldGrid,
+    RendererRadianceSurfaceCandidate, RendererRadianceSurfaceInspection, RendererSkyLighting, ShadowQuality,
 };
 pub use scene::{CameraId, LightId, MeshId, Scene};
 pub use time::{Time, TimeScaleId};
@@ -92,6 +92,9 @@ pub struct RuntimeContext {
     pub sky_lighting: RendererSkyLighting,
     pub performance_stats: RendererPerformanceStats,
     pub gi_trace_diagnostics: [RendererGiRayDiagnostic; RADIANCE_FIELD_RAY_COUNT],
+    pub gi_angular_resolution: RadianceAngularResolution,
+    pub gi_angular_segments: [RendererRadianceAngularSegment; RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS],
+    pub gi_angular_segments_cell: [u32; 3],
     /// Latest GPU-evaluated surface point and its eight radiance-field contributions.
     pub gi_surface_inspection: RendererRadianceSurfaceInspection,
     /// Whether a surface contribution pick is queued or being read back.
@@ -102,7 +105,6 @@ pub struct RuntimeContext {
     pub gi_surface_inspector_enabled: bool,
     pub gi_trace_selected_ray: u32,
     pub gi_trace_debug_mode: RendererGiTraceDebugMode,
-    pub gi_trace_overview_enabled: bool,
     pub gizmos: GizmoCanvas,
     pub gizmos_enabled: bool,
     pub normal_gizmos_enabled: bool,
@@ -203,13 +205,15 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         sky_lighting: RendererSkyLighting::default(),
         performance_stats: RendererPerformanceStats::default(),
         gi_trace_diagnostics: [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT],
+        gi_angular_resolution: RadianceAngularResolution::default(),
+        gi_angular_segments: [RendererRadianceAngularSegment::default(); RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS],
+        gi_angular_segments_cell: [u32::MAX; 3],
         gi_surface_inspection: RendererRadianceSurfaceInspection::default(),
         gi_surface_inspection_pending: false,
         gi_surface_inspector_pick_request: None,
         gi_surface_inspector_enabled: false,
         gi_trace_selected_ray: 0,
         gi_trace_debug_mode: RendererGiTraceDebugMode::Geometry,
-        gi_trace_overview_enabled: false,
         gizmos: GizmoCanvas::default(),
         gizmos_enabled: false,
         normal_gizmos_enabled: false,
@@ -460,6 +464,11 @@ where
                     if let Some(direct_light_visibility_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::direct_light_visibility) {
                         self.context.render_settings.direct_light_visibility_enabled = direct_light_visibility_enabled;
                     }
+                    if let Some(triangle_probe_occlusion_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::triangle_probe_occlusion) {
+                        self.context.render_settings.triangle_probe_occlusion_enabled = triangle_probe_occlusion_enabled;
+                    }
+                    let triangle_probe_diagnostics_enabled = self.context.debug_capture.as_ref().and_then(DebugCapture::triangle_probe_diagnostics).unwrap_or(false);
+                    let triangle_probe_bvh_sah_enabled = self.context.debug_capture.as_ref().and_then(DebugCapture::triangle_probe_bvh_sah).unwrap_or(true);
                     if let Some(quality) = self.context.debug_capture.as_ref().and_then(DebugCapture::shadow_quality) {
                         let quality = match quality {
                             0 => ShadowQuality::Low,
@@ -513,10 +522,13 @@ where
                     let irradiance_volumes =
                         camera.map(|camera| renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera)).unwrap_or_default();
                     let result = result.and_then(|_| renderer.update_lights(&lights)).and_then(|_| renderer.update_instances(self.context.scene.instances())).and_then(|_| {
+                        renderer.set_triangle_bvh_sah_enabled(triangle_probe_bvh_sah_enabled);
                         renderer.set_irradiance_update_budget(self.context.irradiance_update_budget);
                         renderer.update_render_settings(self.context.render_settings);
+                        renderer.set_triangle_bvh_diagnostics_enabled(triangle_probe_diagnostics_enabled);
                         renderer.update_sky_lighting(self.context.sky_lighting);
                         renderer.set_gi_radiance_temporal_accumulation_enabled(self.context.gi_radiance_temporal_accumulation_enabled);
+                        renderer.set_radiance_angular_resolution(self.context.gi_angular_resolution);
                         renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights, self.context.irradiance_mode == IrradianceMode::AabbSdf);
                         self.context.gi_radiance_field_grid = renderer.radiance_field_grid();
                         self.context.performance_stats = renderer.performance_stats();
@@ -526,7 +538,7 @@ where
                         renderer.set_world_radiance_gizmos_enabled(self.context.gi_global_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.set_world_radiance_trace_gizmos_enabled(self.context.gi_trace_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.set_selected_radiance_cell(self.context.gi_selected_radiance_cell);
-                        renderer.set_selected_radiance_trace_options(self.context.gi_trace_selected_ray, self.context.gi_trace_debug_mode, self.context.gi_trace_overview_enabled);
+                        renderer.set_selected_radiance_trace_options(self.context.gi_trace_selected_ray, self.context.gi_trace_debug_mode);
                         if let Some(pixel) = self.context.gi_surface_inspector_pick_request.take() {
                             renderer.request_radiance_surface_inspection(pixel);
                         }
@@ -535,6 +547,8 @@ where
                         renderer.update_ui(&ui_vertices);
                         renderer.render()?;
                         self.context.gi_trace_diagnostics = renderer.gi_trace_diagnostics();
+                        self.context.gi_angular_segments = renderer.radiance_angular_segments();
+                        self.context.gi_angular_segments_cell = renderer.radiance_angular_segments_cell();
                         self.context.gi_surface_inspection = renderer.radiance_surface_inspection();
                         self.context.gi_surface_inspection_pending = renderer.radiance_surface_inspection_pending();
                         Ok(())
@@ -549,6 +563,10 @@ where
                         if self.context.request_gpu_timing_sample || capture_report_requested {
                             self.context.request_gpu_timing_sample = false;
                             renderer.update_gpu_timestamps()?;
+                            self.context.performance_stats = renderer.performance_stats();
+                        }
+                        if capture_report_requested {
+                            renderer.read_triangle_bvh_diagnostics()?;
                             self.context.performance_stats = renderer.performance_stats();
                         }
                         if let Some(capture) = &mut self.context.debug_capture {

@@ -73,10 +73,15 @@ struct TriangleBvhNode {
 
 struct TriangleBvhTriangle {
     vertices: array<vec4<f32>, 3>,
+    source: vec4<u32>,
 };
 
 struct TriangleBvhSettings {
     counts: vec4<u32>,
+};
+
+struct TriangleBvhDiagnostics {
+    counters: array<atomic<u32>, 4>,
 };
 
 struct RadianceFieldCandidate {
@@ -98,8 +103,13 @@ struct RadianceSurfaceInspectionSettings {
     pixel: vec4<u32>,
 };
 
+struct RadianceFieldAngularSample {
+    radiance: vec4<f32>,
+    sampling: vec4<u32>,
+};
+
 struct RadianceFieldValues {
-    values: array<vec4<f32>>,
+    values: array<RadianceFieldAngularSample>,
 };
 
 struct RadianceFieldProbeValues {
@@ -261,6 +271,9 @@ var<uniform> radiance_surface_inspection_settings: RadianceSurfaceInspectionSett
 @group(0) @binding(24)
 var<storage, read_write> radiance_surface_inspection_values: RadianceSurfaceInspectionValues;
 
+@group(0) @binding(25)
+var sdf_clearance_texture: texture_3d<f32>;
+
 @group(1) @binding(0)
 var scene_depth_texture: texture_depth_2d;
 
@@ -281,6 +294,9 @@ var<storage, read> triangle_bvh_triangles: array<TriangleBvhTriangle>;
 
 @group(1) @binding(6)
 var<uniform> triangle_bvh_settings: TriangleBvhSettings;
+
+@group(1) @binding(7)
+var<storage, read_write> triangle_bvh_diagnostics: TriangleBvhDiagnostics;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -738,7 +754,7 @@ fn trace_conservative_voxels(origin: vec3<f32>, direction: vec3<f32>, maximum_di
             return SdfTraceResult(position, normal, travelled, TRACE_TERMINATION_HIT, sdf_value.x);
         }
         let cell_center = sdf_clipmap.minimum.xyz + (vec3<f32>(coordinate) + vec3<f32>(0.5)) * voxel_size;
-        let safe_center_distance = textureLoad(sdf_emission_texture, sdf_physical_coordinate(coordinate), 0).a;
+        let safe_center_distance = textureLoad(sdf_clearance_texture, sdf_physical_coordinate(coordinate), 0).r;
         let safe_distance = max(safe_center_distance - distance(position, cell_center), 0.0);
         if safe_distance > minimum_voxel_size {
             travelled += min(safe_distance * 0.8, maximum_distance - travelled);
@@ -762,23 +778,23 @@ fn trace_conservative_voxels(origin: vec3<f32>, direction: vec3<f32>, maximum_di
     return SdfTraceResult(position, vec3<f32>(0.0), travelled, TRACE_TERMINATION_MAX_STEPS, last_sdf_distance);
 }
 
-fn radiance_lobe_direction(index: u32) -> vec3<f32> {
-    if index == 0u {
-        return vec3<f32>(1.0, 0.0, 0.0);
-    }
-    if index == 1u {
-        return vec3<f32>(-1.0, 0.0, 0.0);
-    }
-    if index == 2u {
-        return vec3<f32>(0.0, 1.0, 0.0);
-    }
-    if index == 3u {
-        return vec3<f32>(0.0, -1.0, 0.0);
-    }
-    if index == 4u {
-        return vec3<f32>(0.0, 0.0, 1.0);
-    }
-    return vec3<f32>(0.0, 0.0, -1.0);
+fn radiance_region_bands(region_count: u32) -> u32 {
+    return select(select(8u, 4u, region_count == 32u), 2u, region_count == 8u);
+}
+
+fn radiance_region_sectors(region_count: u32) -> u32 {
+    return select(8u, 4u, region_count == 8u);
+}
+
+fn radiance_region_direction(region_index: u32, region_count: u32, jitter_u: f32, jitter_v: f32) -> vec3<f32> {
+    let bands = radiance_region_bands(region_count);
+    let sectors = radiance_region_sectors(region_count);
+    let band = region_index / sectors;
+    let sector = region_index % sectors;
+    let height = 1.0 - 2.0 * (f32(band) + jitter_u) / f32(bands);
+    let azimuth = 6.28318530718 * (f32(sector) + jitter_v) / f32(sectors);
+    let radius = sqrt(max(1.0 - height * height, 0.0));
+    return vec3<f32>(radius * cos(azimuth), height, radius * sin(azimuth));
 }
 
 fn radiance_cell_seed(world_position: vec3<f32>, cell_size: vec3<f32>) -> u32 {
@@ -791,35 +807,13 @@ fn radiance_cell_seed(world_position: vec3<f32>, cell_size: vec3<f32>) -> u32 {
     return seed ^ (seed >> 13u);
 }
 
-fn radiance_sample_direction(cell_seed: u32, sample_round: u32, channel_index: u32, sample_index: u32) -> vec3<f32> {
-    let axis = radiance_lobe_direction(channel_index);
-    if sample_round == 0u && sample_index == 0u {
-        return axis;
-    }
-    let channel_seed = cell_seed ^ ((channel_index + 1u) * 0x9e3779b9u);
-    let seed_u = channel_seed * 747796405u + 2891336453u;
+fn radiance_sample_direction(cell_seed: u32, region_index: u32, region_count: u32, attempt_count: u32) -> vec3<f32> {
+    let seed = cell_seed ^ ((region_index + 1u) * 0x9e3779b9u) ^ ((attempt_count + 1u) * 0x85ebca6bu);
+    let seed_u = seed * 747796405u + 2891336453u;
     let seed_v = seed_u * 277803737u + 1171808521u;
-    let offset_u = f32(seed_u & 0x00ffffffu) / 16777216.0;
-    let offset_v = f32(seed_v & 0x00ffffffu) / 16777216.0;
-    var sample_u = 0.0;
-    var sample_v = 0.0;
-    if sample_round == 0u {
-        let equal_area_band = sample_index - 1u;
-        let band_jitter = fract(offset_u + f32(equal_area_band) * 0.61803398875);
-        sample_u = (f32(equal_area_band) + band_jitter) / 3.0;
-        sample_v = fract(f32(sample_index) * 0.61803398875 + offset_v);
-    } else {
-        let sequence_index = sample_round * 4u - 1u + sample_index;
-        sample_u = fract((f32(sequence_index) + 0.5) * 0.75487766625 + offset_u);
-        sample_v = fract((f32(sequence_index) + 0.5) * 0.56984029099 + offset_v);
-    }
-    let cosine_theta = sample_u;
-    let sine_theta = sqrt(max(1.0 - cosine_theta * cosine_theta, 0.0));
-    let angle = 6.28318530718 * sample_v;
-    let reference_axis = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(axis.y) > 0.99);
-    let tangent = normalize(cross(reference_axis, axis));
-    let bitangent = cross(axis, tangent);
-    return normalize(axis * cosine_theta + sine_theta * (tangent * cos(angle) + bitangent * sin(angle)));
+    let jitter_u = (f32(seed_u & 0x00ffffffu) + 0.5) / 16777216.0;
+    let jitter_v = (f32(seed_v & 0x00ffffffu) + 0.5) / 16777216.0;
+    return radiance_region_direction(region_index, region_count, jitter_u, jitter_v);
 }
 
 fn trace_world_radiance(origin: vec3<f32>, direction: vec3<f32>) -> RadianceTraceResult {
@@ -840,23 +834,6 @@ fn radiance_field_cell_index(coordinate: vec3<u32>, resolution: vec3<u32>) -> u3
     return coordinate.x + coordinate.y * resolution.x + coordinate.z * resolution.x * resolution.y;
 }
 
-fn radiance_camera_snapshot_due(world_position: vec3<f32>, cell_seed: u32, frame_index: u32) -> bool {
-    let clip_position = camera.view_projection * vec4<f32>(world_position, 1.0);
-    if clip_position.w <= 0.0 || abs(clip_position.x) > clip_position.w || abs(clip_position.y) > clip_position.w || clip_position.z < 0.0 || clip_position.z > clip_position.w {
-        return false;
-    }
-    let camera_distance = distance(camera.camera_position.xyz, world_position);
-    var refresh_interval = 0u;
-    if camera_distance < 8.0 {
-        refresh_interval = 120u;
-    } else if camera_distance < 24.0 {
-        refresh_interval = 360u;
-    } else if camera_distance < 64.0 {
-        refresh_interval = 900u;
-    }
-    return refresh_interval > 0u && (frame_index + cell_seed) % refresh_interval == 0u;
-}
-
 fn update_radiance_field_cell(invocation: vec3<u32>, field: RadianceFieldData) {
     let resolution = field.resolution.xyz;
     if any(invocation >= resolution) {
@@ -866,20 +843,16 @@ fn update_radiance_field_cell(invocation: vec3<u32>, field: RadianceFieldData) {
     let cell_size = (field.maximum.xyz - field.minimum.xyz) / vec3<f32>(resolution);
     let world_position = field.minimum.xyz + (vec3<f32>(invocation) + vec3<f32>(0.5)) * cell_size;
     let physical_coordinate = invocation;
-    let physical_value_index = radiance_field_cell_index(physical_coordinate, resolution) * field.settings.z;
+    let physical_value_index = radiance_field_cell_index(physical_coordinate, resolution) * 64u;
     let physical_probe_index = logical_index;
     let physical_trace_index = radiance_field_cell_index(physical_coordinate, resolution) * field.settings.y;
     let debug_field_offset = 0u;
     let cell_seed = radiance_cell_seed(world_position, cell_size);
     let full_refresh = (field.settings.w & 1u) != 0u;
-    let temporal_accumulation_enabled = (field.settings.w & 4u) != 0u;
-    let dirty_refresh = (field.settings.w & 2u) != 0u;
     let new_cell = full_refresh;
     var scheduled_refresh = field.schedule_metadata.y != 0u;
-    var sample_round = select(0u, 1u, scheduled_refresh);
     if full_refresh {
         scheduled_refresh = true;
-        sample_round = 0u;
     }
     if !scheduled_refresh {
         for (var schedule_index = 0u; schedule_index < field.schedule_metadata.x; schedule_index++) {
@@ -888,142 +861,77 @@ fn update_radiance_field_cell(invocation: vec3<u32>, field: RadianceFieldData) {
             let scheduled_cell = field.scheduled_cells[schedule_group][schedule_lane];
             if (scheduled_cell & 0x0000ffffu) == logical_index {
                 scheduled_refresh = true;
-                sample_round = scheduled_cell >> 16u;
             }
         }
     }
     if !scheduled_refresh {
         if new_cell {
             let relocation = relocate_radiance_probe(world_position);
-            for (var channel_index = 0u; channel_index < field.settings.z; channel_index++) {
-                let value_index = physical_value_index + channel_index;
-                radiance_field_values.values[value_index] = vec4<f32>(0.0);
-            }
             radiance_field_probes.values[physical_probe_index] = vec4<f32>(relocation.xyz, relocation.w);
-            for (var ray_index = 0u; ray_index < field.settings.y; ray_index++) {
-                let debug_index = debug_field_offset + physical_trace_index + ray_index;
-                let channel_index = ray_index / 4u;
-                let sample_index = ray_index % 4u;
-                let sample_direction = radiance_sample_direction(cell_seed, 0u, channel_index, sample_index);
-                radiance_field_trace_debug.values[debug_index] = RadianceFieldTraceDebug(vec4<f32>(relocation.xyz, 0.0), vec4<f32>(world_position, 0.0), vec4<f32>(0.0), vec4<f32>(sample_direction, 0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0, 0.0, 0.0, f32(field.settings.x)), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(world_position, relocation.w));
-            }
         }
         return;
     }
 
-    let camera_snapshot = scheduled_refresh && temporal_accumulation_enabled && !full_refresh && radiance_camera_snapshot_due(world_position, cell_seed, field.settings.x);
-    let refresh_snapshot = scheduled_refresh && !full_refresh && (dirty_refresh || camera_snapshot);
-    let sample_seed = select(cell_seed, cell_seed ^ (field.settings.x * 0x9e3779b9u), refresh_snapshot);
     let relocation = relocate_radiance_probe(world_position);
     if relocation.w < 0.0 {
-        for (var channel_index = 0u; channel_index < field.settings.z; channel_index++) {
-            let value_index = physical_value_index + channel_index;
-            radiance_field_values.values[value_index] = vec4<f32>(0.0);
-        }
         radiance_field_probes.values[physical_probe_index] = vec4<f32>(relocation.xyz, relocation.w);
-        for (var ray_index = 0u; ray_index < field.settings.y; ray_index++) {
-            let debug_index = debug_field_offset + physical_trace_index + ray_index;
-            let channel_index = ray_index / 4u;
-            let sample_index = ray_index % 4u;
-            let sample_direction = radiance_sample_direction(cell_seed, sample_round, channel_index, sample_index);
-            radiance_field_trace_debug.values[debug_index] = RadianceFieldTraceDebug(vec4<f32>(relocation.xyz, 0.0), vec4<f32>(world_position, 0.0), vec4<f32>(0.0), vec4<f32>(sample_direction, 5.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0, 0.0, 0.0, f32(field.settings.x)), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(world_position, relocation.w));
+        for (var region_index = 0u; region_index < field.settings.z; region_index++) {
+            radiance_field_values.values[physical_value_index + region_index] = RadianceFieldAngularSample(vec4<f32>(0.0), vec4<u32>(0u));
         }
         return;
     }
 
     radiance_field_probes.values[physical_probe_index] = vec4<f32>(relocation.xyz, relocation.w);
-    for (var channel_index = 0u; channel_index < field.settings.z; channel_index++) {
-        let value_index = physical_value_index + channel_index;
-        let first_ray_index = channel_index * 4u;
-        let channel_debug_index = debug_field_offset + physical_trace_index + first_ray_index;
-        let previous = radiance_field_values.values[value_index];
-        var weighted_radiance = vec3<f32>(0.0);
-        var batch_sample_count = 0u;
-        let previous_weights = radiance_field_trace_debug.values[channel_debug_index].direct_radiance.w;
-        var previous_counts = u32(max(radiance_field_trace_debug.values[channel_debug_index].emission_radiance.w, 0.0) + 0.5);
-        var statistics_aux = radiance_field_trace_debug.values[channel_debug_index].channel_statistics_aux;
-        if new_cell {
-            previous_counts = 0u;
-            statistics_aux = vec4<f32>(0.0);
-        }
-        let attempted_sample_count = u32(max(statistics_aux.w, 0.0) + 0.5);
-        let refinement_sample_index = attempted_sample_count % 4u;
-        for (var sample_index = 0u; sample_index < 4u; sample_index++) {
-            if sample_round != 0u && !refresh_snapshot && sample_index != refinement_sample_index {
-                continue;
-            }
-            let ray_sample_index = select(refinement_sample_index, sample_index, sample_round == 0u || refresh_snapshot);
-            let ray_index = first_ray_index + ray_sample_index;
-            let debug_index = debug_field_offset + physical_trace_index + ray_index;
-            let direction_attempt = attempted_sample_count + select(0u, sample_index, sample_round == 0u || refresh_snapshot);
-            let direction_sample_round = direction_attempt / 4u;
-            let direction_sample_index = direction_attempt % 4u;
-            let direction = radiance_sample_direction(sample_seed, direction_sample_round, channel_index, direction_sample_index);
-            let trace = trace_world_radiance(relocation.xyz + direction * 0.05, direction);
-            let trace_resolved = trace.termination_reason == TRACE_TERMINATION_HIT || trace.termination_reason == TRACE_TERMINATION_MAX_DISTANCE;
-            weighted_radiance += select(vec3<f32>(0.0), trace.radiance, trace_resolved);
-            batch_sample_count += select(0u, 1u, trace_resolved);
-            var debug_normal = trace.hit_normal;
-            if trace.termination_reason != TRACE_TERMINATION_HIT {
-                debug_normal = vec3<f32>(trace.last_sdf_distance, 0.0, 0.0);
-            }
-            var ray_debug = RadianceFieldTraceDebug(vec4<f32>(relocation.xyz, 1.0), vec4<f32>(trace.hit_position, f32(trace.lighting_kind)), vec4<f32>(debug_normal, trace.hit_distance), vec4<f32>(direction, f32(trace.termination_reason)), vec4<f32>(trace.radiance, 0.0), vec4<f32>(trace.direct_radiance, 0.0), vec4<f32>(trace.emission_radiance, 0.0), vec4<f32>(trace.sky_radiance, f32(field.settings.x)), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(world_position, relocation.w));
-            let sample_weight = select(0.0, 1.0, trace_resolved);
-            if channel_index < 4u {
-                var directional_weights = ray_debug.directional_weights_first;
-                directional_weights[channel_index] = sample_weight;
-                ray_debug.directional_weights_first = directional_weights;
-            } else {
-                var directional_weights = ray_debug.directional_weights_second;
-                directional_weights[channel_index - 4u] = sample_weight;
-                ray_debug.directional_weights_second = directional_weights;
-            }
-            radiance_field_trace_debug.values[debug_index] = ray_debug;
-        }
-
-        var stored_radiance = previous.rgb;
-        var blend_factor = 0.0;
-        var accumulated_weight = previous_weights;
-        var accumulated_count = previous_counts;
-        if batch_sample_count > 0u {
-            let batch_weight = f32(batch_sample_count);
-            let batch_radiance = weighted_radiance / batch_weight;
-            let has_history = previous.a > 0.0 && !full_refresh && !new_cell;
-            if !has_history {
-                blend_factor = 1.0;
-                accumulated_weight = batch_weight;
-                accumulated_count = batch_sample_count;
-            } else {
-                let total_weight = accumulated_weight + batch_weight;
-                blend_factor = batch_weight / max(total_weight, 0.0001);
-                accumulated_weight = total_weight;
-                accumulated_count += batch_sample_count;
-            }
-            stored_radiance = mix(previous.rgb, batch_radiance, blend_factor);
-            let stored_value = vec4<f32>(stored_radiance, 1.0);
-            radiance_field_values.values[value_index] = stored_value;
-        } else if new_cell {
-            accumulated_weight = 0.0;
-            accumulated_count = 0u;
-            radiance_field_values.values[value_index] = vec4<f32>(0.0);
-        }
-
-        statistics_aux.w += select(select(4.0, 1.0, sample_round != 0u), 4.0, refresh_snapshot);
-        statistics_aux = vec4<f32>(0.0, 0.0, 0.0, statistics_aux.w);
-
-        for (var sample_index = 0u; sample_index < 4u; sample_index++) {
-            let ray_debug_index = debug_field_offset + physical_trace_index + first_ray_index + sample_index;
-            var ray_debug = radiance_field_trace_debug.values[ray_debug_index];
-            ray_debug.radiance.w = blend_factor;
-            ray_debug.direct_radiance.w = accumulated_weight;
-            ray_debug.emission_radiance.w = f32(accumulated_count);
-            if sample_index == 0u {
-                ray_debug.channel_statistics = vec4<f32>(0.0);
-                ray_debug.channel_statistics_aux = statistics_aux;
-            }
-            radiance_field_trace_debug.values[ray_debug_index] = ray_debug;
+    if new_cell {
+        for (var region_index = 0u; region_index < field.settings.z; region_index++) {
+            radiance_field_values.values[physical_value_index + region_index] = RadianceFieldAngularSample(vec4<f32>(0.0), vec4<u32>(0u));
         }
     }
+    var region_cursor = radiance_field_values.values[physical_value_index].sampling.w;
+    for (var ray_index = 0u; ray_index < field.settings.y; ray_index++) {
+        var region_index = region_cursor;
+        if ray_index == 1u {
+            region_index = field.settings.z - 1u - region_cursor;
+        }
+        let region_value_index = physical_value_index + region_index;
+        var angular_sample = radiance_field_values.values[region_value_index];
+        let attempt_count = angular_sample.sampling.y;
+        let direction = radiance_sample_direction(cell_seed, region_index, field.settings.z, attempt_count);
+        let trace = trace_world_radiance(relocation.xyz + direction * 0.05, direction);
+        let trace_resolved = trace.termination_reason == TRACE_TERMINATION_HIT || trace.termination_reason == TRACE_TERMINATION_MAX_DISTANCE;
+        angular_sample.sampling.y += 1u;
+        var blend_factor = 0.0;
+        if trace_resolved {
+            let previous_count = angular_sample.sampling.x;
+            let next_count = previous_count + 1u;
+            blend_factor = 1.0 / f32(next_count);
+            angular_sample.radiance = vec4<f32>(mix(angular_sample.radiance.rgb, trace.radiance, blend_factor), 1.0);
+            angular_sample.sampling.x = next_count;
+            angular_sample.sampling.z = field.settings.x;
+        }
+        radiance_field_values.values[region_value_index] = angular_sample;
+        let debug_index = debug_field_offset + physical_trace_index + ray_index;
+        var debug_normal = trace.hit_normal;
+        if trace.termination_reason != TRACE_TERMINATION_HIT {
+            debug_normal = vec3<f32>(trace.last_sdf_distance, 0.0, 0.0);
+        }
+        radiance_field_trace_debug.values[debug_index] = RadianceFieldTraceDebug(
+            vec4<f32>(relocation.xyz, 1.0),
+            vec4<f32>(trace.hit_position, f32(trace.lighting_kind)),
+            vec4<f32>(debug_normal, trace.hit_distance),
+            vec4<f32>(direction, f32(trace.termination_reason)),
+            vec4<f32>(trace.radiance, blend_factor),
+            vec4<f32>(trace.direct_radiance, f32(angular_sample.sampling.x)),
+            vec4<f32>(trace.emission_radiance, f32(angular_sample.sampling.y)),
+            vec4<f32>(trace.sky_radiance, f32(field.settings.x)),
+            vec4<f32>(0.0),
+            vec4<f32>(0.0),
+            vec4<f32>(f32(region_index), f32(angular_sample.sampling.x), f32(angular_sample.sampling.y), 0.0),
+            vec4<f32>(0.0),
+            vec4<f32>(world_position, relocation.w),
+        );
+    }
+    radiance_field_values.values[physical_value_index].sampling.w = (region_cursor + 1u) % field.settings.z;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -1243,23 +1151,25 @@ fn radiance_field_interpolation_candidate(position: vec3<f32>, field: RadianceFi
 
 fn evaluate_radiance_field_candidate(logical_coordinate: vec3<u32>, normal: vec3<f32>, field: RadianceFieldData) -> RadianceFieldCandidate {
     let surface_normal = normalize(normal);
-    let cell_index = radiance_field_cell_index(logical_coordinate, field.resolution.xyz) * field.settings.z;
+    let cell_index = radiance_field_cell_index(logical_coordinate, field.resolution.xyz) * 64u;
     let probe_record = radiance_field_probes.values[radiance_field_cell_index(logical_coordinate, field.resolution.xyz)];
     var cell_radiance = vec3<f32>(0.0);
-    var cell_angular_weight = 0.0;
-    var cell_expected_angular_weight = 0.0;
+    var expected_angular_weight = 0.0;
+    var sampled_angular_weight = 0.0;
     var cell_validity = 0.0;
-    for (var direction_index = 0u; direction_index < field.settings.z; direction_index++) {
-        let sample = radiance_field_values.values[cell_index + direction_index];
-        let angular_weight = max(dot(surface_normal, radiance_lobe_direction(direction_index)), 0.0);
-        cell_expected_angular_weight += angular_weight;
-        let weight = angular_weight * sample.a;
-        cell_radiance += sample.rgb * weight;
-        cell_angular_weight += weight;
-        cell_validity = max(cell_validity, sample.a);
+    for (var region_index = 0u; region_index < field.settings.z; region_index++) {
+        let sample = radiance_field_values.values[cell_index + region_index];
+        let region_direction = radiance_region_direction(region_index, field.settings.z, 0.5, 0.5);
+        let angular_weight = max(dot(surface_normal, region_direction), 0.0);
+        expected_angular_weight += angular_weight;
+        if sample.sampling.x > 0u {
+            cell_radiance += sample.radiance.rgb * angular_weight;
+            sampled_angular_weight += angular_weight;
+            cell_validity = 1.0;
+        }
     }
-    let directional_radiance = select(vec3<f32>(0.0), cell_radiance / max(cell_angular_weight, 0.0001), cell_angular_weight > 0.0001);
-    let directional_support = cell_angular_weight / max(cell_expected_angular_weight, 0.0001);
+    let directional_radiance = cell_radiance / max(expected_angular_weight, 0.0001);
+    let directional_support = sampled_angular_weight / max(expected_angular_weight, 0.0001);
     let probe_validity = select(0.0, 1.0, probe_record.w > 0.0);
     return RadianceFieldCandidate(directional_radiance, directional_support, cell_validity * probe_validity, probe_record.xyz, probe_record.w);
 }
@@ -1325,13 +1235,13 @@ fn inspect_sdf_segment(start_position: vec3<f32>, end_position: vec3<f32>, start
     return SdfSegmentInspection(first_blocking_voxel, first_occupied_after_start, first_occupied_after_start_minimum, first_occupied_after_start_maximum);
 }
 
-fn triangle_bvh_segment_intersects_bounds(start: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, node: TriangleBvhNode) -> bool {
+fn triangle_bvh_segment_bounds_entry(start: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, node: TriangleBvhNode) -> f32 {
     let inverse_direction = select(vec3<f32>(1.0e30), 1.0 / direction, abs(direction) > vec3<f32>(0.000001));
     let first = (node.minimum.xyz - start) * inverse_direction;
     let second = (node.maximum.xyz - start) * inverse_direction;
     let entry = max(max(min(first.x, second.x), min(first.y, second.y)), max(min(first.z, second.z), 0.001));
     let exit = min(min(max(first.x, second.x), max(first.y, second.y)), min(max(first.z, second.z), maximum_distance));
-    return exit >= entry;
+    return select(1.0e30, entry, exit >= entry);
 }
 
 fn triangle_bvh_segment_hits_triangle(start: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, triangle: TriangleBvhTriangle) -> bool {
@@ -1365,13 +1275,21 @@ fn triangle_bvh_segment_occluded(start: vec3<f32>, end: vec3<f32>) -> bool {
     }
     let direction = segment / segment_length;
     let maximum_distance = segment_length - max(0.001, segment_length * 0.00001);
+    let diagnostics_enabled = triangle_bvh_settings.counts.z != 0u;
+    if diagnostics_enabled {
+        atomicAdd(&triangle_bvh_diagnostics.counters[0], 1u);
+    }
     var node_index = 0u;
     for (var visit = 0u; visit < triangle_bvh_settings.counts.x; visit++) {
         if node_index >= triangle_bvh_settings.counts.x {
             break;
         }
         let node = triangle_bvh_nodes[node_index];
-        if !triangle_bvh_segment_intersects_bounds(start, direction, maximum_distance, node) {
+        let entry = triangle_bvh_segment_bounds_entry(start, direction, maximum_distance, node);
+        if diagnostics_enabled {
+            atomicAdd(&triangle_bvh_diagnostics.counters[1], 1u);
+        }
+        if entry > maximum_distance {
             node_index = node.metadata.w;
             continue;
         }
@@ -1380,8 +1298,16 @@ fn triangle_bvh_segment_occluded(start: vec3<f32>, end: vec3<f32>) -> bool {
             let triangle_start = node.metadata.y;
             for (var triangle_offset = 0u; triangle_offset < triangle_count; triangle_offset++) {
                 let triangle_index = triangle_start + triangle_offset;
-                if triangle_index < triangle_bvh_settings.counts.y && triangle_bvh_segment_hits_triangle(start, direction, maximum_distance, triangle_bvh_triangles[triangle_index]) {
-                    return true;
+                if triangle_index < triangle_bvh_settings.counts.y {
+                    if diagnostics_enabled {
+                        atomicAdd(&triangle_bvh_diagnostics.counters[2], 1u);
+                    }
+                    if triangle_bvh_segment_hits_triangle(start, direction, maximum_distance, triangle_bvh_triangles[triangle_index]) {
+                        if diagnostics_enabled {
+                            atomicAdd(&triangle_bvh_diagnostics.counters[3], 1u);
+                        }
+                        return true;
+                    }
                 }
             }
         }

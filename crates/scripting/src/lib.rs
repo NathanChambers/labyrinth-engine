@@ -34,6 +34,9 @@ pub enum CaptureAction {
     SetRenderEffects { shadows: bool, irradiance: bool, gizmos: bool },
     SetAmbientOcclusion(bool),
     SetDirectLightVisibility(bool),
+    SetTriangleProbeOcclusion(bool),
+    SetTriangleProbeDiagnostics(bool),
+    SetTriangleProbeBvhSah(bool),
     SetShadowQuality(u8),
     SetRenderMode(CaptureRenderMode),
     SetUiEnabled(bool),
@@ -105,6 +108,24 @@ impl ScriptBuilder {
     fn set_direct_light_visibility(&mut self, enabled: bool) {
         if self.capabilities.capture {
             self.plan.actions.push(CaptureAction::SetDirectLightVisibility(enabled));
+        }
+    }
+
+    fn set_triangle_probe_occlusion(&mut self, enabled: bool) {
+        if self.capabilities.capture {
+            self.plan.actions.push(CaptureAction::SetTriangleProbeOcclusion(enabled));
+        }
+    }
+
+    fn set_triangle_probe_diagnostics(&mut self, enabled: bool) {
+        if self.capabilities.capture {
+            self.plan.actions.push(CaptureAction::SetTriangleProbeDiagnostics(enabled));
+        }
+    }
+
+    fn set_triangle_probe_bvh_sah(&mut self, enabled: bool) {
+        if self.capabilities.capture {
+            self.plan.actions.push(CaptureAction::SetTriangleProbeBvhSah(enabled));
         }
     }
 
@@ -213,6 +234,9 @@ pub fn compile_capture_script_with_capabilities(source: &str, capabilities: Scri
     engine.register_fn("set_render_effects", ScriptBuilder::set_render_effects);
     engine.register_fn("set_ambient_occlusion", ScriptBuilder::set_ambient_occlusion);
     engine.register_fn("set_direct_light_visibility", ScriptBuilder::set_direct_light_visibility);
+    engine.register_fn("set_triangle_probe_occlusion", ScriptBuilder::set_triangle_probe_occlusion);
+    engine.register_fn("set_triangle_probe_diagnostics", ScriptBuilder::set_triangle_probe_diagnostics);
+    engine.register_fn("set_triangle_probe_bvh_sah", ScriptBuilder::set_triangle_probe_bvh_sah);
     engine.register_fn("set_shadow_quality", ScriptBuilder::set_shadow_quality);
     engine.register_fn("set_render_mode", ScriptBuilder::set_render_mode);
     engine.register_fn("set_ui_enabled", ScriptBuilder::set_ui_enabled);
