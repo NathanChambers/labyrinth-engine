@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use math::Color;
 use math::Transform;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MESH_ID: AtomicU64 = AtomicU64::new(1);
@@ -35,23 +36,22 @@ pub struct UiVertex {
     pub color: [f32; 4],
 }
 
-#[derive(Debug)]
-pub struct Mesh {
+#[derive(Clone, Debug)]
+struct MeshGeometry {
     vertices: Vec<MeshVertex>,
     indices: Vec<u32>,
     id: u64,
     revision: u64,
 }
 
-impl Default for Mesh {
-    fn default() -> Self {
-        Self { vertices: Vec::new(), indices: Vec::new(), id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed), revision: 0 }
-    }
+#[derive(Clone, Debug)]
+pub struct Mesh {
+    geometry: Arc<MeshGeometry>,
 }
 
-impl Clone for Mesh {
-    fn clone(&self) -> Self {
-        Self { vertices: self.vertices.clone(), indices: self.indices.clone(), id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed), revision: self.revision }
+impl Default for Mesh {
+    fn default() -> Self {
+        Self { geometry: new_geometry(Vec::new(), Vec::new()) }
     }
 }
 
@@ -69,22 +69,24 @@ impl Mesh {
             return Err("mesh indices must contain complete triangles".into());
         }
 
-        Ok(Self { vertices, indices, ..Self::default() })
+        Ok(Self { geometry: new_geometry(vertices, indices) })
     }
 
     pub fn add_vertex(&mut self, vertex: MeshVertex) -> u32 {
-        let index = self.vertices.len() as u32;
-        self.vertices.push(vertex);
-        self.revision = self.revision.wrapping_add(1);
+        let geometry = self.geometry_mut();
+        let index = geometry.vertices.len() as u32;
+        geometry.vertices.push(vertex);
+        geometry.revision = geometry.revision.wrapping_add(1);
         index
     }
 
     pub fn add_triangle(&mut self, first: u32, second: u32, third: u32) {
-        assert!((first as usize) < self.vertices.len(), "first mesh index is outside the vertex data");
-        assert!((second as usize) < self.vertices.len(), "second mesh index is outside the vertex data");
-        assert!((third as usize) < self.vertices.len(), "third mesh index is outside the vertex data");
-        self.indices.extend_from_slice(&[first, second, third]);
-        self.revision = self.revision.wrapping_add(1);
+        assert!((first as usize) < self.geometry.vertices.len(), "first mesh index is outside the vertex data");
+        assert!((second as usize) < self.geometry.vertices.len(), "second mesh index is outside the vertex data");
+        assert!((third as usize) < self.geometry.vertices.len(), "third mesh index is outside the vertex data");
+        let geometry = self.geometry_mut();
+        geometry.indices.extend_from_slice(&[first, second, third]);
+        geometry.revision = geometry.revision.wrapping_add(1);
     }
 
     pub fn add_quad(&mut self, vertices: [MeshVertex; 4]) {
@@ -97,20 +99,33 @@ impl Mesh {
     }
 
     pub fn vertices(&self) -> &[MeshVertex] {
-        &self.vertices
+        &self.geometry.vertices
     }
 
     pub fn indices(&self) -> &[u32] {
-        &self.indices
+        &self.geometry.indices
     }
 
     pub fn geometry_version(&self) -> (u64, u64) {
-        (self.id, self.revision)
+        (self.geometry.id, self.geometry.revision)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.geometry.indices.is_empty()
     }
+
+    fn geometry_mut(&mut self) -> &mut MeshGeometry {
+        if Arc::strong_count(&self.geometry) > 1 {
+            let mut geometry = (*self.geometry).clone();
+            geometry.id = NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed);
+            self.geometry = Arc::new(geometry);
+        }
+        Arc::make_mut(&mut self.geometry)
+    }
+}
+
+fn new_geometry(vertices: Vec<MeshVertex>, indices: Vec<u32>) -> Arc<MeshGeometry> {
+    Arc::new(MeshGeometry { vertices, indices, id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed), revision: 0 })
 }
 
 #[derive(Clone, Debug)]

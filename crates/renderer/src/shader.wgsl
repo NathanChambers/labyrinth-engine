@@ -274,9 +274,17 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) material_base_color: vec4<f32>,
-    @location(4) material_params: vec4<f32>,
-    @location(5) material_emission: vec4<f32>,
+    @location(3) model_0: vec4<f32>,
+    @location(4) model_1: vec4<f32>,
+    @location(5) model_2: vec4<f32>,
+    @location(6) model_3: vec4<f32>,
+    @location(7) normal_0: vec4<f32>,
+    @location(8) normal_1: vec4<f32>,
+    @location(9) normal_2: vec4<f32>,
+    @location(10) material_base_color: vec4<f32>,
+    @location(11) material_params: vec4<f32>,
+    @location(12) material_emission: vec4<f32>,
+    @location(13) surface_id: u32,
 };
 
 struct VertexOutput {
@@ -300,17 +308,20 @@ struct FragmentOutput {
 @vertex
 fn vertex_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
-    output.normal = input.normal;
+    let model = mat4x4<f32>(input.model_0, input.model_1, input.model_2, input.model_3);
+    let normal_matrix = mat3x3<f32>(input.normal_0.xyz, input.normal_1.xyz, input.normal_2.xyz);
+    let world_position = model * vec4<f32>(input.position, 1.0);
+    output.clip_position = camera.view_projection * world_position;
+    output.normal = normalize(normal_matrix * input.normal);
     output.color = input.color;
     output.material_base_color = input.material_base_color;
     output.material_params = input.material_params;
     output.material_emission = input.material_emission;
-    let shadow_origin = input.position;
-    output.shadow_position_0 = camera.shadow_view_projection[0] * vec4<f32>(shadow_origin, 1.0);
-    output.shadow_position_1 = camera.shadow_view_projection[1] * vec4<f32>(shadow_origin, 1.0);
-    output.shadow_position_2 = camera.shadow_view_projection[2] * vec4<f32>(shadow_origin, 1.0);
-    output.world_position = input.position;
+    let shadow_origin = world_position;
+    output.shadow_position_0 = camera.shadow_view_projection[0] * shadow_origin;
+    output.shadow_position_1 = camera.shadow_view_projection[1] * shadow_origin;
+    output.shadow_position_2 = camera.shadow_view_projection[2] * shadow_origin;
+    output.world_position = world_position.xyz;
     output.indirect = vec3<f32>(0.0);
     return output;
 }

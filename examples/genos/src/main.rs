@@ -4,8 +4,8 @@ use std::path::Path;
 
 use building::{Building, LampSlot, MovingBox, distributed_lamps};
 use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, EulerRot, FontAsset, IrradianceMode, KeyCode, LightId, PointLight, Quat, RadianceFieldResolution, RuntimeContext, Transform, UiAnchor,
-    UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run,
+    Application, Camera, CameraId, Color, DirectionalLight, EulerRot, FontAsset, IrradianceMode, KeyCode, LightId, Material, PointLight, Quat, RadianceFieldResolution, RuntimeContext, Transform,
+    UiAnchor, UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run,
 };
 use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
 
@@ -115,18 +115,26 @@ impl GenosDemo {
         let (floor_width, floor_depth) = building.floor_size();
         let floor = primitives::quad(floor_width, floor_depth, 0.0, Color::WHITE);
         context.scene.spawn_static_mesh(floor, Transform::from_position(building.floor_center()));
+        let cube_mesh = primitives::cube([0.0; 3], 1.0, Color::WHITE);
 
         for object in &building.static_boxes {
-            let mesh = if object.cylinder { primitives::cylinder([0.0; 3], object.size.x * 0.5, object.size.y, object.color, 16) } else { primitives::cube([0.0; 3], 1.0, object.color) };
             let scale = if object.cylinder { Vec3::ONE } else { object.size };
-            context.scene.spawn_static_mesh(mesh, Transform::new(object.center, Quat::IDENTITY, scale));
+            let transform = Transform::new(object.center, Quat::IDENTITY, scale);
+            if object.cylinder {
+                let mesh = primitives::cylinder([0.0; 3], object.size.x * 0.5, object.size.y, object.color, 16);
+                context.scene.spawn_static_mesh(mesh, transform);
+            } else {
+                let material = Material { base_color: object.color, ..Material::default() };
+                let id = context.scene.spawn_mesh_with_material(cube_mesh.clone(), transform, material);
+                context.scene.get_mesh_mut(id).expect("new static mesh is registered").probe_dynamic = false;
+            }
         }
 
         for motion in building.moving_boxes {
-            let mesh = primitives::cube([0.0; 3], 1.0, motion.color);
             let (position, yaw) = motion.pose(0.0);
             let transform = Transform::new(position, Quat::from_rotation_y(yaw), motion.size);
-            let id = context.scene.spawn_mesh(mesh, transform);
+            let material = Material { base_color: motion.color, ..Material::default() };
+            let id = context.scene.spawn_mesh_with_material(cube_mesh.clone(), transform, material);
             self.moving_boxes.push(MovingBoxEntity { id, motion });
         }
 

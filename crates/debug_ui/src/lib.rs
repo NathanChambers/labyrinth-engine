@@ -262,6 +262,18 @@ impl DebugPanels {
     }
 
     pub fn update(&mut self, context: &mut RuntimeContext) {
+        if !context.ui_enabled {
+            self.movement_keys_active = false;
+            return;
+        }
+
+        let delta_seconds = context.time.delta_seconds();
+        if !context.ui.debug_ui_visible() {
+            self.movement_keys_active = false;
+            self.update_fps_counter(context, delta_seconds);
+            return;
+        }
+
         self.update_feature_availability(context);
         update_drawer(context, self.display_mode_drawer, "DISPLAY MODE");
         update_drawer(context, self.render_options_drawer, "RENDER OPTIONS");
@@ -300,11 +312,7 @@ impl DebugPanels {
         self.movement_keys_active = self.radiance_inspector.update(context, sdf_gi_available);
         self.surface_inspector.update(context, sdf_gi_available);
 
-        let delta_seconds = context.time.delta_seconds();
-        if let Some(fps) = self.fps_counter.update(delta_seconds) {
-            self.fps = Some(fps);
-            context.ui.set_label_text(self.fps_counter_label, format_fps_counter(fps));
-        }
+        self.update_fps_counter(context, delta_seconds);
         self.performance_refresh_elapsed += delta_seconds;
         self.frame_history.push(delta_seconds * 1000.0);
         if self.frame_history.len() > 48 {
@@ -320,6 +328,13 @@ impl DebugPanels {
             let fps_text = self.fps.map_or_else(|| "--".into(), |fps| format!("{fps:.1}"));
             context.ui.set_label_text(self.performance_frame_label, format!("FPS {fps_text} | Frame {:.2} ms", delta_seconds * 1000.0));
             context.ui.set_graph_values(self.performance_graph, &self.frame_history);
+        }
+    }
+
+    fn update_fps_counter(&mut self, context: &mut RuntimeContext, delta_seconds: f32) {
+        if let Some(fps) = self.fps_counter.update(delta_seconds) {
+            self.fps = Some(fps);
+            context.ui.set_label_text(self.fps_counter_label, format_fps_counter(fps));
         }
     }
 

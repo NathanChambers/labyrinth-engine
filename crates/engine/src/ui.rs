@@ -273,7 +273,7 @@ impl UiCanvas {
             text_vertex_cache: RefCell::new(HashMap::new()),
             viewport_size: (1, 1),
             pointer_press_consumed: false,
-            debug_ui_visible: true,
+            debug_ui_visible: false,
         }
     }
 
@@ -398,6 +398,9 @@ impl UiCanvas {
     }
 
     pub fn pointer_over_ui(&self, cursor: Vec2, width: u32, height: u32) -> bool {
+        if !self.debug_ui_visible {
+            return false;
+        }
         let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
         self.pointer_over_ui_at(cursor, root)
     }

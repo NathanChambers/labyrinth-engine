@@ -44,9 +44,10 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | [Windowing](systems/windowing.md) | Suppresses cursor capture on scene clicks while surface picking is armed | Pick mode |
 | [Input](systems/input.md) | [Primitives example](../examples/primitives/src/main.rs) | Key state and mouse delta | Each update |
 | [Input](systems/input.md) | [UI](systems/ui.md) | Cursor position and left-button state | Each frame |
-| [Windowing](systems/windowing.md) | [UI](systems/ui.md) | F1 press toggles normal UI visibility; marked FPS overlay labels remain visible | Key press; repeats ignored |
-| [Shared debug panels](../crates/debug_ui/src/lib.rs) | [UI](systems/ui.md) | Reusable display mode, render options, gizmos, performance panel, and GI radiance inspector used by Lighting, Genos, and Primitives | Setup and each update |
+| [Windowing](systems/windowing.md) | [UI](systems/ui.md) | Apps start with reduced overlay mode; F1 toggles normal UI visibility and marked FPS overlay labels remain visible | Startup and key press; repeats ignored |
+| [Shared debug panels](../crates/debug_ui/src/lib.rs) | [UI](systems/ui.md) | Reusable display mode, render options, gizmos, performance panel, and GI radiance inspector used by Lighting, Genos, and Primitives | Setup; control and inspector updates while normal UI is visible; FPS-only updates in F1 reduced mode; skipped when UI is disabled |
 | [Shared debug panels](../crates/debug_ui/src/lib.rs) | [Rendering](systems/rendering.md) | `Triangle probe occlusion` render setting toggled from Render Options | Each UI update |
+| [Mesh](systems/mesh.md) | [Rendering](systems/rendering.md) | Shared local-space geometry uploaded once per geometry version; per-instance transforms, normal transforms, materials, and surface IDs drive instanced scene/depth/wireframe/shadow draws | Renderer initialization and redraw |
 | [Rendering](systems/rendering.md) | [Mesh](systems/mesh.md) | Transformed indexed triangles flattened into a world-space BVH; transform-only instance changes refit leaf triangles and node bounds, while topology changes rebuild the tree | Renderer initialization, instance update, or GI sampling when enabled |
 | [Primitives example](../examples/primitives/src/main.rs) | [Shared debug panels](../crates/debug_ui/src/lib.rs) | Render debug panels alongside the local lighting controls | Setup and each update |
 | [Lighting example](../examples/lighting/src/main.rs) | [Shared debug panels](../crates/debug_ui/src/lib.rs) | Render debug panels with the GI radiance inspector launch button | Setup and each update |
@@ -65,10 +66,11 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Genos stress example](../examples/genos/src/main.rs) | [Rendering](systems/rendering.md) | AABB-SDF GI mode and time-of-day directional sun controls | Setup and each update |
 | [Genos capture script](../examples/genos/scripts/global_grid_diagnostic.rhai) | [Debug Capture](systems/capture.md) | Global-grid GI-only and lit scene screenshots | Capture run |
 | [Genos stress example](../examples/genos/src/main.rs) | [Scene](systems/scene.md) | Building meshes, animated point-light and box transforms, and active light handles | Setup and each update |
+| [Genos stress example](../examples/genos/src/main.rs) | [Mesh](systems/mesh.md) | One shared white cube geometry cloned across static and moving boxes; per-instance materials preserve their colors | Scene construction |
 | [Application](../examples/lighting/src/main.rs) | [Windowing](systems/windowing.md) | Master gizmo visibility plus normals, lights, and global-probe toggles | Each redraw |
 | [Mesh](systems/mesh.md) | [Rendering](systems/rendering.md) | Geometry version plus validated vertices and triangle indices | Initialization; version changes trigger renderer cache updates |
 | [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Window surface, assigned camera, assigned lights, mesh instances | Resume or startup |
-| [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Updated mesh instances, including topology changes | Each redraw; renderer skips unchanged instance data, updates changed vertex ranges, and rebuilds flattened buffers when topology changes |
+| [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Updated mesh instances, including topology changes | Each redraw; renderer skips unchanged instance data, uploads changed instance records, and rebuilds unique local-space geometry batches when topology changes |
 | [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Resize dimensions and draw requests | Window events |
 | [Rendering](systems/rendering.md) | [Windowing](systems/windowing.md) | Initialization or draw failure | Startup or redraw |
 | [Scripting](systems/scripting.md) | [Windowing](systems/windowing.md) | Compiled debug capture plan | After application setup |

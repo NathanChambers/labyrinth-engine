@@ -76,7 +76,9 @@ impl Application for ControlScene {
     }
 
     fn cleanup(&mut self, _context: &mut RuntimeContext) {
-        self.report_samples();
+        if self.profile_seconds.is_some() {
+            self.report_samples();
+        }
     }
 }
 

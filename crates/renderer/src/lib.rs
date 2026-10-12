@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use math::{Camera, Color, DirectionalLight, Light, Mat4, SpotLight, Vec3, Vec4};
-use mesh::{MeshInstance, UiVertex};
+use math::{Camera, Color, DirectionalLight, Light, Mat3, Mat4, SpotLight, Vec3, Vec4};
+use mesh::{MeshInstance, MeshVertex, UiVertex};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -314,10 +314,26 @@ struct RendererMeshVertex {
     position: [f32; 3],
     normal: [f32; 3],
     color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RendererInstanceData {
+    model: [[f32; 4]; 4],
+    normal: [[f32; 4]; 3],
     material_base_color: [f32; 4],
     material_params: [f32; 4],
     material_emission: [f32; 4],
     surface_id: u32,
+    padding: [u32; 3],
+}
+
+#[derive(Clone, Debug)]
+struct MeshDrawBatch {
+    index_range: Range<u32>,
+    wireframe_range: Range<u32>,
+    instance_range: Range<usize>,
+    instance_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -842,10 +858,16 @@ pub struct Renderer {
     gi_gizmo_bind_group: wgpu::BindGroup,
     gi_gizmo_selection_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
+    instance_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
     mesh_topology_signature: u64,
     instance_signatures: Vec<u64>,
+    instance_signature_scratch: Vec<u64>,
+    instance_data_scratch: Vec<RendererInstanceData>,
+    instance_data_offsets: Vec<usize>,
+    instance_data_dirty_slots: Vec<usize>,
+    mesh_draw_batches: Vec<MeshDrawBatch>,
     wireframe_index_buffer: wgpu::Buffer,
     wireframe_index_count: u32,
     camera_buffer: wgpu::Buffer,
@@ -918,7 +940,6 @@ pub struct Renderer {
     shadow_bind_groups: [wgpu::BindGroup; SHADOW_CASCADE_COUNT],
     shadow_matrices: [Mat4; SHADOW_CASCADE_COUNT],
     shadow_cascade_splits: [f32; 4],
-    shadow_draw_ranges: Vec<Range<u32>>,
     local_mesh_bounds: Vec<GeometryBounds>,
     shadow_caster_bounds: Vec<GeometryBounds>,
     spot_shadow_pipeline: wgpu::RenderPipeline,
@@ -1004,10 +1025,10 @@ impl Renderer {
         radiance_field_resolution: RadianceFieldResolution,
     ) -> Result<Self, String> {
         let radiance_field_resolution = radiance_field_resolution.bounded();
-        let (vertices, indices) = flatten_instances(instances)?;
+        let (vertices, indices, mesh_draw_batches) = flatten_meshes(instances)?;
+        let (instance_data, instance_data_offsets) = build_instance_data(instances, &mesh_draw_batches);
         let local_mesh_bounds = mesh_local_bounds(instances);
         let shadow_caster_bounds = transformed_mesh_bounds(instances, &local_mesh_bounds);
-        let shadow_draw_ranges = shadow_draw_ranges(instances);
 
         let backend = graphics_api.backends();
         if !wgpu::Instance::enabled_backend_features().contains(backend) {
@@ -1106,11 +1127,18 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shadow_shader,
                 entry_point: Some("vertex_main"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Uint32],
-                })],
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
+                    }),
+                ],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Front), ..Default::default() },
@@ -1197,11 +1225,18 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &spot_shadow_shader,
                 entry_point: Some("vertex_main"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Uint32],
-                })],
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4],
+                    }),
+                ],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
@@ -1726,12 +1761,26 @@ impl Renderer {
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Uint32],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+        };
+        let instance_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![
+                3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4,
+                7 => Float32x4, 8 => Float32x4, 9 => Float32x4,
+                10 => Float32x4, 11 => Float32x4, 12 => Float32x4, 13 => Uint32
+            ],
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene pipeline"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vertex_main"), buffers: &[Some(vertex_layout.clone())], compilation_options: Default::default() },
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex_main"),
+                buffers: &[Some(vertex_layout.clone()), Some(instance_vertex_layout.clone())],
+                compilation_options: Default::default(),
+            },
             primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
@@ -1774,7 +1823,12 @@ impl Renderer {
         let wireframe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("wireframe pipeline"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vertex_main"), buffers: &[Some(vertex_layout.clone())], compilation_options: Default::default() },
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex_main"),
+                buffers: &[Some(vertex_layout.clone()), Some(instance_vertex_layout.clone())],
+                compilation_options: Default::default(),
+            },
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
@@ -1800,7 +1854,12 @@ impl Renderer {
         let depth_prepass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("depth prepass pipeline"),
             layout: Some(&depth_pipeline_layout),
-            vertex: wgpu::VertexState { module: &depth_shader, entry_point: Some("vertex_main"), buffers: &[Some(vertex_layout.clone())], compilation_options: Default::default() },
+            vertex: wgpu::VertexState {
+                module: &depth_shader,
+                entry_point: Some("vertex_main"),
+                buffers: &[Some(vertex_layout.clone()), Some(instance_vertex_layout.clone())],
+                compilation_options: Default::default(),
+            },
             primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
@@ -1974,6 +2033,13 @@ impl Renderer {
         let wireframe_contents = if wireframe_indices.is_empty() { bytemuck::bytes_of(&dummy_wireframe_index) } else { bytemuck::cast_slice(&wireframe_indices) };
         let vertex_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh vertices"), contents: vertex_contents, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST });
+        let dummy_instance = RendererInstanceData::zeroed();
+        let instance_contents = if instance_data.is_empty() { bytemuck::bytes_of(&dummy_instance) } else { bytemuck::cast_slice(&instance_data) };
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh instance data"),
+            contents: instance_contents,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: index_contents, usage: wgpu::BufferUsages::INDEX });
         let wireframe_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("wireframe indices"),
@@ -2012,10 +2078,16 @@ impl Renderer {
             angular_segment_pipeline,
             sdf_occupancy_gizmo_pipeline,
             vertex_buffer,
+            instance_buffer,
             index_buffer,
             index_count: indices.len() as u32,
             mesh_topology_signature: mesh_topology_signature(instances),
             instance_signatures: instances.iter().map(mesh_instance_signature).collect(),
+            instance_signature_scratch: Vec::new(),
+            instance_data_scratch: instance_data,
+            instance_data_offsets,
+            instance_data_dirty_slots: Vec::new(),
+            mesh_draw_batches,
             wireframe_index_buffer,
             wireframe_index_count: wireframe_indices.len() as u32,
             camera_buffer,
@@ -2097,7 +2169,6 @@ impl Renderer {
             shadow_bind_groups,
             shadow_matrices,
             shadow_cascade_splits,
-            shadow_draw_ranges,
             local_mesh_bounds,
             shadow_caster_bounds,
             spot_shadow_pipeline,
@@ -2167,22 +2238,33 @@ impl Renderer {
             return Err("renderer does not accept empty mesh instances".into());
         }
         let topology_signature = mesh_topology_signature(instances);
-        let instance_signatures = instances.iter().map(mesh_instance_signature).collect::<Vec<_>>();
-        let expected_vertex_bytes = instances.iter().map(|instance| instance.mesh.vertices().len()).sum::<usize>() * mem::size_of::<RendererMeshVertex>();
+        self.instance_signature_scratch.clear();
+        self.instance_signature_scratch.extend(instances.iter().map(mesh_instance_signature));
+        let (unique_vertex_count, unique_index_count) = unique_mesh_geometry_counts(instances);
+        let expected_vertex_bytes = unique_vertex_count * mem::size_of::<RendererMeshVertex>();
         let topology_changed = topology_signature != self.mesh_topology_signature
-            || instances.iter().map(|instance| instance.mesh.indices().len()).sum::<usize>() as u32 != self.index_count
+            || unique_index_count as u32 != self.index_count
             || expected_vertex_bytes.max(mem::size_of::<RendererMeshVertex>()) != self.vertex_buffer.size() as usize;
-        let instances_changed = instance_signatures != self.instance_signatures;
+        let instances_changed = self.instance_signature_scratch != self.instance_signatures;
         if !topology_changed && !instances_changed {
             self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
             return Ok(());
         }
         if topology_changed {
-            let (vertices, indices) = flatten_instances(instances)?;
+            let (vertices, indices, mesh_draw_batches) = flatten_meshes(instances)?;
             let dummy_vertex = RendererMeshVertex::zeroed();
             let vertex_contents = if vertices.is_empty() { bytemuck::bytes_of(&dummy_vertex) } else { bytemuck::cast_slice(&vertices) };
             let dummy_index = 0_u32;
             let index_contents = if indices.is_empty() { bytemuck::bytes_of(&dummy_index) } else { bytemuck::cast_slice(&indices) };
+            self.mesh_draw_batches = mesh_draw_batches;
+            (self.instance_data_scratch, self.instance_data_offsets) = build_instance_data(instances, &self.mesh_draw_batches);
+            let dummy_instance = RendererInstanceData::zeroed();
+            let instance_contents = if self.instance_data_scratch.is_empty() { bytemuck::bytes_of(&dummy_instance) } else { bytemuck::cast_slice(&self.instance_data_scratch) };
+            self.instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh instance data"),
+                contents: instance_contents,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
             self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh vertices"),
                 contents: vertex_contents,
@@ -2191,7 +2273,7 @@ impl Renderer {
             self.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: index_contents, usage: wgpu::BufferUsages::INDEX });
             self.index_count = indices.len() as u32;
             self.mesh_topology_signature = topology_signature;
-            self.instance_signatures = instance_signatures;
+            self.instance_signatures.clone_from(&self.instance_signature_scratch);
             let wireframe_indices = wireframe_indices(&indices);
             let dummy_wireframe_index = 0_u32;
             let wireframe_contents = if wireframe_indices.is_empty() { bytemuck::bytes_of(&dummy_wireframe_index) } else { bytemuck::cast_slice(&wireframe_indices) };
@@ -2203,25 +2285,38 @@ impl Renderer {
             self.wireframe_index_count = wireframe_indices.len() as u32;
             self.local_mesh_bounds = mesh_local_bounds(instances);
             self.shadow_caster_bounds = transformed_mesh_bounds(instances, &self.local_mesh_bounds);
-            self.shadow_draw_ranges = shadow_draw_ranges(instances);
             self.shadow_bounds = combined_geometry_bounds(&geometry_bounds(instances));
             self.visibility_bounds.clear();
             self.visibility_rebuild_cooldown = 0;
         } else {
-            let mut vertex_offset = 0_usize;
+            self.instance_data_dirty_slots.clear();
             for (instance_index, instance) in instances.iter().enumerate() {
-                if instance_signatures[instance_index] != self.instance_signatures[instance_index] {
-                    let vertices = flatten_instance(instance, instance_index);
-                    let byte_offset = (vertex_offset * mem::size_of::<RendererMeshVertex>()) as u64;
-                    self.queue.write_buffer(&self.vertex_buffer, byte_offset, bytemuck::cast_slice(&vertices));
+                if self.instance_signature_scratch[instance_index] != self.instance_signatures[instance_index] {
+                    let data_slot = self.instance_data_offsets[instance_index];
+                    self.instance_data_scratch[data_slot] = renderer_instance_data(instance, instance_index);
+                    self.instance_data_dirty_slots.push(data_slot);
                 }
-                vertex_offset += instance.mesh.vertices().len();
             }
-            self.instance_signatures = instance_signatures;
+            self.instance_data_dirty_slots.sort_unstable();
+            let mut dirty_start = 0;
+            while dirty_start < self.instance_data_dirty_slots.len() {
+                let mut dirty_end = dirty_start + 1;
+                while dirty_end < self.instance_data_dirty_slots.len() && self.instance_data_dirty_slots[dirty_end] == self.instance_data_dirty_slots[dirty_end - 1] + 1 {
+                    dirty_end += 1;
+                }
+                let data_start = self.instance_data_dirty_slots[dirty_start];
+                let data_end = self.instance_data_dirty_slots[dirty_end - 1] + 1;
+                let byte_offset = (data_start * mem::size_of::<RendererInstanceData>()) as u64;
+                self.queue.write_buffer(&self.instance_buffer, byte_offset, bytemuck::cast_slice(&self.instance_data_scratch[data_start..data_end]));
+                dirty_start = dirty_end;
+            }
+            self.instance_signatures.clone_from(&self.instance_signature_scratch);
             self.shadow_caster_bounds = transformed_mesh_bounds(instances, &self.local_mesh_bounds);
             self.shadow_bounds = combined_geometry_bounds(&self.shadow_caster_bounds);
         }
-        self.shadow_scheduler.mark_all_dirty();
+        if self.render_settings.shadows_enabled {
+            self.shadow_scheduler.mark_all_dirty();
+        }
         self.dynamic_probe_samples_dirty = true;
         self.sdf_geometry_cache_dirty = true;
         self.surface_inspection_meshes_dirty = true;
@@ -2334,20 +2429,22 @@ impl Renderer {
             return Ok(());
         }
         self.camera = *camera;
-        self.shadow_scheduler.rebuild(&self.lights, &self.camera, self.render_settings.shadow_budget);
-        self.rebuild_shadow_resources();
-        self.update_shadow_scheduler_stats();
-        self.shadow_matrices = self
-            .lights
-            .iter()
-            .find_map(|light| match light {
-                Light::Directional(light) => Some(cascade_shadow_view_projections(light, &self.camera, self.config.width, self.config.height, self.render_settings.shadow_cascade_count)),
-                _ => None,
-            })
-            .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADE_COUNT]);
-        self.shadow_cascade_splits = cascade_splits_for_count(&self.camera, self.render_settings.shadow_cascade_count);
-        for (cascade_index, matrix) in self.shadow_matrices.iter().enumerate() {
-            self.queue.write_buffer(&self.shadow_uniform_buffers[cascade_index], 0, bytemuck::bytes_of(&ShadowUniform { view_projection: matrix.to_cols_array_2d() }));
+        if self.render_settings.shadows_enabled {
+            self.shadow_scheduler.rebuild(&self.lights, &self.camera, self.render_settings.shadow_budget);
+            self.rebuild_shadow_resources();
+            self.update_shadow_scheduler_stats();
+            self.shadow_matrices = self
+                .lights
+                .iter()
+                .find_map(|light| match light {
+                    Light::Directional(light) => Some(cascade_shadow_view_projections(light, &self.camera, self.config.width, self.config.height, self.render_settings.shadow_cascade_count)),
+                    _ => None,
+                })
+                .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADE_COUNT]);
+            self.shadow_cascade_splits = cascade_splits_for_count(&self.camera, self.render_settings.shadow_cascade_count);
+            for (cascade_index, matrix) in self.shadow_matrices.iter().enumerate() {
+                self.queue.write_buffer(&self.shadow_uniform_buffers[cascade_index], 0, bytemuck::bytes_of(&ShadowUniform { view_projection: matrix.to_cols_array_2d() }));
+            }
         }
         let camera_uniform = camera_uniform(self.config.width, self.config.height, camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
@@ -2370,34 +2467,36 @@ impl Renderer {
         }
         self.lights.clear();
         self.lights.extend_from_slice(lights);
-        if shadow_geometry_changed(&previous_lights, &self.lights) {
-            self.shadow_scheduler.mark_all_dirty();
+        if self.render_settings.shadows_enabled {
+            if shadow_geometry_changed(&previous_lights, &self.lights) {
+                self.shadow_scheduler.mark_all_dirty();
+            }
+            self.shadow_scheduler.rebuild(&self.lights, &self.camera, self.render_settings.shadow_budget);
+            self.rebuild_shadow_resources();
+            self.update_shadow_scheduler_stats();
+            let shadow_matrices = self
+                .lights
+                .iter()
+                .find_map(|light| match light {
+                    Light::Directional(light) => Some(cascade_shadow_view_projections(light, &self.camera, self.config.width, self.config.height, self.render_settings.shadow_cascade_count)),
+                    _ => None,
+                })
+                .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADE_COUNT]);
+            self.shadow_matrices = shadow_matrices;
+            self.shadow_cascade_splits = cascade_splits_for_count(&self.camera, self.render_settings.shadow_cascade_count);
+            for (cascade_index, matrix) in shadow_matrices.iter().enumerate() {
+                self.queue.write_buffer(&self.shadow_uniform_buffers[cascade_index], 0, bytemuck::bytes_of(&ShadowUniform { view_projection: matrix.to_cols_array_2d() }));
+            }
+            let spot_shadow_matrix = self
+                .lights
+                .iter()
+                .find_map(|light| match light {
+                    Light::Spot(light) => Some(spot_shadow_view_projection(light)),
+                    _ => None,
+                })
+                .unwrap_or(Mat4::IDENTITY);
+            self.queue.write_buffer(&self.spot_shadow_uniform_buffer, 0, bytemuck::bytes_of(&SpotShadowUniform { view_projection: spot_shadow_matrix.to_cols_array_2d() }));
         }
-        self.shadow_scheduler.rebuild(&self.lights, &self.camera, self.render_settings.shadow_budget);
-        self.rebuild_shadow_resources();
-        self.update_shadow_scheduler_stats();
-        let shadow_matrices = self
-            .lights
-            .iter()
-            .find_map(|light| match light {
-                Light::Directional(light) => Some(cascade_shadow_view_projections(light, &self.camera, self.config.width, self.config.height, self.render_settings.shadow_cascade_count)),
-                _ => None,
-            })
-            .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADE_COUNT]);
-        self.shadow_matrices = shadow_matrices;
-        self.shadow_cascade_splits = cascade_splits_for_count(&self.camera, self.render_settings.shadow_cascade_count);
-        for (cascade_index, matrix) in shadow_matrices.iter().enumerate() {
-            self.queue.write_buffer(&self.shadow_uniform_buffers[cascade_index], 0, bytemuck::bytes_of(&ShadowUniform { view_projection: matrix.to_cols_array_2d() }));
-        }
-        let spot_shadow_matrix = self
-            .lights
-            .iter()
-            .find_map(|light| match light {
-                Light::Spot(light) => Some(spot_shadow_view_projection(light)),
-                _ => None,
-            })
-            .unwrap_or(Mat4::IDENTITY);
-        self.queue.write_buffer(&self.spot_shadow_uniform_buffer, 0, bytemuck::bytes_of(&SpotShadowUniform { view_projection: spot_shadow_matrix.to_cols_array_2d() }));
         let camera_uniform = camera_uniform(self.config.width, self.config.height, &self.camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
         self.performance_stats.light_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
@@ -2768,26 +2867,32 @@ impl Renderer {
             return;
         }
         let cascade_count_changed = self.render_settings.shadow_cascade_count != settings.shadow_cascade_count;
+        let shadows_reenabled = !self.render_settings.shadows_enabled && settings.shadows_enabled;
         let gi_reenabled = !self.render_settings.irradiance_enabled && settings.irradiance_enabled && self.sdf_gi_enabled;
         self.render_settings = settings;
         if gi_reenabled {
             self.radiance_field.invalidate();
         }
-        self.shadow_scheduler.rebuild(&self.lights, &self.camera, settings.shadow_budget);
-        self.rebuild_shadow_resources();
-        self.update_shadow_scheduler_stats();
-        if cascade_count_changed {
-            self.shadow_matrices = self
-                .lights
-                .iter()
-                .find_map(|light| match light {
-                    Light::Directional(light) => Some(cascade_shadow_view_projections(light, &self.camera, self.config.width, self.config.height, settings.shadow_cascade_count)),
-                    _ => None,
-                })
-                .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADE_COUNT]);
-            self.shadow_cascade_splits = cascade_splits_for_count(&self.camera, settings.shadow_cascade_count);
-            for (cascade_index, matrix) in self.shadow_matrices.iter().enumerate() {
-                self.queue.write_buffer(&self.shadow_uniform_buffers[cascade_index], 0, bytemuck::bytes_of(&ShadowUniform { view_projection: matrix.to_cols_array_2d() }));
+        if settings.shadows_enabled {
+            if shadows_reenabled {
+                self.shadow_scheduler.mark_all_dirty();
+            }
+            self.shadow_scheduler.rebuild(&self.lights, &self.camera, settings.shadow_budget);
+            self.rebuild_shadow_resources();
+            self.update_shadow_scheduler_stats();
+            if cascade_count_changed || shadows_reenabled {
+                self.shadow_matrices = self
+                    .lights
+                    .iter()
+                    .find_map(|light| match light {
+                        Light::Directional(light) => Some(cascade_shadow_view_projections(light, &self.camera, self.config.width, self.config.height, settings.shadow_cascade_count)),
+                        _ => None,
+                    })
+                    .unwrap_or([Mat4::IDENTITY; SHADOW_CASCADE_COUNT]);
+                self.shadow_cascade_splits = cascade_splits_for_count(&self.camera, settings.shadow_cascade_count);
+                for (cascade_index, matrix) in self.shadow_matrices.iter().enumerate() {
+                    self.queue.write_buffer(&self.shadow_uniform_buffers[cascade_index], 0, bytemuck::bytes_of(&ShadowUniform { view_projection: matrix.to_cols_array_2d() }));
+                }
             }
         }
         let camera_uniform = camera_uniform(self.config.width, self.config.height, &self.camera, &self.lights, self.render_debug_mode, settings, self.shadow_bounds);
@@ -3536,7 +3641,12 @@ impl Renderer {
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, 0..1);
+        for batch in &self.mesh_draw_batches {
+            let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
+            let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
+            pass.draw_indexed(batch.index_range.clone(), 0, 0..batch.instance_range.len() as u32);
+        }
     }
 
     fn render_scene_pass(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, depth_view: &wgpu::TextureView, depth_bind_group: &wgpu::BindGroup) {
@@ -3576,10 +3686,20 @@ impl Renderer {
         if self.render_debug_mode == RenderDebugMode::Wireframe {
             pass.set_pipeline(&self.wireframe_pipeline);
             pass.set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.wireframe_index_count, 0, 0..1);
+            for batch in &self.mesh_draw_batches {
+                let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
+                let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
+                pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
+                pass.draw_indexed(batch.wireframe_range.clone(), 0, 0..batch.instance_range.len() as u32);
+            }
         } else {
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            for batch in &self.mesh_draw_batches {
+                let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
+                let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
+                pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
+                pass.draw_indexed(batch.index_range.clone(), 0, 0..batch.instance_range.len() as u32);
+            }
         }
     }
 
@@ -3631,9 +3751,21 @@ impl Renderer {
             pass.set_bind_group(0, &self.shadow_bind_groups[cascade_index], &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            for (draw_range, bounds) in self.shadow_draw_ranges.iter().zip(&self.shadow_caster_bounds) {
-                if shadow_bounds_intersect(self.shadow_matrices[cascade_index], *bounds) {
-                    pass.draw_indexed(draw_range.clone(), 0, 0..1);
+            for batch in &self.mesh_draw_batches {
+                let mut visible_start = None;
+                for (batch_instance_index, instance_index) in batch.instance_indices.iter().enumerate() {
+                    let visible = shadow_bounds_intersect(self.shadow_matrices[cascade_index], self.shadow_caster_bounds[*instance_index]);
+                    match (visible_start, visible) {
+                        (None, true) => visible_start = Some(batch_instance_index),
+                        (Some(start), false) => {
+                            draw_shadow_instance_range(&mut pass, &self.instance_buffer, batch, start, batch_instance_index);
+                            visible_start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(start) = visible_start {
+                    draw_shadow_instance_range(&mut pass, &self.instance_buffer, batch, start, batch.instance_indices.len());
                 }
             }
         }
@@ -3674,7 +3806,12 @@ impl Renderer {
             pass.set_bind_group(0, &self.spot_shadow_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            for batch in &self.mesh_draw_batches {
+                let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
+                let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
+                pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
+                pass.draw_indexed(batch.index_range.clone(), 0, 0..batch.instance_range.len() as u32);
+            }
             drop(pass);
             self.shadow_scheduler.mark_clean(request.light_index as usize);
             rendered += 1;
@@ -3714,7 +3851,12 @@ impl Renderer {
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
+                for batch in &self.mesh_draw_batches {
+                    let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
+                    let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
+                    pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
+                    pass.draw_indexed(batch.index_range.clone(), 0, 0..batch.instance_range.len() as u32);
+                }
             }
             self.shadow_scheduler.mark_clean(request.light_index as usize);
         }
@@ -4115,10 +4257,22 @@ fn mesh_topology_signature(instances: &[MeshInstance]) -> u64 {
     instances.len().hash(&mut hasher);
     for instance in instances {
         instance.mesh.geometry_version().hash(&mut hasher);
-        instance.mesh.vertices().len().hash(&mut hasher);
-        instance.mesh.indices().len().hash(&mut hasher);
     }
     hasher.finish()
+}
+
+fn unique_mesh_geometry_counts(instances: &[MeshInstance]) -> (usize, usize) {
+    let mut meshes = HashMap::new();
+    let mut vertex_count = 0;
+    let mut index_count = 0;
+    for instance in instances {
+        let version = instance.mesh.geometry_version();
+        if meshes.insert(version, ()).is_none() {
+            vertex_count += instance.mesh.vertices().len();
+            index_count += instance.mesh.indices().len();
+        }
+    }
+    (vertex_count, index_count)
 }
 
 fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
@@ -4136,42 +4290,93 @@ fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
     hasher.finish()
 }
 
-fn flatten_instances(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>, Vec<u32>), String> {
+fn flatten_meshes(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>, Vec<u32>, Vec<MeshDrawBatch>), String> {
     if instances.iter().any(|instance| instance.mesh.is_empty()) {
         return Err("renderer does not accept empty mesh instances".into());
+    }
+
+    let mut mesh_batches = Vec::<MeshDrawBatch>::new();
+    let mut batch_indices = HashMap::new();
+    for (instance_index, instance) in instances.iter().enumerate() {
+        let version = instance.mesh.geometry_version();
+        let batch_index = match batch_indices.get(&version) {
+            Some(batch_index) => *batch_index,
+            None => {
+                let batch_index = mesh_batches.len();
+                mesh_batches.push(MeshDrawBatch { index_range: 0..0, wireframe_range: 0..0, instance_range: 0..0, instance_indices: Vec::new() });
+                batch_indices.insert(version, batch_index);
+                batch_index
+            }
+        };
+        mesh_batches[batch_index].instance_indices.push(instance_index);
     }
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut vertex_offset = 0_u32;
-    for (instance_index, instance) in instances.iter().enumerate() {
-        vertices.extend(flatten_instance(instance, instance_index));
-        indices.extend(instance.mesh.indices().iter().map(|index| index + vertex_offset));
-        vertex_offset += instance.mesh.vertices().len() as u32;
+    let mut instance_offset = 0_usize;
+    for batch in &mut mesh_batches {
+        let mesh = &instances[batch.instance_indices[0]].mesh;
+        let index_start = indices.len() as u32;
+        vertices.extend(mesh.vertices().iter().map(renderer_mesh_vertex));
+        indices.extend(mesh.indices().iter().map(|index| index + vertex_offset));
+        vertex_offset += mesh.vertices().len() as u32;
+        let index_end = indices.len() as u32;
+        batch.index_range = index_start..index_end;
+        batch.wireframe_range = (index_start * 2)..(index_end * 2);
+        batch.instance_range = instance_offset..instance_offset + batch.instance_indices.len();
+        instance_offset = batch.instance_range.end;
     }
-    Ok((vertices, indices))
+    Ok((vertices, indices, mesh_batches))
 }
 
-fn flatten_instance(instance: &MeshInstance, instance_index: usize) -> Vec<RendererMeshVertex> {
+fn renderer_mesh_vertex(vertex: &MeshVertex) -> RendererMeshVertex {
+    RendererMeshVertex { position: vertex.position, normal: vertex.normal, color: vertex.color }
+}
+
+fn build_instance_data(instances: &[MeshInstance], batches: &[MeshDrawBatch]) -> (Vec<RendererInstanceData>, Vec<usize>) {
+    let mut data = Vec::with_capacity(instances.len());
+    let mut data_offsets = vec![0; instances.len()];
+    for batch in batches {
+        for instance_index in &batch.instance_indices {
+            data_offsets[*instance_index] = data.len();
+            data.push(renderer_instance_data(&instances[*instance_index], *instance_index));
+        }
+    }
+    (data, data_offsets)
+}
+
+fn renderer_instance_data(instance: &MeshInstance, instance_index: usize) -> RendererInstanceData {
     let transform = instance.transform;
-    instance
-        .mesh
-        .vertices()
-        .iter()
-        .map(|vertex| {
-            let position = transform.transform_point(Vec3::from_array(vertex.position));
-            let normal = transform.transform_vector(Vec3::from_array(vertex.normal)).normalize_or_zero();
-            RendererMeshVertex {
-                position: position.to_array(),
-                normal: normal.to_array(),
-                color: vertex.color,
-                material_base_color: instance.material.base_color.to_array(),
-                material_params: [instance.material.metallic.clamp(0.0, 1.0), instance.material.roughness.clamp(0.04, 1.0), 0.5, instance.material.emission_strength.max(0.0)],
-                material_emission: instance.material.emission.to_array(),
-                surface_id: instance_index as u32 + 1,
-            }
-        })
-        .collect()
+    let inverse_scale = Vec3::new(
+        if transform.scale.x.abs() > 1.0e-8 { transform.scale.x.recip() } else { 0.0 },
+        if transform.scale.y.abs() > 1.0e-8 { transform.scale.y.recip() } else { 0.0 },
+        if transform.scale.z.abs() > 1.0e-8 { transform.scale.z.recip() } else { 0.0 },
+    );
+    let normal_matrix = Mat3::from_quat(transform.rotation) * Mat3::from_diagonal(inverse_scale);
+    let normal_columns = normal_matrix.to_cols_array_2d();
+    let material_base_color = instance.material.base_color.to_array();
+    let material_params = [instance.material.metallic.clamp(0.0, 1.0), instance.material.roughness.clamp(0.04, 1.0), 0.5, instance.material.emission_strength.max(0.0)];
+    let material_emission = instance.material.emission.to_array();
+    let surface_id = instance_index as u32 + 1;
+    RendererInstanceData {
+        model: transform.matrix().to_cols_array_2d(),
+        normal: normal_columns.map(|column| [column[0], column[1], column[2], 0.0]),
+        material_base_color,
+        material_params,
+        material_emission,
+        surface_id,
+        padding: [0; 3],
+    }
+}
+
+fn draw_shadow_instance_range<'pass>(pass: &mut wgpu::RenderPass<'pass>, instance_buffer: &'pass wgpu::Buffer, batch: &MeshDrawBatch, start: usize, end: usize) {
+    let first_instance = batch.instance_range.start + start;
+    let last_instance = batch.instance_range.start + end;
+    let instance_start = (first_instance * mem::size_of::<RendererInstanceData>()) as u64;
+    let instance_end = (last_instance * mem::size_of::<RendererInstanceData>()) as u64;
+    pass.set_vertex_buffer(1, instance_buffer.slice(instance_start..instance_end));
+    pass.draw_indexed(batch.index_range.clone(), 0, 0..(end - start) as u32);
 }
 
 fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -5860,17 +6065,6 @@ fn segment_triangle_intersection(start: Vec3, direction: Vec3, segment_length: f
         return None;
     }
     Some((distance, Vec3::new(1.0 - barycentric_u - barycentric_v, barycentric_u, barycentric_v)))
-}
-
-fn shadow_draw_ranges(instances: &[MeshInstance]) -> Vec<Range<u32>> {
-    let mut ranges = Vec::with_capacity(instances.len());
-    let mut index_start = 0_u32;
-    for instance in instances {
-        let index_count = instance.mesh.indices().len() as u32;
-        ranges.push(index_start..index_start + index_count);
-        index_start += index_count;
-    }
-    ranges
 }
 
 fn shadow_bounds_intersect(matrix: Mat4, bounds: GeometryBounds) -> bool {
