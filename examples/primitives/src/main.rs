@@ -6,6 +6,8 @@ use labyrinth::{
 };
 use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
 
+const PROFILE_WARMUP_SECONDS: f32 = 2.0;
+
 struct PrimitiveDemo {
     cube: Option<MeshId>,
     sphere: Option<MeshId>,
@@ -21,6 +23,10 @@ struct PrimitiveDemo {
     light_angle: f32,
     font: Option<FontAsset>,
     debug_panels: Option<DebugPanels>,
+    profile_seconds: Option<f32>,
+    elapsed_seconds: f32,
+    frame_intervals_ms: Vec<f32>,
+    engine_frame_ms: Vec<f32>,
 }
 
 impl PrimitiveDemo {
@@ -141,6 +147,14 @@ impl PrimitiveDemo {
         light.direction = Vec3::new(angle.cos() * 0.7, 1.0, angle.sin() * 0.7).normalize();
         Ok(())
     }
+
+    fn report_profile(&self) {
+        println!("Build profile: {}", if cfg!(debug_assertions) { "debug" } else { "release" });
+        println!("Scene entities: meshes=3 cameras=1 lights=1; cube, sphere, and light animate");
+        println!("Captured frames: {}", self.frame_intervals_ms.len());
+        report_series("Frame interval", &self.frame_intervals_ms);
+        report_series("Engine CPU frame", &self.engine_frame_ms);
+    }
 }
 
 impl Application for PrimitiveDemo {
@@ -152,6 +166,15 @@ impl Application for PrimitiveDemo {
 
     fn update(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         let delta_seconds = context.time.delta_seconds();
+        let sample_frame = self.elapsed_seconds >= PROFILE_WARMUP_SECONDS;
+        self.elapsed_seconds += delta_seconds;
+        if self.profile_seconds.is_some() && sample_frame {
+            self.frame_intervals_ms.push(delta_seconds * 1000.0);
+            self.engine_frame_ms.push(context.performance_stats.frame_cpu_ms);
+        }
+        if self.profile_seconds.is_some_and(|duration| self.elapsed_seconds >= duration) {
+            context.request_exit();
+        }
         self.update_cube(context, delta_seconds)?;
         self.update_sphere(context, delta_seconds)?;
         self.debug_panels.as_mut().expect("shared debug panels are initialized").update(context);
@@ -160,12 +183,51 @@ impl Application for PrimitiveDemo {
         self.update_light(context, delta_seconds)?;
         Ok(())
     }
+
+    fn cleanup(&mut self, _context: &mut RuntimeContext) {
+        if self.profile_seconds.is_some() {
+            self.report_profile();
+        }
+    }
+}
+
+fn report_series(name: &str, samples: &[f32]) {
+    if samples.is_empty() {
+        println!("{name}: no samples");
+        return;
+    }
+    let mut sorted_samples = samples.to_vec();
+    sorted_samples.sort_by(f32::total_cmp);
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    let standard_deviation = (samples.iter().map(|sample| (sample - mean).powi(2)).sum::<f32>() / samples.len() as f32).sqrt();
+    let frames_per_second = if name == "Frame interval" { 1000.0 / mean } else { 0.0 };
+    println!(
+        "{name}: mean={mean:.3} ms stddev={standard_deviation:.3} ms p50={:.3} ms p95={:.3} ms p99={:.3} ms max={:.3} ms{}",
+        percentile(&sorted_samples, 0.50),
+        percentile(&sorted_samples, 0.95),
+        percentile(&sorted_samples, 0.99),
+        sorted_samples[sorted_samples.len() - 1],
+        if frames_per_second > 0.0 { format!(" mean_fps={frames_per_second:.1}") } else { String::new() },
+    );
+}
+
+fn percentile(sorted_samples: &[f32], percentile: f32) -> f32 {
+    let index = ((sorted_samples.len() - 1) as f32 * percentile).ceil() as usize;
+    sorted_samples[index]
 }
 
 fn main() -> Result<(), String> {
     let mut settings = WindowSettings::default();
+    let mut profile_seconds = None;
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
+            _ if argument.starts_with("--profile-seconds=") => {
+                let duration = argument.trim_start_matches("--profile-seconds=").parse::<f32>().map_err(|error| format!("invalid profile duration: {error}"))?;
+                if !duration.is_finite() || duration < PROFILE_WARMUP_SECONDS + 1.0 {
+                    return Err(format!("profile duration must be at least {:.0} seconds", PROFILE_WARMUP_SECONDS + 1.0));
+                }
+                profile_seconds = Some(duration);
+            }
             "--windowed" => settings.mode = WindowMode::Windowed,
             "--borderless" => settings.mode = WindowMode::Borderless,
             "--fullscreen" => settings.mode = WindowMode::Exclusive,
@@ -195,6 +257,10 @@ fn main() -> Result<(), String> {
             light_angle: 0.0,
             font: None,
             debug_panels: None,
+            profile_seconds,
+            elapsed_seconds: 0.0,
+            frame_intervals_ms: Vec::new(),
+            engine_frame_ms: Vec::new(),
         },
     )
 }

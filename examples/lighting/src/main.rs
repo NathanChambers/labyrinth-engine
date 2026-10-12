@@ -400,7 +400,6 @@ impl Application for LightingDemo {
         }
         context.gi_radiance_temporal_accumulation_enabled = true;
         context.gizmos_enabled = false;
-        context.gi_gizmos_enabled = false;
         self.setup_ui(context)?;
         self.setup_active_entities(context)
     }

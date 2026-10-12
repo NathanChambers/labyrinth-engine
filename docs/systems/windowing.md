@@ -15,9 +15,9 @@ Windowing owns the desktop event loop, window lifetime, initial size, display mo
 ## Public contract
 RuntimeContext includes an optional debug capture coordinator. WindowSettings may specify a Rhai capture script and a capture output root. The script is compiled after application setup; its camera actions run after the application update, and capture.exit() exits cleanly after pending images are written.
 
-`run(settings, application)` starts the event loop. The application receives `setup`, `update`, and `cleanup` lifecycle hooks through the `Application` trait. `RuntimeContext` exposes the scene registry, active camera and light assignments, and global `Time`. Games spawn mesh, camera, and light entities, retain typed handles, mutate them through scene accessors, and choose the active render entities through `active_camera` and `active_lights`. `WindowSettings` selects title, logical size, mode, and graphics API. The event loop uses `ControlFlow::Poll` and requests redraws continuously. The renderer selects `Immediate` when the surface supports it and otherwise falls back to `AutoNoVsync`, with a three-frame surface latency budget to reduce acquire backpressure during uncapped rendering.
+`run(settings, application)` starts the event loop. The application receives `setup`, `update`, and `cleanup` lifecycle hooks through the `Application` trait. `RuntimeContext` exposes the scene registry, active camera and light assignments, and global `Time`. Games spawn mesh, camera, and light entities, retain typed handles, mutate them through scene accessors, and choose the active render entities through `active_camera` and `active_lights`. An application may leave all three collections empty; windowing supplies an internal default camera to the renderer without adding a camera to the scene. `RuntimeContext::request_exit` exits after the current frame has been rendered and still runs application cleanup. `WindowSettings` selects title, logical size, mode, and graphics API. The event loop uses `ControlFlow::Poll` and requests redraws continuously. The renderer selects `Immediate` when the surface supports it and otherwise falls back to `AutoNoVsync`, with a three-frame surface latency budget to reduce acquire backpressure during uncapped rendering.
 
-F11 cycles windowed → borderless → exclusive → windowed. Escape and the close button exit. Exclusive mode chooses a reported video mode at the monitor's native size when possible, preferring larger area and higher refresh rate. It requests borderless fullscreen when no usable mode is available. On Windows, a display-mode test guards the exclusive request; on Wayland, exclusive requests use borderless because the window system does not support them.
+F1 toggles the UI canvas between normal UI and its marked overlay labels, such as the shared FPS counter. F11 cycles windowed → borderless → exclusive → windowed. Escape and the close button exit. Exclusive mode chooses a reported video mode at the monitor's native size when possible, preferring larger area and higher refresh rate. It requests borderless fullscreen when no usable mode is available. On Windows, a display-mode test guards the exclusive request; on Wayland, exclusive requests use borderless because the window system does not support them.
 
 ## Lifecycle
 
@@ -27,12 +27,14 @@ The application creates its window and renderer on `resumed`. It releases cursor
 
 | Other system | Direction | Data or command | When | Failure behavior |
 | --- | --- | --- | --- | --- |
-| [Rendering](rendering.md) | Windowing → rendering | Window, graphics API, mesh instances | Resume | Error exits the loop |
+| [Rendering](rendering.md) | Windowing → rendering | Window, graphics API, assigned camera or internal fallback, lights, and mesh instances (which may be empty) | Resume | Error exits the loop |
 | [Math](math.md) | Windowing → math | Elapsed time and animation updates | Each redraw | Update changes are applied before rendering |
+| [UI](ui.md) | Windowing → UI | F1 press toggles normal UI visibility while preserving marked overlay labels | Key press; repeats ignored | UI input is suppressed in reduced mode |
 | [Rendering](rendering.md) | Windowing → rendering | Resize and draw | Window event | Draw error exits the loop |
 | [Rendering](rendering.md) | Rendering → windowing | Initialization or draw error | Startup or redraw | Error returned from `run` |
 | [Scripting](scripting.md) | Windowing → scripting | Debug script source and capability grant | After application setup | Script compilation error exits the loop |
 | [Debug Capture](capture.md) | Windowing → capture | Frame delta, active scene, and renderer | Each redraw | Capture error exits the loop; capture.exit() exits cleanly |
+| Application | Windowing → event loop | `RuntimeContext::request_exit()` | After current frame rendering | Cleanup runs on the normal exit path |
 
 ## Verification and open questions
 

@@ -61,7 +61,6 @@ struct GenosDemo {
     time: f32,
     box_time: f32,
     day: f32,
-    surface_probe_gi_enabled: bool,
     yaw: f32,
     pitch: f32,
     camera: Option<CameraId>,
@@ -77,7 +76,6 @@ impl Application for GenosDemo {
         context.irradiance_mode = IrradianceMode::AabbSdf;
         context.gi_radiance_field_resolution = RadianceFieldResolution { resolution: [40, 10, 40] };
         context.render_settings.ambient_intensity = 0.0;
-        context.render_settings.surface_probes_enabled = self.surface_probe_gi_enabled;
         self.build_scene(context);
         self.setup_ui(context)
     }
@@ -444,7 +442,6 @@ fn main() -> Result<(), String> {
     let mut dynamic_percent = 50;
     let mut sun_speed = 1.0;
     let mut seed = 1;
-    let mut surface_probe_gi_enabled = true;
     let mut boxes_still = false;
     let mut debug_script = None;
     let mut args = std::env::args().skip(1);
@@ -455,12 +452,11 @@ fn main() -> Result<(), String> {
             "--dynamic" => dynamic_percent = args.next().ok_or("--dynamic needs a value")?.parse().map_err(|_| "invalid --dynamic value")?,
             "--sun-speed" => sun_speed = args.next().ok_or("--sun-speed needs a value")?.parse().map_err(|_| "invalid --sun-speed value")?,
             "--seed" => seed = args.next().ok_or("--seed needs a value")?.parse().map_err(|_| "invalid --seed value")?,
-            "--global-grid-only" => surface_probe_gi_enabled = false,
             "--boxes-still" => boxes_still = true,
             argument if argument.starts_with("--capture-script=") => debug_script = Some(argument.trim_start_matches("--capture-script=").into()),
             "--help" | "-h" => {
                 println!(
-                    "genos [--scale small|big|N|NxM] [--lights 1..7] [--dynamic 0..100] [--sun-speed 0|1|4|16] [--seed N] [--boxes-still] [--global-grid-only] [--capture-script=PATH]\nClick to capture mouse; WASD + mouse to fly, Space/C to rise or descend, Shift to move faster. Escape releases the mouse."
+                    "genos [--scale small|big|N|NxM] [--lights 1..7] [--dynamic 0..100] [--sun-speed 0|1|4|16] [--seed N] [--boxes-still] [--capture-script=PATH]\nClick to capture mouse; WASD + mouse to fly, Space/C to rise or descend, Shift to move faster. Escape releases the mouse."
                 );
                 return Ok(());
             }
@@ -496,7 +492,6 @@ fn main() -> Result<(), String> {
             time: 0.0,
             box_time: 0.0,
             day: 0.5,
-            surface_probe_gi_enabled,
             yaw: 0.0,
             pitch: 0.0,
             camera: None,

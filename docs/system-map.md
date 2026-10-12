@@ -4,6 +4,7 @@ This map records relationships established in code. Broader gameplay scripting a
 
 ```text
 primitives example ──entities/assignments──> windowing ──window/scene/backend──> rendering
+control example ──empty scene + frame sampling──> windowing ──fallback camera/clear/present──> rendering
 genos stress example ──building + animated boxes and lights──> scene ──selected camera/lights/meshes──> rendering
        │                                  ^                                      │
        └──uses──> engine primitives ──> mesh <────────────────────────────────────┘
@@ -21,7 +22,7 @@ transformed source triangles ──> renderer-built triangle BVH ──Render Op
 selected field cell + Geometry/Radiance mode ──> latest-sample gizmo pass ──two trace records + 64 region radiance/sample-age records──> async readback ──> GI radiance inspector and freshness heatmap
 clicked viewport pixel ──> depth-prepass depth + world normal + surface ID ──> shared GPU candidate evaluator + SDF voxel segment checks ──async weights and RGB contributions──> readback ──> renderer CPU exact transformed-triangle segment checks ──> per-probe mesh/SDF visibility comparison, hit triangle and hit geometry ──> GI Surface Inspector and diagnostic gizmos
 panel header input ──click/drag──> shared UI window state ──collapse/position/size──> shared panels and Genos inspector
-depth + normals + surface IDs ──fixed 32px screen lattice──> retained optional screen-space probe cache (updates disabled by default)
+F1 key press ──> UI visibility mode ──skip normal UI vertices and input; preserve marked FPS label──> rendering
 uniform angular-region radiance field + relocation validity ──trilinear + soft receiver-plane weighting ──SDF voxel + direct scene-AABB segment filters + optional source-triangle BVH segment filter──> cosine-weighted angular integration──> full-resolution raster GI
 SDF build/upload timings + radiance-field GPU timing/availability ──> renderer performance stats ──> lighting diagnostics
 ```
@@ -29,6 +30,8 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | Producer | Consumer | Data or command | When |
 | --- | --- | --- | --- |
 | [Primitives example](../examples/primitives/src/main.rs) | [Windowing](systems/windowing.md) | Application implementation, entities, assignments, and window settings | Startup |
+| [Primitives example](../examples/primitives/src/main.rs) | [Profiling](systems/profiling.md) | Timed debug/release frame interval and engine CPU samples for the animated primitives scene | Profile duration after two-second warmup |
+| [Control example](../examples/control/src/main.rs) | [Windowing](systems/windowing.md) | Empty scene and optional timed debug/release frame sampling | Startup and each redraw |
 | [Engine primitives](systems/primitives.md) | [Mesh](systems/mesh.md) | Generated primitive geometry | On request |
 | [Math](systems/math.md) | [Rendering](systems/rendering.md) | Camera matrix and vector operations | Initialization and resize |
 | [Windowing](systems/windowing.md) | [Math](systems/math.md) | Frame delta and registered time scales | Each update |
@@ -36,6 +39,7 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | [Windowing](systems/windowing.md) | Suppresses cursor capture on scene clicks while surface picking is armed | Pick mode |
 | [Input](systems/input.md) | [Primitives example](../examples/primitives/src/main.rs) | Key state and mouse delta | Each update |
 | [Input](systems/input.md) | [UI](systems/ui.md) | Cursor position and left-button state | Each frame |
+| [Windowing](systems/windowing.md) | [UI](systems/ui.md) | F1 press toggles normal UI visibility; marked FPS overlay labels remain visible | Key press; repeats ignored |
 | [Shared debug panels](../crates/debug_ui/src/lib.rs) | [UI](systems/ui.md) | Reusable display mode, render options, gizmos, performance panel, and GI radiance inspector used by Lighting, Genos, and Primitives | Setup and each update |
 | [Shared debug panels](../crates/debug_ui/src/lib.rs) | [Rendering](systems/rendering.md) | `Triangle probe occlusion` render setting toggled from Render Options | Each UI update |
 | [Rendering](systems/rendering.md) | [Mesh](systems/mesh.md) | Transformed indexed triangles flattened into a world-space BVH; transform-only instance changes refit leaf triangles and node bounds, while topology changes rebuild the tree | Renderer initialization, instance update, or GI sampling when enabled |
@@ -53,8 +57,8 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Lighting example](../examples/lighting/src/main.rs) | [Scene](systems/scene.md) | Room-test point-light movement controls | Each application update |
 | [UI](systems/ui.md) | [Rendering](systems/rendering.md) | Screen-space overlay vertices | Each redraw |
 | [Application](../examples/lighting/src/main.rs) | [Rendering](systems/rendering.md) | Render settings, Lit/Unlit/Wire/GI Support display modes, selected radiance-field cell, Geometry/Radiance mode, cache freeze, temporal accumulation, and gizmo visibility | Each update |
-| [Genos stress example](../examples/genos/src/main.rs) | [Rendering](systems/rendering.md) | AABB-SDF GI mode, global-grid-only diagnostic option, time-of-day directional sun controls, and independent screen-probe GI and gizmo visibility toggles | Setup and each update |
-| [Genos capture script](../examples/genos/scripts/global_grid_diagnostic.rhai) | [Debug Capture](systems/capture.md) | Screen-probe-free global-grid GI-only and lit scene screenshots | Capture run |
+| [Genos stress example](../examples/genos/src/main.rs) | [Rendering](systems/rendering.md) | AABB-SDF GI mode and time-of-day directional sun controls | Setup and each update |
+| [Genos capture script](../examples/genos/scripts/global_grid_diagnostic.rhai) | [Debug Capture](systems/capture.md) | Global-grid GI-only and lit scene screenshots | Capture run |
 | [Genos stress example](../examples/genos/src/main.rs) | [Scene](systems/scene.md) | Building meshes, animated point-light and box transforms, and active light handles | Setup and each update |
 | [Application](../examples/lighting/src/main.rs) | [Windowing](systems/windowing.md) | Master gizmo visibility plus normals, lights, and global-probe toggles | Each redraw |
 | [Mesh](systems/mesh.md) | [Rendering](systems/rendering.md) | Validated vertices and triangle indices | Renderer initialization and scene topology updates |
@@ -79,6 +83,6 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Active camera transform, scene instances, lights, and sky for the experimental conservative-voxel AABB GI and world-space radiance field; changed scene bounds re-anchor the static fields | Each redraw or scene/light update |
 | [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Equal-area 8/32/64 angular regions per cell, two counter-sweeping rays per scheduled cell update with round-robin coverage, relocation state, and latest trace data | Scene/light change, field update, raster shading, and diagnostics |
 | [Irradiance volumes](systems/irradiance.md) | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | Latest asynchronously read back trace for the selected cell plus 64 segment radiance, sample count, attempt count, and age records; sphere gizmo maps successful sample age from white to black; unresolved regions remain black | Each redraw |
-| [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Single field refresh queue, per-cell probe relocation, trilinear interpolation, cosine-weighted angular-region integration, receiver-plane heuristic, and optional triangle-BVH probe visibility; retained optional screen-probe cache | GI-enabled compute update, raster shading, and debug views |
+| [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Single field refresh queue, per-cell probe relocation, trilinear interpolation, cosine-weighted angular-region integration, receiver-plane heuristic, and optional triangle-BVH probe visibility | GI-enabled compute update, raster shading, and debug views |
 
 The windowing system is the lifecycle coordinator. The renderer owns GPU resources and does not decide window mode. The example supplies an update callback that changes transforms before each redraw; there is no world state or scripting interaction yet. Any producer that can provide the mesh contract can use the same render path.

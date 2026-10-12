@@ -218,12 +218,23 @@ impl RadianceInspector {
         }
     }
 
-    pub fn update(&mut self, context: &mut RuntimeContext) -> bool {
-        let inspector_open = context.ui.button_toggled(self.open_button).unwrap_or(false);
+    pub fn update(&mut self, context: &mut RuntimeContext, available: bool) -> bool {
+        let inspector_open = available && context.ui.button_toggled(self.open_button).unwrap_or(false);
+        context.ui.set_button_toggled(self.open_button, inspector_open);
         context.ui.set_panel_window_visible(self.window, inspector_open);
         let collapsed = context.ui.panel_window_collapsed(self.window).unwrap_or(false);
         context.ui.set_container_visible(self.content, inspector_open && !collapsed);
         context.gi_trace_gizmos_enabled = inspector_open;
+        if !available {
+            self.pick_armed = false;
+            self.movement_keys_active = false;
+            context.ui.set_button_toggled(self.pick_button, false);
+            context.ui.set_button_toggled(self.move_button, false);
+            context.gi_surface_inspector_enabled = false;
+            context.gi_surface_inspector_pick_request = None;
+            context.cursor_capture_on_scene_click = true;
+            return false;
+        }
         context.gizmos_enabled |= inspector_open;
         context.ui.set_panel_window_expanded_height(self.window, self.panel_height(context));
         update_drawer(context, self.cell_drawer, "RADIANCE CELL");
@@ -276,7 +287,6 @@ impl RadianceInspector {
         let rays_open = self.rays_drawer.header.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false);
         let radiance_focus = inspector_open && rays_open && context.gi_trace_debug_mode == RendererGiTraceDebugMode::Radiance && !show_other_gizmos;
         context.gi_global_gizmos_enabled &= !radiance_focus;
-        context.gi_gizmos_enabled &= !radiance_focus;
         context.normal_gizmos_enabled &= !radiance_focus;
         context.light_gizmos_enabled &= !radiance_focus;
         context.sdf_occupancy_gizmos_enabled &= !radiance_focus;

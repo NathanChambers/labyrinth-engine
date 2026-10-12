@@ -32,8 +32,6 @@ const SDF_MAX_DISTANCE: f32 = 16.0;
 const SDF_CLEARANCE_RADIUS_VOXELS: u16 = 4;
 const RADIANCE_FIELD_DEFAULT_RESOLUTION: [u32; 3] = [32, 8, 32];
 const RADIANCE_FIELD_MAX_RESOLUTION: [u32; 3] = [40, 10, 40];
-const SURFACE_PROBE_STRIDE: u32 = 16;
-const SURFACE_PROBE_CAPACITY: u32 = 131_072;
 const RADIANCE_FIELD_EXTENT: Vec3 = SDF_CLIPMAP_EXTENT;
 pub const RADIANCE_FIELD_RAY_COUNT: usize = 2;
 pub const RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS: usize = 64;
@@ -261,7 +259,6 @@ pub struct RenderSettings {
     pub ambient_occlusion_enabled: bool,
     pub ambient_intensity: f32,
     pub irradiance_enabled: bool,
-    pub surface_probes_enabled: bool,
     pub triangle_probe_occlusion_enabled: bool,
     pub shadow_cascade_count: u32,
     pub shadow_resolution: u32,
@@ -281,7 +278,6 @@ impl Default for RenderSettings {
             ambient_occlusion_enabled: false,
             ambient_intensity: 0.02,
             irradiance_enabled: true,
-            surface_probes_enabled: false,
             triangle_probe_occlusion_enabled: true,
             shadow_cascade_count: SHADOW_CASCADE_COUNT as u32,
             shadow_resolution: SHADOW_MAP_SIZE,
@@ -370,13 +366,6 @@ struct CameraUniform {
     shadow_flags: [u32; 4],
     ambient_light: [f32; 4],
     gi_settings: [u32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct SurfaceProbeUniform {
-    screen_resolution: [u32; 4],
-    cache_settings: [u32; 4],
 }
 
 #[repr(C)]
@@ -845,8 +834,6 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     radiance_field_pipeline: wgpu::ComputePipeline,
     radiance_surface_inspection_pipeline: wgpu::ComputePipeline,
-    surface_probe_update_pipeline: wgpu::ComputePipeline,
-    surface_probe_maintenance_pipeline: wgpu::ComputePipeline,
     depth_prepass_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
     gi_gizmo_pipeline: wgpu::RenderPipeline,
@@ -868,7 +855,11 @@ pub struct Renderer {
     irradiance_volume_layout: Vec<RendererIrradianceVolume>,
     sdf_clipmap: SdfClipmap,
     sdf_geometry_cache: Vec<SdfGeometry>,
+    sdf_geometry_cache_dirty: bool,
     surface_inspection_meshes: Vec<SurfaceInspectionMesh>,
+    surface_inspection_meshes_dirty: bool,
+    triangle_bvh_dirty: bool,
+    triangle_bvh_topology_dirty: bool,
     sdf_uniform_buffer: wgpu::Buffer,
     _sdf_texture: wgpu::Texture,
     _sdf_emission_texture: wgpu::Texture,
@@ -900,8 +891,6 @@ pub struct Renderer {
     radiance_surface_inspection_request: Option<[u32; 2]>,
     radiance_surface_inspection_mesh_snapshot: Option<Vec<SurfaceInspectionMesh>>,
     radiance_surface_inspection: RendererRadianceSurfaceInspection,
-    surface_probe_uniform_buffer: wgpu::Buffer,
-    _surface_probe_buffer: wgpu::Buffer,
     sdf_gi_enabled: bool,
     gi_radiance_frozen: bool,
     gi_radiance_temporal_accumulation_enabled: bool,
@@ -914,6 +903,8 @@ pub struct Renderer {
     static_probe_samples: Vec<ProbeSurfaceSample>,
     dynamic_probe_samples: Vec<ProbeSurfaceSample>,
     static_probe_signature: u64,
+    static_probe_samples_dirty: bool,
+    dynamic_probe_samples_dirty: bool,
     shadow_bounds: GeometryBounds,
     performance_stats: RendererPerformanceStats,
     frame_index: u32,
@@ -977,7 +968,6 @@ pub struct Renderer {
     radiance_angular_resolution: RadianceAngularResolution,
     radiance_angular_segments: [RendererRadianceAngularSegment; RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS],
     radiance_angular_segments_cell: [u32; 3],
-    surface_probe_gizmos_enabled: bool,
     world_radiance_gizmos_enabled: bool,
     world_radiance_trace_gizmos_enabled: bool,
     selected_radiance_cell: [u32; 3],
@@ -1015,9 +1005,6 @@ impl Renderer {
         let radiance_field_resolution = radiance_field_resolution.bounded();
         let (vertices, indices) = flatten_instances(instances)?;
         let (shadow_draw_ranges, shadow_caster_bounds) = shadow_draw_data(instances);
-        if vertices.is_empty() || indices.is_empty() {
-            return Err("renderer requires nonempty mesh instances".into());
-        }
 
         let backend = graphics_api.backends();
         if !wgpu::Instance::enabled_backend_features().contains(backend) {
@@ -1380,21 +1367,6 @@ impl Renderer {
             contents: bytemuck::cast_slice(&[4_u32, 1, 4, 0, 0, 0, 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let surface_probe_uniform = SurfaceProbeUniform {
-            screen_resolution: [width.div_ceil(SURFACE_PROBE_STRIDE), height.div_ceil(SURFACE_PROBE_STRIDE), width, height],
-            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, 0],
-        };
-        let surface_probe_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("surface probe update settings"),
-            contents: bytemuck::bytes_of(&surface_probe_uniform),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let surface_probe_data = vec![[0u32; 16]; SURFACE_PROBE_CAPACITY as usize];
-        let surface_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("persistent world surface probes"),
-            contents: bytemuck::cast_slice(&surface_probe_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &sdf_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&sdf_clipmap.values),
@@ -1556,18 +1528,6 @@ impl Renderer {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 15,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 16,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 20,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
@@ -1616,8 +1576,6 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sdf_emission_view) },
                 wgpu::BindGroupEntry { binding: 11, resource: radiance_field_uniform_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: radiance_field_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: surface_probe_uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: surface_probe_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 22, resource: radiance_field_probe_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 23, resource: radiance_surface_inspection_settings_buffer.as_entire_binding() },
@@ -1659,12 +1617,6 @@ impl Renderer {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 16,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 20,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
@@ -1687,7 +1639,6 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 9, resource: sdf_uniform_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: radiance_field_uniform_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: radiance_field_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: surface_probe_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 21, resource: gi_gizmo_selection_buffer.as_entire_binding() },
             ],
@@ -1814,22 +1765,6 @@ impl Renderer {
             layout: Some(&radiance_field_pipeline_layout),
             module: &shader,
             entry_point: Some("inspect_radiance_surface"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let surface_probe_update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("screen seeded surface probe update pipeline"),
-            layout: Some(&radiance_field_pipeline_layout),
-            module: &shader,
-            entry_point: Some("update_surface_probes"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let surface_probe_maintenance_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("surface probe aging pipeline"),
-            layout: Some(&radiance_field_pipeline_layout),
-            module: &shader,
-            entry_point: Some("age_surface_probes"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -2027,16 +1962,19 @@ impl Renderer {
             cache: None,
         });
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: bytemuck::cast_slice(&indices), usage: wgpu::BufferUsages::INDEX });
+        let dummy_vertex = RendererMeshVertex::zeroed();
+        let vertex_contents = if vertices.is_empty() { bytemuck::bytes_of(&dummy_vertex) } else { bytemuck::cast_slice(&vertices) };
+        let dummy_index = 0_u32;
+        let index_contents = if indices.is_empty() { bytemuck::bytes_of(&dummy_index) } else { bytemuck::cast_slice(&indices) };
         let wireframe_indices = wireframe_indices(&indices);
+        let dummy_wireframe_index = 0_u32;
+        let wireframe_contents = if wireframe_indices.is_empty() { bytemuck::bytes_of(&dummy_wireframe_index) } else { bytemuck::cast_slice(&wireframe_indices) };
+        let vertex_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh vertices"), contents: vertex_contents, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: index_contents, usage: wgpu::BufferUsages::INDEX });
         let wireframe_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("wireframe indices"),
-            contents: bytemuck::cast_slice(&wireframe_indices),
+            contents: wireframe_contents,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
         let ui_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2065,8 +2003,6 @@ impl Renderer {
             pipeline,
             radiance_field_pipeline,
             radiance_surface_inspection_pipeline,
-            surface_probe_update_pipeline,
-            surface_probe_maintenance_pipeline,
             depth_prepass_pipeline,
             wireframe_pipeline,
             gi_gizmo_pipeline,
@@ -2086,7 +2022,11 @@ impl Renderer {
             irradiance_volume_layout: irradiance_volumes.to_vec(),
             sdf_clipmap,
             sdf_geometry_cache: sdf_geometries,
+            sdf_geometry_cache_dirty: false,
             surface_inspection_meshes,
+            surface_inspection_meshes_dirty: false,
+            triangle_bvh_dirty: false,
+            triangle_bvh_topology_dirty: false,
             sdf_uniform_buffer,
             _sdf_texture: sdf_texture,
             _sdf_emission_texture: sdf_emission_texture,
@@ -2118,8 +2058,6 @@ impl Renderer {
             radiance_surface_inspection_request: None,
             radiance_surface_inspection_mesh_snapshot: None,
             radiance_surface_inspection: RendererRadianceSurfaceInspection::default(),
-            surface_probe_uniform_buffer,
-            _surface_probe_buffer: surface_probe_buffer,
             sdf_gi_enabled: false,
             gi_radiance_frozen: false,
             gi_radiance_temporal_accumulation_enabled: true,
@@ -2132,6 +2070,8 @@ impl Renderer {
             static_probe_samples,
             dynamic_probe_samples,
             static_probe_signature,
+            static_probe_samples_dirty: false,
+            dynamic_probe_samples_dirty: false,
             shadow_bounds,
             performance_stats: RendererPerformanceStats {
                 triangle_bvh_build_ms,
@@ -2206,7 +2146,6 @@ impl Renderer {
             radiance_angular_resolution: RadianceAngularResolution::default(),
             radiance_angular_segments: [RendererRadianceAngularSegment::default(); RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS],
             radiance_angular_segments_cell: [u32::MAX; 3],
-            surface_probe_gizmos_enabled: false,
             world_radiance_gizmos_enabled: false,
             world_radiance_trace_gizmos_enabled: false,
             selected_radiance_cell: [4, 1, 4],
@@ -2220,14 +2159,15 @@ impl Renderer {
 
     pub fn update_instances(&mut self, instances: &[MeshInstance]) -> Result<(), String> {
         let update_start = Instant::now();
-        if instances.is_empty() || instances.iter().any(|instance| instance.mesh.is_empty()) {
-            return Err("renderer requires nonempty mesh instances".into());
+        if instances.iter().any(|instance| instance.mesh.is_empty()) {
+            return Err("renderer does not accept empty mesh instances".into());
         }
         let topology_signature = mesh_topology_signature(instances);
         let instance_signatures = instances.iter().map(mesh_instance_signature).collect::<Vec<_>>();
+        let expected_vertex_bytes = instances.iter().map(|instance| instance.mesh.vertices().len()).sum::<usize>() * mem::size_of::<RendererMeshVertex>();
         let topology_changed = topology_signature != self.mesh_topology_signature
             || instances.iter().map(|instance| instance.mesh.indices().len()).sum::<usize>() as u32 != self.index_count
-            || instances.iter().map(|instance| instance.mesh.vertices().len()).sum::<usize>() * mem::size_of::<RendererMeshVertex>() != self.vertex_buffer.size() as usize;
+            || expected_vertex_bytes.max(mem::size_of::<RendererMeshVertex>()) != self.vertex_buffer.size() as usize;
         let instances_changed = instance_signatures != self.instance_signatures;
         if !topology_changed && !instances_changed {
             self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
@@ -2235,20 +2175,25 @@ impl Renderer {
         }
         if topology_changed {
             let (vertices, indices) = flatten_instances(instances)?;
+            let dummy_vertex = RendererMeshVertex::zeroed();
+            let vertex_contents = if vertices.is_empty() { bytemuck::bytes_of(&dummy_vertex) } else { bytemuck::cast_slice(&vertices) };
+            let dummy_index = 0_u32;
+            let index_contents = if indices.is_empty() { bytemuck::bytes_of(&dummy_index) } else { bytemuck::cast_slice(&indices) };
             self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh vertices"),
-                contents: bytemuck::cast_slice(&vertices),
+                contents: vertex_contents,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
-            self.index_buffer =
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: bytemuck::cast_slice(&indices), usage: wgpu::BufferUsages::INDEX });
+            self.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mesh indices"), contents: index_contents, usage: wgpu::BufferUsages::INDEX });
             self.index_count = indices.len() as u32;
             self.mesh_topology_signature = topology_signature;
             self.instance_signatures = instance_signatures;
             let wireframe_indices = wireframe_indices(&indices);
+            let dummy_wireframe_index = 0_u32;
+            let wireframe_contents = if wireframe_indices.is_empty() { bytemuck::bytes_of(&dummy_wireframe_index) } else { bytemuck::cast_slice(&wireframe_indices) };
             self.wireframe_index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("wireframe indices"),
-                contents: bytemuck::cast_slice(&wireframe_indices),
+                contents: wireframe_contents,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             });
             self.wireframe_index_count = wireframe_indices.len() as u32;
@@ -2271,20 +2216,24 @@ impl Renderer {
             self.shadow_bounds = combined_geometry_bounds(&self.shadow_caster_bounds);
         }
         self.shadow_scheduler.mark_all_dirty();
+        self.dynamic_probe_samples_dirty = true;
+        self.sdf_geometry_cache_dirty = true;
+        self.surface_inspection_meshes_dirty = true;
+        self.triangle_bvh_dirty = true;
+        self.triangle_bvh_topology_dirty |= topology_changed;
         let signature = static_probe_signature(instances);
+        let authored_gi_active = !self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.irradiance_volume_layout.iter().any(|volume| volume.enabled);
         if signature != self.static_probe_signature {
-            let (static_samples, dynamic_samples) = build_probe_samples(instances, true);
-            self.static_probe_samples = static_samples;
-            self.dynamic_probe_samples = dynamic_samples;
             self.static_probe_signature = signature;
-        } else {
-            self.dynamic_probe_samples = build_dynamic_probe_samples(instances);
+            self.static_probe_samples_dirty = true;
         }
-        let sdf_geometry_cache = sdf_geometries(instances);
-        self.sdf_geometry_cache = sdf_geometry_cache;
-        self.surface_inspection_meshes = surface_inspection_meshes(instances);
-        if topology_changed || !self.refit_triangle_bvh() {
-            self.rebuild_triangle_bvh();
+        if authored_gi_active && self.static_probe_samples_dirty {
+            (self.static_probe_samples, self.dynamic_probe_samples) = build_probe_samples(instances, true);
+            self.static_probe_samples_dirty = false;
+            self.dynamic_probe_samples_dirty = false;
+        } else if authored_gi_active {
+            self.dynamic_probe_samples = build_dynamic_probe_samples(instances);
+            self.dynamic_probe_samples_dirty = false;
         }
         self.performance_stats.instance_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
         Ok(())
@@ -2369,11 +2318,6 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 7, resource: self.triangle_bvh_diagnostics_buffer.as_entire_binding() },
             ],
         });
-        let surface_probe_uniform = SurfaceProbeUniform {
-            screen_resolution: [width.div_ceil(SURFACE_PROBE_STRIDE), height.div_ceil(SURFACE_PROBE_STRIDE), width, height],
-            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, self.packed_surface_probe_frame_index()],
-        };
-        self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&surface_probe_uniform));
         let camera_uniform = camera_uniform(width, height, &self.camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
@@ -2407,7 +2351,7 @@ impl Renderer {
             return Err(format!("renderer supports at most {MAX_DIRECTIONAL_LIGHTS} directional lights"));
         }
         let previous_lights = self.lights.clone();
-        if previous_lights != lights {
+        if previous_lights != lights && self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
             let priority = changed_light_priority(&previous_lights, lights);
             self.radiance_field.refresh_for_lighting_change(priority, self.gi_radiance_temporal_accumulation_enabled);
         }
@@ -2460,6 +2404,38 @@ impl Renderer {
         self.performance_stats.sdf_upload_ms = 0.0;
         self.performance_stats.sdf_voxels_updated = 0;
         self.performance_stats.gi_history_valid_percent = 0.0;
+        if !sdf_gi_enabled && (!self.render_settings.irradiance_enabled || volumes.is_empty()) {
+            self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(false, self.sky_lighting)));
+            self.performance_stats.probe_update_ms = 0.0;
+            self.performance_stats.irradiance_upload_ms = 0.0;
+            self.performance_stats.visibility_rebuild_ms = 0.0;
+            self.performance_stats.probes_updated = 0;
+            return;
+        }
+        if sdf_gi_enabled && self.render_settings.irradiance_enabled {
+            if self.sdf_geometry_cache_dirty {
+                self.sdf_geometry_cache = sdf_geometries(instances);
+                self.sdf_geometry_cache_dirty = false;
+            }
+            if self.surface_inspection_meshes_dirty {
+                self.surface_inspection_meshes = surface_inspection_meshes(instances);
+                self.surface_inspection_meshes_dirty = false;
+            }
+            if self.render_settings.triangle_probe_occlusion_enabled && self.triangle_bvh_dirty {
+                if self.triangle_bvh_topology_dirty || !self.refit_triangle_bvh() {
+                    self.rebuild_triangle_bvh();
+                }
+                self.triangle_bvh_dirty = false;
+                self.triangle_bvh_topology_dirty = false;
+            }
+        } else if self.render_settings.irradiance_enabled && self.static_probe_samples_dirty {
+            (self.static_probe_samples, self.dynamic_probe_samples) = build_probe_samples(instances, true);
+            self.static_probe_samples_dirty = false;
+            self.dynamic_probe_samples_dirty = false;
+        } else if self.render_settings.irradiance_enabled && self.dynamic_probe_samples_dirty {
+            self.dynamic_probe_samples = build_dynamic_probe_samples(instances);
+            self.dynamic_probe_samples_dirty = false;
+        }
         if !sdf_gi_enabled || !self.render_settings.irradiance_enabled {
             self.performance_stats.gpu_sdf_gi_ms = 0.0;
         }
@@ -2838,10 +2814,6 @@ impl Renderer {
         self.gizmo_vertex_count = vertices.len() as u32;
     }
 
-    pub fn set_surface_probe_gizmos_enabled(&mut self, enabled: bool) {
-        self.surface_probe_gizmos_enabled = enabled;
-    }
-
     pub fn set_gi_radiance_frozen(&mut self, frozen: bool) {
         self.gi_radiance_frozen = frozen;
     }
@@ -2876,10 +2848,6 @@ impl Renderer {
 
     pub fn radiance_angular_segments_cell(&self) -> [u32; 3] {
         self.radiance_angular_segments_cell
-    }
-
-    fn packed_surface_probe_frame_index(&self) -> u32 {
-        (self.frame_index & 0x7fff_ffff) | if self.gi_radiance_frozen { 0x8000_0000 } else { 0 }
     }
 
     pub fn set_world_radiance_gizmos_enabled(&mut self, enabled: bool) {
@@ -3140,12 +3108,6 @@ impl Renderer {
         let capture_uniform = camera_uniform(width, height, camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&capture_uniform));
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
-        let capture_probe_uniform = SurfaceProbeUniform {
-            screen_resolution: [width.div_ceil(SURFACE_PROBE_STRIDE), height.div_ceil(SURFACE_PROBE_STRIDE), width, height],
-            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, self.packed_surface_probe_frame_index()],
-        };
-        self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&capture_probe_uniform));
-
         let bytes_per_pixel = 4_u32;
         let unpadded_bytes_per_row = width * bytes_per_pixel;
         let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -3184,7 +3146,7 @@ impl Renderer {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
-            self.render_world_radiance_field_pass(&mut encoder, &capture_depth_bind_group, width, height);
+            self.render_world_radiance_field_pass(&mut encoder, &capture_depth_bind_group);
         }
         self.render_scene_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group);
         encoder.pop_debug_group();
@@ -3401,11 +3363,42 @@ impl Renderer {
         };
 
         let color_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let probe_uniform = SurfaceProbeUniform {
-            screen_resolution: [self.config.width.div_ceil(SURFACE_PROBE_STRIDE), self.config.height.div_ceil(SURFACE_PROBE_STRIDE), self.config.width, self.config.height],
-            cache_settings: [SURFACE_PROBE_STRIDE, SURFACE_PROBE_CAPACITY, 0, self.packed_surface_probe_frame_index()],
-        };
-        self.queue.write_buffer(&self.surface_probe_uniform_buffer, 0, bytemuck::bytes_of(&probe_uniform));
+        if self.index_count == 0 {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("empty scene encoder") });
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("empty scene clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: f64::from(self.camera.clear_color.red),
+                                g: f64::from(self.camera.clear_color.green),
+                                b: f64::from(self.camera.clear_color.blue),
+                                a: f64::from(self.camera.clear_color.alpha),
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            if self.ui_vertex_count > 0 {
+                self.render_ui_pass(&mut encoder, &color_view);
+            }
+            self.queue.submit(Some(encoder.finish()));
+            self.queue.present(frame);
+            if !self.has_presented {
+                eprintln!("First frame presented");
+                self.has_presented = true;
+            }
+            return Ok(());
+        }
         self.frame_index = self.frame_index.wrapping_add(1);
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
         let trace_readback_copied = self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.gi_trace_readback_receiver.is_none();
@@ -3433,7 +3426,7 @@ impl Renderer {
             wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
         );
         if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
-            self.render_world_radiance_field_pass(&mut encoder, &self.depth_bind_group, self.config.width, self.config.height);
+            self.render_world_radiance_field_pass(&mut encoder, &self.depth_bind_group);
             if trace_readback_copied {
                 self.copy_selected_gi_trace_debug(&mut encoder);
             }
@@ -3574,7 +3567,7 @@ impl Renderer {
         }
     }
 
-    fn render_world_radiance_field_pass(&self, encoder: &mut wgpu::CommandEncoder, depth_bind_group: &wgpu::BindGroup, width: u32, height: u32) {
+    fn render_world_radiance_field_pass(&self, encoder: &mut wgpu::CommandEncoder, depth_bind_group: &wgpu::BindGroup) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("world radiance field update"),
             timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
@@ -3588,12 +3581,6 @@ impl Renderer {
         pass.set_bind_group(1, depth_bind_group, &[]);
         let resolution = self.radiance_field.resolution;
         pass.dispatch_workgroups(resolution[0].div_ceil(4), resolution[1].div_ceil(4), resolution[2].div_ceil(4));
-        if self.render_settings.surface_probes_enabled {
-            pass.set_pipeline(&self.surface_probe_update_pipeline);
-            pass.dispatch_workgroups(width.div_ceil(SURFACE_PROBE_STRIDE * 8), height.div_ceil(SURFACE_PROBE_STRIDE * 8), 1);
-            pass.set_pipeline(&self.surface_probe_maintenance_pipeline);
-            pass.dispatch_workgroups(SURFACE_PROBE_CAPACITY.div_ceil(64), 1, 1);
-        }
     }
 
     fn render_shadow_pass(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -3790,16 +3777,12 @@ impl Renderer {
         });
         pass.set_pipeline(&self.gi_gizmo_pipeline);
         pass.set_bind_group(0, &self.gi_gizmo_bind_group, &[]);
-        let surface_probe_count = SURFACE_PROBE_CAPACITY;
         let radiance_field_count = self.radiance_field.cell_count() as u32;
-        if self.surface_probe_gizmos_enabled {
-            pass.draw(0..8, 0..surface_probe_count);
-        }
         if self.world_radiance_gizmos_enabled {
-            pass.draw(0..8, surface_probe_count..surface_probe_count + radiance_field_count);
+            pass.draw(0..8, 0..radiance_field_count);
         }
         if self.world_radiance_trace_gizmos_enabled {
-            let trace_start = surface_probe_count + radiance_field_count;
+            let trace_start = radiance_field_count;
             pass.draw(0..42, trace_start..trace_start + RADIANCE_FIELD_RAY_COUNT as u32);
             pass.draw(0..2, trace_start + RADIANCE_FIELD_RAY_COUNT as u32..trace_start + RADIANCE_FIELD_RAY_COUNT as u32 + 12);
             if self.angular_segment_vertex_count > 0 {
@@ -3815,7 +3798,7 @@ impl Renderer {
     }
 
     fn should_draw_gi_gizmos(&self) -> bool {
-        let has_debug_gizmos = self.surface_probe_gizmos_enabled || self.world_radiance_gizmos_enabled || self.world_radiance_trace_gizmos_enabled || self.sdf_occupancy_gizmos_enabled;
+        let has_debug_gizmos = self.world_radiance_gizmos_enabled || self.world_radiance_trace_gizmos_enabled || self.sdf_occupancy_gizmos_enabled;
         has_debug_gizmos && self.sdf_gi_enabled && self.render_settings.irradiance_enabled
     }
 
@@ -3997,7 +3980,7 @@ fn camera_uniform(width: u32, height: u32, camera: &Camera, lights: &[Light], mo
             u32::from(settings.direct_light_visibility_enabled),
         ],
         ambient_light: [settings.ambient_intensity.max(0.0), 0.0, 0.0, 0.0],
-        gi_settings: [u32::from(settings.surface_probes_enabled), u32::from(settings.triangle_probe_occlusion_enabled), 0, 0],
+        gi_settings: [0, u32::from(settings.triangle_probe_occlusion_enabled), 0, 0],
     }
 }
 
@@ -4138,8 +4121,8 @@ fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
 }
 
 fn flatten_instances(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>, Vec<u32>), String> {
-    if instances.is_empty() || instances.iter().any(|instance| instance.mesh.is_empty()) {
-        return Err("renderer requires nonempty mesh instances".into());
+    if instances.iter().any(|instance| instance.mesh.is_empty()) {
+        return Err("renderer does not accept empty mesh instances".into());
     }
 
     let mut vertices = Vec::new();

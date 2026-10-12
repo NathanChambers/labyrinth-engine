@@ -110,7 +110,6 @@ pub struct RuntimeContext {
     pub normal_gizmos_enabled: bool,
     pub light_gizmos_enabled: bool,
     pub gi_global_gizmos_enabled: bool,
-    pub gi_gizmos_enabled: bool,
     pub gi_trace_gizmos_enabled: bool,
     pub gi_selected_radiance_cell: [u32; 3],
     /// Whether a scene click should capture the cursor; tools can disable this while picking.
@@ -124,6 +123,28 @@ pub struct RuntimeContext {
     pub render_debug_mode: RenderDebugMode,
     pub render_settings: RenderSettings,
     pub debug_capture: Option<DebugCapture>,
+    exit_requested: bool,
+}
+
+impl RuntimeContext {
+    pub fn has_irradiance_source(&self) -> bool {
+        if !self.scene.instances().iter().any(|instance| !instance.mesh.is_empty()) {
+            return false;
+        }
+
+        let has_authored_volume = || self.irradiance_volumes.iter().any(|(_, volume)| volume.desc.enabled && volume.desc.resolution.iter().all(|resolution| *resolution > 0));
+        match self.irradiance_mode {
+            IrradianceMode::Volumes => has_authored_volume(),
+            IrradianceMode::Clipmap => self.irradiance_clipmap.active_level_count() > 0,
+            IrradianceMode::Combined => self.irradiance_clipmap.active_level_count() > 0 || has_authored_volume(),
+            IrradianceMode::AabbSdf => true,
+        }
+    }
+
+    /// Requests a clean exit after the current frame has been rendered.
+    pub fn request_exit(&mut self) {
+        self.exit_requested = true;
+    }
 }
 
 fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection: RendererRadianceSurfaceInspection, grid: RendererRadianceFieldGrid) {
@@ -219,7 +240,6 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         normal_gizmos_enabled: false,
         light_gizmos_enabled: false,
         gi_global_gizmos_enabled: false,
-        gi_gizmos_enabled: false,
         gi_trace_gizmos_enabled: false,
         gi_selected_radiance_cell: [4, 1, 4],
         cursor_capture_on_scene_click: true,
@@ -231,13 +251,14 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         render_debug_mode: RenderDebugMode::default(),
         render_settings: RenderSettings::default(),
         debug_capture: None,
+        exit_requested: false,
     };
     application.setup(&mut context)?;
     if let Some(path) = &settings.debug_script {
         let source = std::fs::read_to_string(path).map_err(|error| format!("failed to read debug script: {error}"))?;
         context.debug_capture = Some(DebugCapture::from_script(&source, settings.debug_capture_root.clone())?);
     }
-    let mut runner = Runner { settings, application, context, last_frame: Instant::now(), window: None, renderer: None, failure: None };
+    let mut runner = Runner { settings, application, context, fallback_camera: Camera::default(), last_frame: Instant::now(), window: None, renderer: None, failure: None };
     let event_loop_result = event_loop.run_app(&mut runner).map_err(|error| error.to_string());
     runner.release_cursor();
     runner.application.cleanup(&mut runner.context);
@@ -252,6 +273,7 @@ struct Runner<A> {
     settings: WindowSettings,
     application: A,
     context: RuntimeContext,
+    fallback_camera: Camera,
     last_frame: Instant,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -333,13 +355,16 @@ where
             Err(error) => return self.fail(event_loop, error.to_string()),
         };
         self.window = Some(window.clone());
-        self.context.input.set_cursor_captured(true);
+        self.context.input.set_cursor_captured(self.context.active_camera.is_some() && self.context.cursor_capture_on_scene_click);
         self.apply_cursor_mode(&window);
         eprintln!("Initializing {:?} renderer", self.settings.graphics_api);
         apply_window_mode(&window, self.settings.mode);
-        let camera = match self.context.active_camera.and_then(|id| self.context.scene.get_camera(id)) {
-            Some(camera) => camera,
-            None => return self.fail(event_loop, "no active camera is assigned".into()),
+        let camera = match self.context.active_camera {
+            Some(id) => match self.context.scene.get_camera(id) {
+                Some(camera) => camera,
+                None => return self.fail(event_loop, "active camera was removed before renderer initialization".into()),
+            },
+            None => &self.fallback_camera,
         };
         let lights = self.context.active_lights.iter().filter_map(|id| self.context.scene.get_light(*id)).copied().collect::<Vec<_>>();
         let irradiance_volumes = renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera);
@@ -431,6 +456,9 @@ where
                         };
                         self.set_mode(next_mode);
                     }
+                    if key == KeyCode::F1 && event.state == ElementState::Pressed && !event.repeat {
+                        self.context.ui.set_debug_ui_visible(!self.context.ui.debug_ui_visible());
+                    }
                 }
             }
             WindowEvent::Resized(size) => {
@@ -491,7 +519,10 @@ where
                         self.context.ui_enabled = ui_enabled;
                     }
                     let result = result.and_then(|_| {
-                        let camera = self.context.active_camera.and_then(|id| self.context.scene.get_camera(id)).ok_or("active camera was removed before update")?;
+                        let camera = match self.context.active_camera {
+                            Some(id) => self.context.scene.get_camera(id).ok_or("active camera was removed before update")?,
+                            None => &self.fallback_camera,
+                        };
                         renderer.update_camera(camera)
                     });
                     let lights = self.context.active_lights.iter().filter_map(|id| self.context.scene.get_light(*id)).copied().collect::<Vec<_>>();
@@ -521,19 +552,30 @@ where
                         self.context.gizmos.vertices().iter().map(|vertex| RendererGizmoVertex { position: vertex.position.to_array(), color: vertex.color.to_array() }).collect::<Vec<_>>();
                     let irradiance_volumes =
                         camera.map(|camera| renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera)).unwrap_or_default();
+                    let irradiance_available = self.context.has_irradiance_source();
+                    let mut render_settings = self.context.render_settings;
+                    render_settings.irradiance_enabled &= irradiance_available;
+                    render_settings.triangle_probe_occlusion_enabled &= irradiance_available && self.context.irradiance_mode == IrradianceMode::AabbSdf;
                     let result = result.and_then(|_| renderer.update_lights(&lights)).and_then(|_| renderer.update_instances(self.context.scene.instances())).and_then(|_| {
                         renderer.set_triangle_bvh_sah_enabled(triangle_probe_bvh_sah_enabled);
                         renderer.set_irradiance_update_budget(self.context.irradiance_update_budget);
-                        renderer.update_render_settings(self.context.render_settings);
-                        renderer.set_triangle_bvh_diagnostics_enabled(triangle_probe_diagnostics_enabled);
+                        renderer.update_render_settings(render_settings);
+                        renderer.set_triangle_bvh_diagnostics_enabled(triangle_probe_diagnostics_enabled && render_settings.triangle_probe_occlusion_enabled);
                         renderer.update_sky_lighting(self.context.sky_lighting);
                         renderer.set_gi_radiance_temporal_accumulation_enabled(self.context.gi_radiance_temporal_accumulation_enabled);
                         renderer.set_radiance_angular_resolution(self.context.gi_angular_resolution);
-                        renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights, self.context.irradiance_mode == IrradianceMode::AabbSdf);
+                        let sdf_gi_active = irradiance_available && render_settings.irradiance_enabled && self.context.irradiance_mode == IrradianceMode::AabbSdf;
+                        renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights, sdf_gi_active);
                         self.context.gi_radiance_field_grid = renderer.radiance_field_grid();
                         self.context.performance_stats = renderer.performance_stats();
-                        renderer.update_render_debug_mode(self.context.render_debug_mode);
-                        renderer.set_surface_probe_gizmos_enabled(self.context.gi_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
+                        let render_debug_mode = if irradiance_available {
+                            self.context.render_debug_mode
+                        } else if self.context.render_debug_mode == RenderDebugMode::GiSupport {
+                            RenderDebugMode::LitMaterials
+                        } else {
+                            self.context.render_debug_mode
+                        };
+                        renderer.update_render_debug_mode(render_debug_mode);
                         renderer.set_gi_radiance_frozen(self.context.freeze_gi_radiance);
                         renderer.set_world_radiance_gizmos_enabled(self.context.gi_global_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
                         renderer.set_world_radiance_trace_gizmos_enabled(self.context.gi_trace_gizmos_enabled && self.context.gizmos_enabled && !capture_without_gizmos);
@@ -570,7 +612,10 @@ where
                             self.context.performance_stats = renderer.performance_stats();
                         }
                         if let Some(capture) = &mut self.context.debug_capture {
-                            let camera = self.context.active_camera.and_then(|id| self.context.scene.get_camera(id)).ok_or("active camera was removed before capture")?;
+                            let camera = match self.context.active_camera {
+                                Some(id) => self.context.scene.get_camera(id).ok_or("active camera was removed before capture")?,
+                                None => &self.fallback_camera,
+                            };
                             capture.capture_pending(renderer, camera)?;
                             capture.report_pending(renderer)?;
                         }
@@ -578,7 +623,7 @@ where
                     });
                     if let Err(error) = result {
                         self.fail(event_loop, error);
-                    } else if self.context.debug_capture.as_ref().is_some_and(DebugCapture::exit_requested) {
+                    } else if self.context.exit_requested || self.context.debug_capture.as_ref().is_some_and(DebugCapture::exit_requested) {
                         event_loop.exit();
                     } else {
                         self.context.input.clear_frame();

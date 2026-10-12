@@ -1,6 +1,10 @@
 use ab_glyph::{Font, PxScale, ScaleFont, point};
 use math::{Color, Vec2};
 use mesh::UiVertex;
+#[cfg(debug_assertions)]
+use std::cell::RefCell;
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
 
 use crate::{FontAsset, InputState};
 
@@ -150,6 +154,7 @@ struct UiLabel {
     size: f32,
     color: Color,
     visible: bool,
+    visible_when_debug_ui_hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +213,26 @@ struct UiGraph {
     visible: bool,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum UiTextCacheKey {
+    Button(usize),
+    Label(usize),
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct CachedTextVertices {
+    text: String,
+    size: f32,
+    color: Color,
+    rect: UiRect,
+    viewport: (u32, u32),
+    centered: bool,
+    font_revision: u64,
+    vertices: Vec<UiVertex>,
+}
+
 #[derive(Debug)]
 pub struct UiCanvas {
     window: UiLayout,
@@ -220,8 +245,13 @@ pub struct UiCanvas {
     active_panel_drag: Option<ActivePanelDrag>,
     graphs: Vec<UiGraph>,
     font: Option<FontAsset>,
+    #[cfg(debug_assertions)]
+    font_revision: u64,
+    #[cfg(debug_assertions)]
+    text_vertex_cache: RefCell<HashMap<UiTextCacheKey, CachedTextVertices>>,
     viewport_size: (u32, u32),
     pointer_press_consumed: bool,
+    debug_ui_visible: bool,
 }
 
 impl UiCanvas {
@@ -237,8 +267,13 @@ impl UiCanvas {
             active_panel_drag: None,
             graphs: Vec::new(),
             font: None,
+            #[cfg(debug_assertions)]
+            font_revision: 0,
+            #[cfg(debug_assertions)]
+            text_vertex_cache: RefCell::new(HashMap::new()),
             viewport_size: (1, 1),
             pointer_press_consumed: false,
+            debug_ui_visible: true,
         }
     }
 
@@ -250,12 +285,30 @@ impl UiCanvas {
         self.pointer_press_consumed
     }
 
+    pub fn debug_ui_visible(&self) -> bool {
+        self.debug_ui_visible
+    }
+
+    pub fn set_debug_ui_visible(&mut self, visible: bool) {
+        self.debug_ui_visible = visible;
+    }
+
     pub fn set_font(&mut self, font: FontAsset) {
         self.font = Some(font);
+        #[cfg(debug_assertions)]
+        {
+            self.font_revision = self.font_revision.wrapping_add(1);
+            self.text_vertex_cache.get_mut().clear();
+        }
     }
 
     pub fn clear_font(&mut self) {
         self.font = None;
+        #[cfg(debug_assertions)]
+        {
+            self.font_revision = self.font_revision.wrapping_add(1);
+            self.text_vertex_cache.get_mut().clear();
+        }
     }
 
     pub fn set_window_layout(&mut self, layout: UiLayout) {
@@ -275,9 +328,21 @@ impl UiCanvas {
         true
     }
 
+    pub fn set_container_size(&mut self, container: UiContainerId, size: Vec2) -> bool {
+        let Some(container) = self.containers.get_mut(container.0) else { return false };
+        container.layout.size = size;
+        true
+    }
+
     pub fn set_label_visible(&mut self, label: UiLabelId, visible: bool) -> bool {
         let Some(label) = self.labels.get_mut(label.0) else { return false };
         label.visible = visible;
+        true
+    }
+
+    pub fn set_label_visible_when_debug_ui_hidden(&mut self, label: UiLabelId, visible: bool) -> bool {
+        let Some(label) = self.labels.get_mut(label.0) else { return false };
+        label.visible_when_debug_ui_hidden = visible;
         true
     }
 
@@ -453,7 +518,7 @@ impl UiCanvas {
     pub fn add_label_layout(&mut self, parent: Option<UiContainerId>, layout: UiLayout, text: impl Into<String>, size: f32, color: Color) -> UiLabelId {
         let id = UiLabelId(self.labels.len());
         let child_index = parent.map(|parent| self.add_child(parent, UiChild::Label(id))).unwrap_or(0);
-        self.labels.push(UiLabel { layout, parent, child_index, text: text.into(), size: size.max(1.0), color, visible: true });
+        self.labels.push(UiLabel { layout, parent, child_index, text: text.into(), size: size.max(1.0), color, visible: true, visible_when_debug_ui_hidden: false });
         id
     }
 
@@ -472,6 +537,9 @@ impl UiCanvas {
     pub fn update(&mut self, input: &InputState, width: u32, height: u32) {
         self.viewport_size = (width.max(1), height.max(1));
         self.pointer_press_consumed = false;
+        if !self.debug_ui_visible {
+            return;
+        }
         if input.left_mouse_pressed() && !input.cursor_captured() {
             let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
             self.pointer_press_consumed = self.pointer_over_ui_at(input.cursor_position(), root);
@@ -607,6 +675,9 @@ impl UiCanvas {
 
     pub fn vertices(&self, width: u32, height: u32) -> Vec<UiVertex> {
         let root = UiRect::new(0.0, 0.0, width as f32, height as f32);
+        if !self.debug_ui_visible {
+            return self.overlay_label_vertices(width, height, root);
+        }
         let window = self.window.resolve(root);
         let mut vertices = Vec::with_capacity(30);
         add_rect(&mut vertices, window, Color::rgba(0.03, 0.04, 0.06, 0.94), width, height);
@@ -653,6 +724,19 @@ impl UiCanvas {
                         rect.x += 8.0;
                         rect.width = (rect.width - 16.0).max(0.0);
                     }
+                    #[cfg(debug_assertions)]
+                    self.add_cached_text_vertices(
+                        &mut vertices,
+                        UiTextCacheKey::Button(index),
+                        font.font(),
+                        &button.text,
+                        button.text_size,
+                        button.text_color,
+                        rect,
+                        (width, height),
+                        button.text_centered,
+                    );
+                    #[cfg(not(debug_assertions))]
                     add_text(&mut vertices, font.font(), &button.text, button.text_size, button.text_color, rect, (width, height), button.text_centered);
                 }
             }
@@ -662,10 +746,64 @@ impl UiCanvas {
                     continue;
                 }
                 let rect = self.control_rect(child, root);
-                add_label(&mut vertices, font.font(), label, rect, (width, height));
+                #[cfg(debug_assertions)]
+                self.add_cached_text_vertices(&mut vertices, UiTextCacheKey::Label(index), font.font(), &label.text, label.size, label.color, rect, (width, height), false);
+                #[cfg(not(debug_assertions))]
+                add_text(&mut vertices, font.font(), &label.text, label.size, label.color, rect, (width, height), false);
             }
         }
         vertices
+    }
+
+    fn overlay_label_vertices(&self, width: u32, height: u32, root: UiRect) -> Vec<UiVertex> {
+        let mut vertices = Vec::new();
+        let Some(font) = &self.font else { return vertices };
+        for (index, label) in self.labels.iter().enumerate() {
+            if !label.visible || !label.visible_when_debug_ui_hidden {
+                continue;
+            }
+            let rect = self.control_rect(UiChild::Label(UiLabelId(index)), root);
+            #[cfg(debug_assertions)]
+            self.add_cached_text_vertices(&mut vertices, UiTextCacheKey::Label(index), font.font(), &label.text, label.size, label.color, rect, (width, height), false);
+            #[cfg(not(debug_assertions))]
+            add_text(&mut vertices, font.font(), &label.text, label.size, label.color, rect, (width, height), false);
+        }
+        vertices
+    }
+
+    #[cfg(debug_assertions)]
+    fn add_cached_text_vertices(
+        &self,
+        vertices: &mut Vec<UiVertex>,
+        key: UiTextCacheKey,
+        font: &ab_glyph::FontArc,
+        text: &str,
+        size: f32,
+        color: Color,
+        rect: UiRect,
+        viewport: (u32, u32),
+        centered: bool,
+    ) {
+        if let Some(cached) = self.text_vertex_cache.borrow().get(&key) {
+            if cached.text == text
+                && cached.size == size
+                && cached.color == color
+                && cached.rect == rect
+                && cached.viewport == viewport
+                && cached.centered == centered
+                && cached.font_revision == self.font_revision
+            {
+                vertices.extend_from_slice(&cached.vertices);
+                return;
+            }
+        }
+
+        let mut text_vertices = Vec::new();
+        add_text(&mut text_vertices, font, text, size, color, rect, viewport, centered);
+        vertices.extend_from_slice(&text_vertices);
+        self.text_vertex_cache
+            .borrow_mut()
+            .insert(key, CachedTextVertices { text: text.to_owned(), size, color, rect, viewport, centered, font_revision: self.font_revision, vertices: text_vertices });
     }
 
     fn add_child(&mut self, parent: UiContainerId, child: UiChild) -> usize {
@@ -715,7 +853,7 @@ impl UiCanvas {
             }
             UiChild::Label(id) => {
                 let label = &self.labels[id.0];
-                return label.visible && self.container_is_visible(label.parent);
+                return label.visible && !label.visible_when_debug_ui_hidden && self.container_is_visible(label.parent);
             }
             UiChild::Container(id) => return self.container_is_visible(Some(id)),
         };
@@ -824,10 +962,6 @@ impl UiCanvas {
             UiChild::Graph(id) => self.graphs[id.0].layout,
         }
     }
-}
-
-fn add_label(vertices: &mut Vec<UiVertex>, font: &ab_glyph::FontArc, label: &UiLabel, rect: UiRect, viewport: (u32, u32)) {
-    add_text(vertices, font, &label.text, label.size, label.color, rect, viewport, false);
 }
 
 fn add_graph(vertices: &mut Vec<UiVertex>, graph: &UiGraph, rect: UiRect, width: u32, height: u32) {

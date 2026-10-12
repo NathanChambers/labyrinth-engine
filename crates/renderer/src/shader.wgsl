@@ -141,34 +141,15 @@ struct RadianceFieldTraceDebugValues {
 };
 
 
-struct SurfaceProbeUniform {
-    screen_resolution: vec4<u32>,
-    cache_settings: vec4<u32>,
-};
+;
 
-struct SurfaceProbe {
-    position_confidence: vec4<f32>,
-    normal_age: vec4<f32>,
-    irradiance: vec4<f32>,
-    sample_reason: u32,
-    surface_id: u32,
-};
+;
 
-struct SurfaceProbeValues {
-    values: array<SurfaceProbe>,
-};
+;
 
-struct SurfaceProbeCandidate {
-    pixel: vec2<u32>,
-    reason: u32,
-    importance: f32,
-    valid: u32,
-};
+;
 
-struct SurfaceProbeLighting {
-    radiance: vec3<f32>,
-    support: f32,
-};
+;
 
 struct RadianceTraceResult {
     radiance: vec3<f32>,
@@ -197,10 +178,7 @@ struct SdfTraceResult {
     last_sdf_distance: f32,
 };
 
-struct ProbeRadianceTraceResult {
-    radiance: vec3<f32>,
-    termination_reason: u32,
-};
+;
 
 const LIGHTING_KIND_UNLIT: u32 = 0u;
 const LIGHTING_KIND_DIRECT: u32 = 1u;
@@ -252,12 +230,6 @@ var<uniform> radiance_field: RadianceFieldData;
 
 @group(0) @binding(12)
 var<storage, read_write> radiance_field_values: RadianceFieldValues;
-
-@group(0) @binding(15)
-var<uniform> surface_probe_settings: SurfaceProbeUniform;
-
-@group(0) @binding(16)
-var<storage, read_write> surface_probes: SurfaceProbeValues;
 
 @group(0) @binding(20)
 var<storage, read_write> radiance_field_trace_debug: RadianceFieldTraceDebugValues;
@@ -936,183 +908,7 @@ fn update_radiance_field_cell(invocation: vec3<u32>, field: RadianceFieldData) {
 
 @compute @workgroup_size(4, 4, 4)
 fn update_world_radiance_field(@builtin(global_invocation_id) invocation: vec3<u32>) {
-    if (surface_probe_settings.cache_settings.w & 0x80000000u) != 0u {
-        return;
-    }
     update_radiance_field_cell(invocation, radiance_field);
-}
-
-fn reconstruct_world_position(pixel: vec2<u32>, depth: f32) -> vec3<f32> {
-    let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(surface_probe_settings.screen_resolution.zw);
-    let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world = camera.inverse_view_projection * clip;
-    return world.xyz / max(abs(world.w), 0.00001) * sign(world.w);
-}
-
-fn trace_surface_probe_radiance(origin: vec3<f32>, direction: vec3<f32>) -> ProbeRadianceTraceResult {
-    let trace = trace_conservative_voxels(origin, direction, 8.0, 96u);
-    if trace.termination_reason == TRACE_TERMINATION_HIT {
-        let hit_radiance = evaluate_sdf_hit_radiance(trace.position, trace.normal);
-        let direct_and_emissive = hit_radiance.direct_radiance + hit_radiance.emission_radiance;
-        let material = sample_sdf_material(trace.position);
-        let indirect = sample_world_radiance_field(trace.position + trace.normal * 0.1, trace.normal) * material;
-        return ProbeRadianceTraceResult(max(direct_and_emissive + indirect * 0.6, vec3<f32>(0.0)), trace.termination_reason);
-    }
-    if trace.termination_reason == TRACE_TERMINATION_MAX_DISTANCE {
-        return ProbeRadianceTraceResult(sdf_clipmap.sky_radiance.rgb, trace.termination_reason);
-    }
-    return ProbeRadianceTraceResult(vec3<f32>(0.0), trace.termination_reason);
-}
-
-fn classify_surface_probe(pixel: vec2<u32>, tile: vec2<u32>) -> SurfaceProbeCandidate {
-    let is_base_sample = (tile.x % 2u == 0u || surface_probe_settings.screen_resolution.x < 2u) && (tile.y % 2u == 0u || surface_probe_settings.screen_resolution.y < 2u);
-    if !is_base_sample {
-        return SurfaceProbeCandidate(pixel, 0u, 0.0, 0u);
-    }
-    let center_depth = textureLoad(scene_depth_texture, vec2<i32>(pixel), 0);
-    let center_surface = textureLoad(surface_normal_texture, vec2<i32>(pixel), 0);
-    let center_valid = center_depth < 0.999999 && center_surface.a >= 0.5 && dot(center_surface.xyz, center_surface.xyz) >= 0.25;
-    var selected_pixel = pixel;
-    var selected_valid = center_valid;
-    let half_tile = i32(surface_probe_settings.cache_settings.x / 2u) - 1;
-    let offsets = array<vec2<i32>, 8>(vec2<i32>(-half_tile, -half_tile), vec2<i32>(0, -half_tile), vec2<i32>(half_tile, -half_tile), vec2<i32>(-half_tile, 0), vec2<i32>(half_tile, 0), vec2<i32>(-half_tile, half_tile), vec2<i32>(0, half_tile), vec2<i32>(half_tile, half_tile));
-    for (var sample_index = 0u; sample_index < 8u; sample_index++) {
-        let sample_pixel = vec2<u32>(clamp(vec2<i32>(pixel) + offsets[sample_index], vec2<i32>(0), vec2<i32>(surface_probe_settings.screen_resolution.zw) - vec2<i32>(1)));
-        let sample_depth = textureLoad(scene_depth_texture, vec2<i32>(sample_pixel), 0);
-        let sample_surface = textureLoad(surface_normal_texture, vec2<i32>(sample_pixel), 0);
-        let sample_valid = sample_depth < 0.999999 && sample_surface.a >= 0.5 && dot(sample_surface.xyz, sample_surface.xyz) >= 0.25;
-        if !selected_valid && sample_valid {
-            selected_pixel = sample_pixel;
-            selected_valid = true;
-        }
-    }
-    if !selected_valid {
-        return SurfaceProbeCandidate(pixel, 0u, 0.0, 0u);
-    }
-    return SurfaceProbeCandidate(selected_pixel, 0u, 0.0, 1u);
-}
-
-fn visible_probe_slot(tile: vec2<u32>) -> u32 {
-    let tile_size = surface_probe_settings.screen_resolution.xy;
-    let base_grid_size = (tile_size + vec2<u32>(1u)) / 2u;
-    let base_count = base_grid_size.x * base_grid_size.y;
-    let visible_probe_budget = min(base_count, 3000u);
-    let base_index = (tile.y / 2u) * base_grid_size.x + tile.x / 2u;
-    if visible_probe_budget >= base_count {
-        return base_index;
-    }
-    let first_slot = base_index * visible_probe_budget / base_count;
-    let next_slot = (base_index + 1u) * visible_probe_budget / base_count;
-    return select(0xffffffffu, next_slot - 1u, next_slot != first_slot);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn update_surface_probes(@builtin(global_invocation_id) invocation: vec3<u32>) {
-    if any(invocation.xy >= surface_probe_settings.screen_resolution.xy) {
-        return;
-    }
-    let pixel = min(invocation.xy * surface_probe_settings.cache_settings.x + vec2<u32>(surface_probe_settings.cache_settings.x / 2u), surface_probe_settings.screen_resolution.zw - vec2<u32>(1u));
-    let classification = classify_surface_probe(pixel, invocation.xy);
-    if classification.valid == 0u {
-        return;
-    }
-    let sample_pixel = classification.pixel;
-    let depth = textureLoad(scene_depth_texture, vec2<i32>(sample_pixel), 0);
-    let surface = textureLoad(surface_normal_texture, vec2<i32>(sample_pixel), 0);
-    let position = reconstruct_world_position(sample_pixel, depth);
-    let normal = normalize(surface.xyz);
-    let surface_id = textureLoad(surface_id_texture, vec2<i32>(sample_pixel), 0).x;
-    let probe_index = visible_probe_slot(invocation.xy);
-    if probe_index == 0xffffffffu || probe_index >= surface_probe_settings.cache_settings.y {
-        return;
-    }
-    let previous_position_confidence = surface_probes.values[probe_index].position_confidence;
-    let previous_normal_age = surface_probes.values[probe_index].normal_age;
-    let voxel_size = (sdf_clipmap.maximum.xyz - sdf_clipmap.minimum.xyz) / vec3<f32>(sdf_clipmap.resolution.xyz);
-    let maximum_voxel_size = max(max(voxel_size.x, voxel_size.y), voxel_size.z);
-    let same_surface = previous_position_confidence.w > 0.0 && surface_probes.values[probe_index].surface_id == surface_id && dot(previous_normal_age.xyz, previous_normal_age.xyz) > 0.25;
-    let anchor_distance = distance(position, previous_position_confidence.xyz);
-    let is_existing = same_surface && dot(normal, normalize(previous_normal_age.xyz)) > 0.72 && anchor_distance <= maximum_voxel_size;
-    let movement_threshold = max(maximum_voxel_size * 0.25, 0.05);
-    let anchor_moved = is_existing && anchor_distance > movement_threshold;
-    var reason = classification.reason;
-    if !is_existing && reason == 0u {
-        reason = 4u;
-    }
-    var probe_position = position;
-    var probe_normal = normal;
-    if is_existing {
-        if (surface_probe_settings.cache_settings.w & 0x80000000u) != 0u {
-            surface_probes.values[probe_index].normal_age.w = 0.0;
-            return;
-        }
-        let update_period = select(16u, select(8u, 4u, reason >= 3u), reason > 0u);
-        let frame_index = surface_probe_settings.cache_settings.w & 0x7fffffffu;
-        if !anchor_moved && (probe_index + frame_index) % update_period != 0u {
-            surface_probes.values[probe_index].position_confidence.w = exp(-anchor_distance * anchor_distance * 8.0);
-            return;
-        }
-    }
-    if !is_existing {
-        surface_probes.values[probe_index].position_confidence = vec4<f32>(probe_position, 1.0);
-        surface_probes.values[probe_index].normal_age = vec4<f32>(probe_normal, 0.0);
-        surface_probes.values[probe_index].irradiance = vec4<f32>(0.0);
-        surface_probes.values[probe_index].sample_reason = reason;
-        surface_probes.values[probe_index].surface_id = surface_id;
-    } else {
-        surface_probes.values[probe_index].sample_reason = max(surface_probes.values[probe_index].sample_reason, reason);
-        surface_probes.values[probe_index].surface_id = surface_id;
-    }
-
-    let tangent = normalize(cross(probe_normal, select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(probe_normal.y) > 0.9)));
-    let bitangent = normalize(cross(probe_normal, tangent));
-    let stable_seed = probe_index * 747796405u + 2891336453u;
-    let stable_hash = ((stable_seed >> ((stable_seed >> 28u) + 4u)) ^ stable_seed) * 277803737u;
-    let random_angle = f32((stable_hash >> 22u) ^ stable_hash) / 4294967295.0 * 6.28318530718;
-    let rotated_tangent = tangent * cos(random_angle) + bitangent * sin(random_angle);
-    let rotated_bitangent = normalize(cross(normal, rotated_tangent));
-    let ray_directions = array<vec3<f32>, 4>(normalize(probe_normal + rotated_tangent * 0.45 + rotated_bitangent * 0.15), normalize(probe_normal - rotated_tangent * 0.35 + rotated_bitangent * 0.5), normalize(probe_normal + rotated_tangent * 0.2 - rotated_bitangent * 0.55), normalize(probe_normal - rotated_tangent * 0.55 - rotated_bitangent * 0.25));
-    var traced_radiance = vec3<f32>(0.0);
-    var resolved_ray_count = 0u;
-    for (var ray_index = 0u; ray_index < 4u; ray_index++) {
-        let trace = trace_surface_probe_radiance(probe_position + probe_normal * 0.08, ray_directions[ray_index]);
-        if trace.termination_reason == TRACE_TERMINATION_HIT || trace.termination_reason == TRACE_TERMINATION_MAX_DISTANCE {
-            traced_radiance += trace.radiance;
-            resolved_ray_count += 1u;
-        }
-    }
-    if resolved_ray_count == 0u {
-        return;
-    }
-    traced_radiance /= f32(resolved_ray_count);
-    let previous = surface_probes.values[probe_index].irradiance.rgb;
-    let old_confidence = surface_probes.values[probe_index].irradiance.a;
-    var blend = 1.0;
-    if is_existing && old_confidence > 0.0 {
-        blend = select(0.65, select(0.8, 0.9, reason >= 3u), reason > 0u);
-        if anchor_moved {
-            blend = 1.0;
-        }
-    }
-    let result = mix(previous, traced_radiance, blend);
-    surface_probes.values[probe_index].position_confidence = vec4<f32>(probe_position, 1.0);
-    surface_probes.values[probe_index].normal_age = vec4<f32>(probe_normal, 0.0);
-    surface_probes.values[probe_index].irradiance = vec4<f32>(result, 1.0);
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn age_surface_probes(@builtin(global_invocation_id) invocation: vec3<u32>) {
-    let index = invocation.x;
-    if index < surface_probe_settings.cache_settings.y {
-        let confidence = surface_probes.values[index].position_confidence.w;
-        if confidence > 0.0 {
-            surface_probes.values[index].normal_age.w += 1.0;
-            if surface_probes.values[index].normal_age.w >= 240.0 {
-                surface_probes.values[index].position_confidence.w = 0.0;
-                surface_probes.values[index].irradiance = vec4<f32>(0.0);
-            }
-        }
-    }
 }
 
 fn radiance_cell_visibility_weight(receiver: vec3<f32>, cell_position: vec3<f32>, normal: vec3<f32>, offset_target: bool) -> f32 {
@@ -1453,82 +1249,6 @@ fn radiance_support_debug_color(sample: RadianceFieldSample) -> vec3<f32> {
     let spatial_support = clamp(sample.valid_interpolation_weight, 0.0, 1.0);
     let directional_support = clamp(sample.directional_support, 0.0, 1.0);
     return vec3<f32>(valid_cell_fraction, spatial_support, directional_support);
-}
-
-fn sample_surface_probe_field(position: vec3<f32>, normal: vec3<f32>, surface_id: u32, pixel: vec2<u32>) -> SurfaceProbeLighting {
-    var nearest_indices = array<u32, 12>(0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu);
-    var nearest_distances = array<f32, 12>(1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30, 1e30);
-    let base_grid_size = (surface_probe_settings.screen_resolution.xy + vec2<u32>(1u)) / 2u;
-    let screen_probe_spacing = surface_probe_settings.cache_settings.x * 2u;
-    let tile_coordinate = vec2<i32>(pixel / screen_probe_spacing);
-    for (var tile_y = -2; tile_y <= 2; tile_y++) {
-        for (var tile_x = -2; tile_x <= 2; tile_x++) {
-            let neighbor_tile = tile_coordinate + vec2<i32>(tile_x, tile_y);
-            if any(neighbor_tile < vec2<i32>(0)) || any(neighbor_tile >= vec2<i32>(base_grid_size)) {
-                continue;
-            }
-            let probe_index = visible_probe_slot(vec2<u32>(neighbor_tile) * 2u);
-            if probe_index == 0xffffffffu || probe_index >= surface_probe_settings.cache_settings.y || surface_probes.values[probe_index].position_confidence.w <= 0.0 || surface_probes.values[probe_index].surface_id != surface_id {
-                continue;
-            }
-            let probe_position = surface_probes.values[probe_index].position_confidence.xyz;
-            let delta = position - probe_position;
-            let plane_distance = dot(delta, normal);
-            let tangent_delta = delta - normal * plane_distance;
-            let tangent_distance = length(tangent_delta);
-            let probe_normal = normalize(surface_probes.values[probe_index].normal_age.xyz);
-            let normal_alignment = dot(normal, probe_normal);
-            let plane_error = abs(plane_distance);
-            if normal_alignment <= 0.1 {
-                continue;
-            }
-            let candidate_distance = tangent_distance * tangent_distance + plane_error * plane_error * 4.0;
-            var insert_at = 12u;
-            for (var slot = 0u; slot < 12u; slot++) {
-                if insert_at == 12u && candidate_distance < nearest_distances[slot] {
-                    insert_at = slot;
-                }
-            }
-            if insert_at < 12u {
-                var shift = 11u;
-                loop {
-                    if shift <= insert_at {
-                        break;
-                    }
-                    nearest_distances[shift] = nearest_distances[shift - 1u];
-                    nearest_indices[shift] = nearest_indices[shift - 1u];
-                    shift -= 1u;
-                }
-                nearest_distances[insert_at] = candidate_distance;
-                nearest_indices[insert_at] = probe_index;
-            }
-        }
-    }
-    var local_radiance = vec3<f32>(0.0);
-    var total_weight = 0.0;
-    for (var slot = 0u; slot < 12u; slot++) {
-        let probe_index = nearest_indices[slot];
-        if probe_index != 0xffffffffu {
-            let probe_position = surface_probes.values[probe_index].position_confidence.xyz;
-            let delta = position - probe_position;
-            let plane_distance = dot(delta, normal);
-            let tangent_delta = delta - normal * plane_distance;
-            let tangent_distance = length(tangent_delta);
-            let probe_normal = normalize(surface_probes.values[probe_index].normal_age.xyz);
-            let plane_error = abs(plane_distance);
-            let normal_weight = smoothstep(0.1, 0.9, dot(normal, probe_normal));
-            let plane_weight = 1.0 - smoothstep(0.35, 0.9, plane_error);
-            let visibility = radiance_cell_visibility_weight(position, probe_position, normal, true);
-            let distance_weight = exp(-tangent_distance * tangent_distance * 0.8 - plane_error * plane_error * 2.5);
-            let age_weight = 1.0 - clamp(surface_probes.values[probe_index].normal_age.w / 240.0, 0.0, 1.0);
-            let weight = distance_weight * normal_weight * plane_weight * visibility * age_weight * surface_probes.values[probe_index].position_confidence.w * surface_probes.values[probe_index].irradiance.a;
-            local_radiance += surface_probes.values[probe_index].irradiance.rgb * weight;
-            total_weight += weight;
-        }
-    }
-    let support = smoothstep(0.01, 0.3, total_weight);
-    let local_value = local_radiance / max(total_weight, 0.0001);
-    return SurfaceProbeLighting(local_value, support);
 }
 
 fn sample_sdf_material(position: vec3<f32>) -> vec3<f32> {

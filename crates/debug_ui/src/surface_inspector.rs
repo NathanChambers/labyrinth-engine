@@ -94,10 +94,10 @@ impl SurfaceInspector {
         }
     }
 
-    pub fn update(&mut self, context: &mut RuntimeContext) {
-        let open = context.ui.button_toggled(self.open_button).unwrap_or(false);
+    pub fn update(&mut self, context: &mut RuntimeContext, available: bool) {
+        let open = available && context.ui.button_toggled(self.open_button).unwrap_or(false);
         context.ui.set_button_toggled(self.open_button, open);
-        let field_enabled = context.irradiance_mode == IrradianceMode::AabbSdf && context.render_settings.irradiance_enabled;
+        let field_enabled = available && context.has_irradiance_source() && context.irradiance_mode == IrradianceMode::AabbSdf && context.render_settings.irradiance_enabled;
         context.gi_surface_inspector_enabled = open && field_enabled;
         context.ui.set_panel_window_visible(self.window, open);
         let collapsed = context.ui.panel_window_collapsed(self.window).unwrap_or(false);

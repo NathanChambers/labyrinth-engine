@@ -51,20 +51,6 @@ struct RadianceFieldTraceDebugValues {
     values: array<RadianceFieldTraceDebug>,
 };
 
-struct SurfaceProbe {
-    position_confidence: vec4<f32>,
-    normal_age: vec4<f32>,
-    irradiance: vec4<f32>,
-    lock: u32,
-    next: u32,
-    sample_reason: u32,
-    padding: u32,
-};
-
-struct SurfaceProbeValues {
-    values: array<SurfaceProbe>,
-};
-
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -85,16 +71,12 @@ var<uniform> radiance_field: RadianceFieldData;
 @group(0) @binding(12)
 var<storage, read> radiance_field_values: RadianceFieldValues;
 
-@group(0) @binding(16)
-var<storage, read> surface_probes: SurfaceProbeValues;
-
 @group(0) @binding(20)
 var<storage, read> radiance_field_trace_debug: RadianceFieldTraceDebugValues;
 
 @group(0) @binding(21)
 var<uniform> selected_radiance_cell: SelectedRadianceCell;
 
-const SURFACE_PROBE_CAPACITY: u32 = 131072u;
 const RADIANCE_FIELD_RAY_COUNT: u32 = 2u;
 const TRACE_TERMINATION_HIT: u32 = 1u;
 const TRACE_TERMINATION_MAX_STEPS: u32 = 2u;
@@ -128,22 +110,6 @@ fn trace_termination_color(reason: u32) -> vec3<f32> {
 fn sampled_sdf_distance_color(distance: f32) -> vec3<f32> {
     let normalized_distance = clamp(distance / 2.0, 0.0, 1.0);
     return mix(vec3<f32>(0.08, 0.2, 1.0), vec3<f32>(1.0, 0.12, 0.04), normalized_distance);
-}
-
-fn probe_reason_color(reason: u32) -> vec3<f32> {
-    if reason == 1u {
-        return vec3<f32>(0.15, 0.65, 1.0);
-    }
-    if reason == 2u {
-        return vec3<f32>(0.9, 0.25, 0.95);
-    }
-    if reason == 3u {
-        return vec3<f32>(1.0, 0.5, 0.12);
-    }
-    if reason >= 4u {
-        return vec3<f32>(1.0, 0.9, 0.15);
-    }
-    return vec3<f32>(0.45, 0.55, 0.68);
 }
 
 fn field_radiance(index: u32, field: RadianceFieldData) -> vec3<f32> {
@@ -199,33 +165,8 @@ fn make_vertex(position: vec3<f32>, color: vec4<f32>) -> VertexOutput {
 
 @vertex
 fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
-    if instance_index < SURFACE_PROBE_CAPACITY {
-        if surface_probes.values[instance_index].position_confidence.w <= 0.0 || surface_probes.values[instance_index].normal_age.w > 1.0 {
-            return make_vertex(vec3<f32>(0.0), vec4<f32>(0.0));
-        }
-        let center = surface_probes.values[instance_index].position_confidence.xyz;
-        let reason_color = probe_reason_color(surface_probes.values[instance_index].sample_reason);
-        let axis_index = vertex_index / 2u;
-        let endpoint = vertex_index % 2u;
-        if axis_index < 3u {
-            var axis = vec3<f32>(1.0, 0.0, 0.0);
-            if axis_index == 1u {
-                axis = vec3<f32>(0.0, 1.0, 0.0);
-            } else if axis_index == 2u {
-                axis = vec3<f32>(0.0, 0.0, 1.0);
-            }
-            let direction = select(-axis, axis, endpoint == 1u);
-            let position = center + direction * 0.025;
-            return make_vertex(position, vec4<f32>(reason_color, 0.9));
-        }
-        let normal = normalize(surface_probes.values[instance_index].normal_age.xyz);
-        let position = center + select(vec3<f32>(0.0), normal * 0.2, endpoint == 1u);
-        let color = display_radiance(surface_probes.values[instance_index].irradiance.rgb);
-        return make_vertex(position, vec4<f32>(color, 0.95));
-    }
-
     let field_cell_count = radiance_field.resolution.x * radiance_field.resolution.y * radiance_field.resolution.z;
-    let field_instance = instance_index - SURFACE_PROBE_CAPACITY;
+    let field_instance = instance_index;
     if field_instance >= field_cell_count {
         let trace_instance = field_instance - field_cell_count;
         let trace_field = radiance_field;
