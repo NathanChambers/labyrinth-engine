@@ -131,7 +131,7 @@ pub fn torus(center: [f32; 3], major_radius: f32, minor_radius: f32, color: Colo
 }
 
 fn vertex(position: [f32; 3], normal: [f32; 3], color: Color) -> MeshVertex {
-    MeshVertex { position, normal, color: color.to_array() }
+    MeshVertex { position, normal, tex_coord: [0.0, 0.0], color: color.to_array() }
 }
 
 fn add_grid_triangles(mesh: &mut Mesh, vertices: &[Vec<u32>], segments: u32, rings: u32) {

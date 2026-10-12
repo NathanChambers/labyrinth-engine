@@ -5,19 +5,62 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MESH_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     pub base_color: Color,
     pub metallic: f32,
     pub roughness: f32,
     pub emission: Color,
     pub emission_strength: f32,
+    pub base_color_texture: Option<Texture>,
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Self { base_color: Color::WHITE, metallic: 0.0, roughness: 0.5, emission: Color::BLACK, emission_strength: 0.0 }
+        Self { base_color: Color::WHITE, metallic: 0.0, roughness: 0.5, emission: Color::BLACK, emission_strength: 0.0, base_color_texture: None }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Texture {
+    id: u64,
+    width: u32,
+    height: u32,
+    rgba8: Arc<[u8]>,
+}
+
+impl Texture {
+    pub fn from_rgba8(width: u32, height: u32, rgba8: Vec<u8>) -> Result<Self, String> {
+        let expected_length = width as usize * height as usize * 4;
+        if width == 0 || height == 0 || rgba8.len() != expected_length {
+            return Err("texture RGBA data must match its non-zero dimensions".into());
+        }
+
+        Ok(Self { id: NEXT_TEXTURE_ID.fetch_add(1, Ordering::Relaxed), width, height, rgba8: rgba8.into() })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba8(&self) -> &[u8] {
+        &self.rgba8
+    }
+}
+
+impl PartialEq for Texture {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
     }
 }
 
@@ -26,6 +69,7 @@ impl Default for Material {
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub tex_coord: [f32; 2],
     pub color: [f32; 4],
 }
 
@@ -147,7 +191,7 @@ mod tests {
     use super::{Mesh, MeshVertex};
 
     fn vertex() -> MeshVertex {
-        MeshVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], color: [1.0, 1.0, 1.0, 1.0] }
+        MeshVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0], tex_coord: [0.0, 0.0], color: [1.0, 1.0, 1.0, 1.0] }
     }
 
     #[test]

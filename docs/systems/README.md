@@ -11,6 +11,7 @@ Each implemented engine system gets one page named for its responsibility. Use [
 | [Scene](scene.md) | `crates/engine` | Implemented |
 | [Math](math.md) | `crates/math` | Implemented |
 | [Mesh](mesh.md) | `crates/mesh` | Implemented |
+| [Asset import](asset-import.md) | `crates/asset_import` | Implemented for static FBX meshes and base-color images |
 | [Primitives](primitives.md) | `crates/engine` | Implemented |
 | [Rendering](rendering.md) | `crates/renderer` | Implemented |
 | [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Authored volumes and experimental static scene-bounded AABB-SDF plus one uniform scene-sized radiance field |

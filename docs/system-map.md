@@ -6,6 +6,7 @@ This map records relationships established in code. Broader gameplay scripting a
 primitives example ──entities/assignments──> windowing ──window/scene/backend──> rendering
 control example ──empty scene + frame sampling──> windowing ──fallback camera/clear/present──> rendering
 genos stress example ──building + animated boxes and lights──> scene ──selected camera/lights/meshes──> rendering
+FX static-world example ──copied FBX assets──> asset importer ──meshes/materials/textures──> scene ──instances──> rendering
        │                                  ^                                      │
        └──uses──> engine primitives ──> mesh <────────────────────────────────────┘
                                           │
@@ -34,6 +35,9 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Primitives example](../examples/primitives/src/main.rs) | [Profiling](systems/profiling.md) | Timed debug/release frame interval and engine CPU samples for the animated primitives scene | Profile duration after two-second warmup |
 | [Control example](../examples/control/src/main.rs) | [Windowing](systems/windowing.md) | Empty scene and optional timed debug/release frame sampling | Startup and each redraw |
 | [Engine primitives](systems/primitives.md) | [Mesh](systems/mesh.md) | Generated primitive geometry | On request |
+| [FX example](../examples/fx/src/main.rs) | [Asset import](systems/asset-import.md) | Copied terrain, building, and prop FBX files plus texture roots | Scene setup |
+| [Asset import](systems/asset-import.md) | [Mesh](systems/mesh.md) | Static triangulated geometry, UVs, scalar PBR values, and decoded base-color pixels | Asset loading |
+| [FX example](../examples/fx/src/main.rs) | [Mesh](systems/mesh.md) | Imported meshes and materials retained as static scene instances; repeated assets share geometry | Scene setup |
 | [Math](systems/math.md) | [Rendering](systems/rendering.md) | Camera matrix and vector operations | Initialization and resize |
 | [Windowing](systems/windowing.md) | [Math](systems/math.md) | Frame delta and registered time scales | Each update |
 | [Windowing](systems/windowing.md) | [Input](systems/input.md) | Keyboard, mouse, focus, and cursor events; capture is cleared on suspension and shutdown | Event loop and teardown |

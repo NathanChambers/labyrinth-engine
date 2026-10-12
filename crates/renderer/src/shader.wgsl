@@ -270,6 +270,12 @@ var<uniform> triangle_bvh_settings: TriangleBvhSettings;
 @group(1) @binding(7)
 var<storage, read_write> triangle_bvh_diagnostics: TriangleBvhDiagnostics;
 
+@group(2) @binding(0)
+var base_color_texture: texture_2d<f32>;
+
+@group(2) @binding(1)
+var base_color_sampler: sampler;
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -285,6 +291,7 @@ struct VertexInput {
     @location(11) material_params: vec4<f32>,
     @location(12) material_emission: vec4<f32>,
     @location(13) surface_id: u32,
+    @location(14) tex_coord: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -299,6 +306,7 @@ struct VertexOutput {
     @location(8) indirect: vec3<f32>,
     @location(9) shadow_position_1: vec4<f32>,
     @location(10) shadow_position_2: vec4<f32>,
+    @location(11) tex_coord: vec2<f32>,
 };
 
 struct FragmentOutput {
@@ -323,15 +331,17 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     output.shadow_position_2 = camera.shadow_view_projection[2] * shadow_origin;
     output.world_position = world_position.xyz;
     output.indirect = vec3<f32>(0.0);
+    output.tex_coord = input.tex_coord;
     return output;
 }
 
 @fragment
 fn fragment_main(input: VertexOutput) -> FragmentOutput {
-    let albedo = input.color.rgb * input.material_base_color.rgb;
+    let base_color_sample = textureSample(base_color_texture, base_color_sampler, input.tex_coord);
+    let albedo = input.color.rgb * input.material_base_color.rgb * base_color_sample.rgb;
     let emission = input.material_emission.rgb * input.material_params.w;
     if camera.debug_mode.x == 1u || camera.debug_mode.x == 2u {
-        return FragmentOutput(vec4<f32>(albedo + emission, input.color.a * input.material_base_color.a));
+        return FragmentOutput(vec4<f32>(albedo + emission, input.color.a * input.material_base_color.a * base_color_sample.a));
     }
     let normal = normalize(input.normal);
     if camera.debug_mode.x == 5u {
@@ -459,7 +469,7 @@ fn fragment_main(input: VertexOutput) -> FragmentOutput {
     if camera.debug_mode.x == 3u {
         return FragmentOutput(vec4<f32>(vec3<f32>(direct_visibility), 1.0));
     }
-    let color = vec4<f32>(final_color, input.color.a * input.material_base_color.a);
+    let color = vec4<f32>(final_color, input.color.a * input.material_base_color.a * base_color_sample.a);
     return FragmentOutput(color);
 }
 

@@ -314,6 +314,7 @@ struct RendererMeshVertex {
     position: [f32; 3],
     normal: [f32; 3],
     color: [f32; 4],
+    tex_coord: [f32; 2],
 }
 
 #[repr(C)]
@@ -334,6 +335,12 @@ struct MeshDrawBatch {
     wireframe_range: Range<u32>,
     instance_range: Range<usize>,
     instance_indices: Vec<usize>,
+    base_color_texture_id: Option<u64>,
+}
+
+struct MaterialTextureBinding {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -872,6 +879,9 @@ pub struct Renderer {
     wireframe_index_count: u32,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    material_texture_bind_group_layout: wgpu::BindGroupLayout,
+    material_texture_bindings: HashMap<Option<u64>, MaterialTextureBinding>,
+    material_texture_sampler: wgpu::Sampler,
     irradiance_buffer: wgpu::Buffer,
     irradiance_cache: Box<IrradianceUniform>,
     irradiance_volume_layout: Vec<RendererIrradianceVolume>,
@@ -1753,15 +1763,40 @@ impl Renderer {
             cache: None,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse shader"), source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()) });
+        let material_texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("base color texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let material_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("base color texture sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let material_texture_bindings = create_material_texture_bindings(&device, &queue, &material_texture_bind_group_layout, &material_texture_sampler, instances);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout), Some(&depth_bind_group_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&depth_bind_group_layout), Some(&material_texture_bind_group_layout)],
             immediate_size: 0,
         });
+        let gizmo_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gizmo pipeline layout"), bind_group_layouts: &[Some(&bind_group_layout)], immediate_size: 0 });
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 14 => Float32x2],
         };
         let instance_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
@@ -1912,7 +1947,7 @@ impl Renderer {
         let gizmo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gizmo shader"), source: wgpu::ShaderSource::Wgsl(include_str!("gizmo_shader.wgsl").into()) });
         let gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gizmo pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&gizmo_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &gizmo_shader,
                 entry_point: Some("vertex_main"),
@@ -2092,6 +2127,9 @@ impl Renderer {
             wireframe_index_count: wireframe_indices.len() as u32,
             camera_buffer,
             camera_bind_group,
+            material_texture_bind_group_layout,
+            material_texture_bindings,
+            material_texture_sampler,
             irradiance_buffer,
             irradiance_cache: initial_irradiance,
             irradiance_volume_layout: irradiance_volumes.to_vec(),
@@ -2257,6 +2295,7 @@ impl Renderer {
             let dummy_index = 0_u32;
             let index_contents = if indices.is_empty() { bytemuck::bytes_of(&dummy_index) } else { bytemuck::cast_slice(&indices) };
             self.mesh_draw_batches = mesh_draw_batches;
+            self.material_texture_bindings = create_material_texture_bindings(&self.device, &self.queue, &self.material_texture_bind_group_layout, &self.material_texture_sampler, instances);
             (self.instance_data_scratch, self.instance_data_offsets) = build_instance_data(instances, &self.mesh_draw_batches);
             let dummy_instance = RendererInstanceData::zeroed();
             let instance_contents = if self.instance_data_scratch.is_empty() { bytemuck::bytes_of(&dummy_instance) } else { bytemuck::cast_slice(&self.instance_data_scratch) };
@@ -3272,7 +3311,7 @@ impl Renderer {
         self.render_scene_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group);
         encoder.pop_debug_group();
         if self.gizmo_vertex_count > 0 {
-            self.render_gizmo_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group);
+            self.render_gizmo_pass(&mut encoder, &color_view, &depth_view);
         }
         if self.should_draw_gi_gizmos() {
             self.render_gi_gizmo_pass(&mut encoder, &color_view, &depth_view);
@@ -3564,7 +3603,7 @@ impl Renderer {
         self.render_scene_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group);
         encoder.pop_debug_group();
         if self.gizmo_vertex_count > 0 {
-            self.render_gizmo_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group);
+            self.render_gizmo_pass(&mut encoder, &color_view, &self.depth_view);
         }
         if self.should_draw_gi_gizmos() {
             self.render_gi_gizmo_pass(&mut encoder, &color_view, &self.depth_view);
@@ -3687,6 +3726,8 @@ impl Renderer {
             pass.set_pipeline(&self.wireframe_pipeline);
             pass.set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             for batch in &self.mesh_draw_batches {
+                let material_texture = self.material_texture_bindings.get(&batch.base_color_texture_id).expect("material texture binding was not created");
+                pass.set_bind_group(2, &material_texture.bind_group, &[]);
                 let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
                 let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
                 pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
@@ -3695,6 +3736,8 @@ impl Renderer {
         } else {
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             for batch in &self.mesh_draw_batches {
+                let material_texture = self.material_texture_bindings.get(&batch.base_color_texture_id).expect("material texture binding was not created");
+                pass.set_bind_group(2, &material_texture.bind_group, &[]);
                 let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
                 let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
                 pass.set_vertex_buffer(1, self.instance_buffer.slice(instance_start..instance_end));
@@ -3886,7 +3929,7 @@ impl Renderer {
         pass.draw(0..self.ui_vertex_count, 0..1);
     }
 
-    fn render_gizmo_pass(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, depth_view: &wgpu::TextureView, depth_bind_group: &wgpu::BindGroup) {
+    fn render_gizmo_pass(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, depth_view: &wgpu::TextureView) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gizmo pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3910,7 +3953,6 @@ impl Renderer {
         });
         pass.set_pipeline(&self.gizmo_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        pass.set_bind_group(1, depth_bind_group, &[]);
         pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
         pass.draw(0..self.gizmo_vertex_count, 0..1);
     }
@@ -4257,6 +4299,7 @@ fn mesh_topology_signature(instances: &[MeshInstance]) -> u64 {
     instances.len().hash(&mut hasher);
     for instance in instances {
         instance.mesh.geometry_version().hash(&mut hasher);
+        instance.material.base_color_texture.as_ref().map(mesh::Texture::id).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -4266,8 +4309,8 @@ fn unique_mesh_geometry_counts(instances: &[MeshInstance]) -> (usize, usize) {
     let mut vertex_count = 0;
     let mut index_count = 0;
     for instance in instances {
-        let version = instance.mesh.geometry_version();
-        if meshes.insert(version, ()).is_none() {
+        let key = (instance.mesh.geometry_version(), instance.material.base_color_texture.as_ref().map(mesh::Texture::id));
+        if meshes.insert(key, ()).is_none() {
             vertex_count += instance.mesh.vertices().len();
             index_count += instance.mesh.indices().len();
         }
@@ -4286,6 +4329,7 @@ fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
     instance.material.roughness.to_bits().hash(&mut hasher);
     instance.material.emission.to_array().map(|value| value.to_bits()).hash(&mut hasher);
     instance.material.emission_strength.to_bits().hash(&mut hasher);
+    instance.material.base_color_texture.as_ref().map(mesh::Texture::id).hash(&mut hasher);
     instance.probe_dynamic.hash(&mut hasher);
     hasher.finish()
 }
@@ -4299,12 +4343,14 @@ fn flatten_meshes(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>
     let mut batch_indices = HashMap::new();
     for (instance_index, instance) in instances.iter().enumerate() {
         let version = instance.mesh.geometry_version();
-        let batch_index = match batch_indices.get(&version) {
+        let texture_id = instance.material.base_color_texture.as_ref().map(mesh::Texture::id);
+        let batch_key = (version, texture_id);
+        let batch_index = match batch_indices.get(&batch_key) {
             Some(batch_index) => *batch_index,
             None => {
                 let batch_index = mesh_batches.len();
-                mesh_batches.push(MeshDrawBatch { index_range: 0..0, wireframe_range: 0..0, instance_range: 0..0, instance_indices: Vec::new() });
-                batch_indices.insert(version, batch_index);
+                mesh_batches.push(MeshDrawBatch { index_range: 0..0, wireframe_range: 0..0, instance_range: 0..0, instance_indices: Vec::new(), base_color_texture_id: texture_id });
+                batch_indices.insert(batch_key, batch_index);
                 batch_index
             }
         };
@@ -4331,7 +4377,7 @@ fn flatten_meshes(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>
 }
 
 fn renderer_mesh_vertex(vertex: &MeshVertex) -> RendererMeshVertex {
-    RendererMeshVertex { position: vertex.position, normal: vertex.normal, color: vertex.color }
+    RendererMeshVertex { position: vertex.position, normal: vertex.normal, color: vertex.color, tex_coord: vertex.tex_coord }
 }
 
 fn build_instance_data(instances: &[MeshInstance], batches: &[MeshDrawBatch]) -> (Vec<RendererInstanceData>, Vec<usize>) {
@@ -4377,6 +4423,61 @@ fn draw_shadow_instance_range<'pass>(pass: &mut wgpu::RenderPass<'pass>, instanc
     let instance_end = (last_instance * mem::size_of::<RendererInstanceData>()) as u64;
     pass.set_vertex_buffer(1, instance_buffer.slice(instance_start..instance_end));
     pass.draw_indexed(batch.index_range.clone(), 0, 0..(end - start) as u32);
+}
+
+fn create_material_texture_bindings(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    instances: &[MeshInstance],
+) -> HashMap<Option<u64>, MaterialTextureBinding> {
+    let mut bindings = HashMap::new();
+    bindings.insert(None, create_material_texture_binding(device, queue, layout, sampler, "default base color", 1, 1, &[255, 255, 255, 255]));
+    for texture in instances.iter().filter_map(|instance| instance.material.base_color_texture.as_ref()) {
+        bindings
+            .entry(Some(texture.id()))
+            .or_insert_with(|| create_material_texture_binding(device, queue, layout, sampler, "material base color", texture.width(), texture.height(), texture.rgba8()));
+    }
+    bindings
+}
+
+fn create_material_texture_binding(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    label: &str,
+    width: u32,
+    height: u32,
+    rgba8: &[u8],
+) -> MaterialTextureBinding {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        rgba8,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    });
+    MaterialTextureBinding { _texture: texture, bind_group }
 }
 
 fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {

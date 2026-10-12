@@ -32,7 +32,7 @@ pub use input::InputState;
 pub use log::{debug, error, info, trace, warn};
 pub use logging::init_logging;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
-pub use mesh::{Material, Mesh, MeshInstance, MeshVertex};
+pub use mesh::{Material, Mesh, MeshInstance, MeshVertex, Texture};
 pub use renderer::{
     GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldResolution, RenderDebugMode, RenderSettings,
     RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceAngularSegment, RendererRadianceFieldGrid,

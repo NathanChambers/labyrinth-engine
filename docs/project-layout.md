@@ -1,6 +1,6 @@
 # Project layout
 
-The workspace grows by working vertical slices. The graphics milestone currently has four engine packages and two example consumers:
+The workspace grows by working vertical slices. The graphics milestone currently has five engine packages and five example consumers:
 
 ```text
 labyrinth-engine/
@@ -9,6 +9,7 @@ labyrinth-engine/
 │   ├── engine/              # Public game-facing package: labyrinth, primitives, windowing
 │   ├── math/                # Shared math value types and transforms
 │   ├── mesh/                # Shared CPU mesh contract
+│   ├── asset_import/        # Static FBX geometry and base-color image loading
 │   ├── renderer/            # GPU rendering and readback
 │   └── scripting/           # Rhai capture-plan compiler and capabilities
 ├── examples/
@@ -26,6 +27,8 @@ mesh ──> renderer ──> engine ──> examples
 ```
 
 Arrows point from a dependency to its consumer. The public package owns window lifecycle, mode selection, and reusable primitive generation. The mesh package defines the data contract and the renderer owns GPU resources, graphics API selection, and the draw path. The example only composes primitives into a scene. See [windowing](systems/windowing.md), [mesh](systems/mesh.md), and [rendering](systems/rendering.md).
+
+The workspace also includes `crates/asset_import` for static FBX conversion and `examples/fx` for the imported Featherweight environment sample. See [asset import](systems/asset-import.md), [mesh](systems/mesh.md), and [rendering](systems/rendering.md) for their contracts.
 
 The directory names describe responsibilities without repeating the project name in every crate. An internal crate should receive a registry-specific name only if it later needs independent publication.
 
