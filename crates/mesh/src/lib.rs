@@ -1,6 +1,9 @@
 use bytemuck::{Pod, Zeroable};
 use math::Color;
 use math::Transform;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_MESH_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
@@ -32,10 +35,24 @@ pub struct UiVertex {
     pub color: [f32; 4],
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct Mesh {
     vertices: Vec<MeshVertex>,
     indices: Vec<u32>,
+    id: u64,
+    revision: u64,
+}
+
+impl Default for Mesh {
+    fn default() -> Self {
+        Self { vertices: Vec::new(), indices: Vec::new(), id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed), revision: 0 }
+    }
+}
+
+impl Clone for Mesh {
+    fn clone(&self) -> Self {
+        Self { vertices: self.vertices.clone(), indices: self.indices.clone(), id: NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed), revision: self.revision }
+    }
 }
 
 impl Mesh {
@@ -52,12 +69,13 @@ impl Mesh {
             return Err("mesh indices must contain complete triangles".into());
         }
 
-        Ok(Self { vertices, indices })
+        Ok(Self { vertices, indices, ..Self::default() })
     }
 
     pub fn add_vertex(&mut self, vertex: MeshVertex) -> u32 {
         let index = self.vertices.len() as u32;
         self.vertices.push(vertex);
+        self.revision = self.revision.wrapping_add(1);
         index
     }
 
@@ -66,6 +84,7 @@ impl Mesh {
         assert!((second as usize) < self.vertices.len(), "second mesh index is outside the vertex data");
         assert!((third as usize) < self.vertices.len(), "third mesh index is outside the vertex data");
         self.indices.extend_from_slice(&[first, second, third]);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn add_quad(&mut self, vertices: [MeshVertex; 4]) {
@@ -83,6 +102,10 @@ impl Mesh {
 
     pub fn indices(&self) -> &[u32] {
         &self.indices
+    }
+
+    pub fn geometry_version(&self) -> (u64, u64) {
+        (self.id, self.revision)
     }
 
     pub fn is_empty(&self) -> bool {

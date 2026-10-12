@@ -131,10 +131,10 @@ impl GenosDemo {
         }
 
         let mut camera = Camera { clear_color: Color::rgb(0.0, 0.0, 0.0), ..Camera::default() };
-        camera.transform.position = Vec3::new(12.5, 1.7, 31.0);
-        camera.look_at(Vec3::new(12.5, 1.6, 16.0));
+        camera.transform.position = Vec3::new(14.5, 1.7, 23.5);
+        camera.look_at(Vec3::new(8.0, 3.2, 6.0));
         self.yaw = self.yaw_from_camera(camera.transform.rotation);
-        self.pitch = -0.04;
+        self.pitch = 0.08;
         let camera_id = context.scene.spawn_camera(camera);
         context.active_camera = Some(camera_id);
         self.camera = Some(camera_id);
@@ -191,7 +191,7 @@ impl GenosDemo {
         self.buttons.sun = add_inspector_mode_row(context, stack, "Sun", &["Run", "Freeze"], usize::from(self.sun_frozen));
         self.buttons.sky = add_inspector_mode_row(context, stack, "Sky", &["On", "Off"], usize::from(!self.sky_on));
         self.buttons.speed = add_inspector_mode_row(context, stack, "Sun speed", &["x0", "x1", "x4", "x16"], SUN_SPEEDS.iter().position(|speed| *speed == self.sun_speed).unwrap_or(1));
-        let (time_slider, time_label) = add_inspector_slider_row(context, stack, "Time of day", 0.0, 24.0, self.day * 24.0);
+        let (time_slider, time_label) = add_inspector_slider_row(context, stack, "Time of day", 0.0, 24.0, clock_hours(self.day));
         self.buttons.time_of_day = Some(time_slider);
         self.buttons.time_of_day_value = Some(time_label);
         self.buttons.boxes = add_inspector_mode_row(context, stack, "Boxes", &["Move", "Still"], usize::from(self.boxes_still));
@@ -217,25 +217,24 @@ impl GenosDemo {
     }
 
     fn update_sun(&mut self, context: &mut RuntimeContext) {
-        let hour_angle = std::f32::consts::TAU * (self.day - 0.25);
-        let elevation = hour_angle.sin();
-        let horizontal = (1.0 - elevation * elevation).sqrt();
-        let fade = (elevation / 0.1).clamp(0.0, 1.0);
+        let angle = std::f32::consts::TAU * self.day.rem_euclid(1.0);
+        let elevation = angle.sin();
+        let fade = (elevation / 0.1).min(1.0).max(0.0);
         if let Some(sun_id) = self.sun
             && let Some(sun) = context.scene.get_directional_light_mut(sun_id)
         {
-            sun.direction = Vec3::new(-hour_angle.cos() * horizontal, elevation, -hour_angle.sin() * horizontal).normalize();
-            sun.color = Color::rgb(1.0, 0.95, 0.85);
-            sun.intensity = 1.8 * fade;
+            sun.direction = -Vec3::new(angle.cos(), elevation, -0.45).normalize();
+            sun.color = Color::rgb(2.0, 1.9, 1.7);
+            sun.intensity = fade;
         }
         let sky = ((elevation + 0.1) / 0.6).clamp(0.0, 1.0) * if self.sky_on { 1.0 } else { 0.0 };
         context.sky_lighting.color = Color::rgb(0.11, 0.14, 0.19);
-        context.sky_lighting.intensity = 0.65 * sky;
+        context.sky_lighting.intensity = sky;
         if let Some(slider) = self.buttons.time_of_day {
-            context.ui.set_slider_value(slider, self.day * 24.0);
+            context.ui.set_slider_value(slider, clock_hours(self.day));
         }
         if let Some(label) = self.buttons.time_of_day_value {
-            context.ui.set_label_text(label, format!("{:04.1} h", self.day * 24.0));
+            context.ui.set_label_text(label, format!("{:04.1} h", clock_hours(self.day)));
         }
     }
 
@@ -289,9 +288,9 @@ impl GenosDemo {
             self.sun_frozen = index == 1;
         }
         if let Some(slider) = self.buttons.time_of_day {
-            let time_of_day = context.ui.slider_value(slider).unwrap_or(self.day * 24.0);
-            if (time_of_day - self.day * 24.0).abs() > 0.01 {
-                self.day = (time_of_day / 24.0).rem_euclid(1.0);
+            let time_of_day = context.ui.slider_value(slider).unwrap_or_else(|| clock_hours(self.day));
+            if (time_of_day - clock_hours(self.day)).abs() > 0.01 {
+                self.day = ((time_of_day - 6.0) / 24.0).rem_euclid(1.0);
                 self.sun_frozen = true;
             }
         }
@@ -416,6 +415,10 @@ fn lamp_range(intensity: f32) -> f32 {
     (intensity * 72.0 * 0.8 / std::f32::consts::PI / (0.5 / 255.0)).sqrt()
 }
 
+fn clock_hours(day: f32) -> f32 {
+    (day.rem_euclid(1.0) * 24.0 + 6.0).rem_euclid(24.0)
+}
+
 fn parse_scale(text: &str) -> Result<(u32, u32), String> {
     match text {
         "small" => Ok((1, 1)),
@@ -491,7 +494,7 @@ fn main() -> Result<(), String> {
             seed,
             time: 0.0,
             box_time: 0.0,
-            day: 0.5,
+            day: 0.12,
             yaw: 0.0,
             pitch: 0.0,
             camera: None,

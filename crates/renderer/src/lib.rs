@@ -919,6 +919,7 @@ pub struct Renderer {
     shadow_matrices: [Mat4; SHADOW_CASCADE_COUNT],
     shadow_cascade_splits: [f32; 4],
     shadow_draw_ranges: Vec<Range<u32>>,
+    local_mesh_bounds: Vec<GeometryBounds>,
     shadow_caster_bounds: Vec<GeometryBounds>,
     spot_shadow_pipeline: wgpu::RenderPipeline,
     _spot_shadow_texture: wgpu::Texture,
@@ -1004,7 +1005,9 @@ impl Renderer {
     ) -> Result<Self, String> {
         let radiance_field_resolution = radiance_field_resolution.bounded();
         let (vertices, indices) = flatten_instances(instances)?;
-        let (shadow_draw_ranges, shadow_caster_bounds) = shadow_draw_data(instances);
+        let local_mesh_bounds = mesh_local_bounds(instances);
+        let shadow_caster_bounds = transformed_mesh_bounds(instances, &local_mesh_bounds);
+        let shadow_draw_ranges = shadow_draw_ranges(instances);
 
         let backend = graphics_api.backends();
         if !wgpu::Instance::enabled_backend_features().contains(backend) {
@@ -2095,6 +2098,7 @@ impl Renderer {
             shadow_matrices,
             shadow_cascade_splits,
             shadow_draw_ranges,
+            local_mesh_bounds,
             shadow_caster_bounds,
             spot_shadow_pipeline,
             _spot_shadow_texture: spot_shadow_texture,
@@ -2197,7 +2201,9 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             });
             self.wireframe_index_count = wireframe_indices.len() as u32;
-            (self.shadow_draw_ranges, self.shadow_caster_bounds) = shadow_draw_data(instances);
+            self.local_mesh_bounds = mesh_local_bounds(instances);
+            self.shadow_caster_bounds = transformed_mesh_bounds(instances, &self.local_mesh_bounds);
+            self.shadow_draw_ranges = shadow_draw_ranges(instances);
             self.shadow_bounds = combined_geometry_bounds(&geometry_bounds(instances));
             self.visibility_bounds.clear();
             self.visibility_rebuild_cooldown = 0;
@@ -2212,7 +2218,7 @@ impl Renderer {
                 vertex_offset += instance.mesh.vertices().len();
             }
             self.instance_signatures = instance_signatures;
-            self.shadow_caster_bounds = geometry_bounds(instances);
+            self.shadow_caster_bounds = transformed_mesh_bounds(instances, &self.local_mesh_bounds);
             self.shadow_bounds = combined_geometry_bounds(&self.shadow_caster_bounds);
         }
         self.shadow_scheduler.mark_all_dirty();
@@ -2324,6 +2330,9 @@ impl Renderer {
     }
 
     pub fn update_camera(&mut self, camera: &Camera) -> Result<(), String> {
+        if self.camera == *camera {
+            return Ok(());
+        }
         self.camera = *camera;
         self.shadow_scheduler.rebuild(&self.lights, &self.camera, self.render_settings.shadow_budget);
         self.rebuild_shadow_resources();
@@ -2349,6 +2358,10 @@ impl Renderer {
         let update_start = Instant::now();
         if lights.len() > MAX_DIRECTIONAL_LIGHTS {
             return Err(format!("renderer supports at most {MAX_DIRECTIONAL_LIGHTS} directional lights"));
+        }
+        if self.lights == lights {
+            self.performance_stats.light_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
+            return Ok(());
         }
         let previous_lights = self.lights.clone();
         if previous_lights != lights && self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
@@ -2742,6 +2755,9 @@ impl Renderer {
     }
 
     pub fn update_render_debug_mode(&mut self, mode: RenderDebugMode) {
+        if self.render_debug_mode == mode {
+            return;
+        }
         self.render_debug_mode = mode;
         let camera_uniform = camera_uniform(self.config.width, self.config.height, &self.camera, &self.lights, mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
@@ -4098,16 +4114,16 @@ fn mesh_topology_signature(instances: &[MeshInstance]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     instances.len().hash(&mut hasher);
     for instance in instances {
+        instance.mesh.geometry_version().hash(&mut hasher);
         instance.mesh.vertices().len().hash(&mut hasher);
-        instance.mesh.indices().hash(&mut hasher);
+        instance.mesh.indices().len().hash(&mut hasher);
     }
     hasher.finish()
 }
 
 fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytemuck::cast_slice::<_, u8>(instance.mesh.vertices()).hash(&mut hasher);
-    instance.mesh.indices().hash(&mut hasher);
+    instance.mesh.geometry_version().hash(&mut hasher);
     instance.transform.position.to_array().map(|value| value.to_bits()).hash(&mut hasher);
     instance.transform.rotation.to_array().map(|value| value.to_bits()).hash(&mut hasher);
     instance.transform.scale.to_array().map(|value| value.to_bits()).hash(&mut hasher);
@@ -5464,6 +5480,49 @@ fn geometry_bounds(instances: &[MeshInstance]) -> Vec<GeometryBounds> {
         .collect()
 }
 
+fn mesh_local_bounds(instances: &[MeshInstance]) -> Vec<GeometryBounds> {
+    instances
+        .iter()
+        .map(|instance| {
+            let mut minimum = Vec3::splat(f32::INFINITY);
+            let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+            for vertex in instance.mesh.vertices() {
+                let position = Vec3::from_array(vertex.position);
+                minimum = minimum.min(position);
+                maximum = maximum.max(position);
+            }
+            GeometryBounds { minimum, maximum }
+        })
+        .collect()
+}
+
+fn transformed_mesh_bounds(instances: &[MeshInstance], local_bounds: &[GeometryBounds]) -> Vec<GeometryBounds> {
+    instances
+        .iter()
+        .zip(local_bounds)
+        .map(|(instance, bounds)| {
+            let local_corners = [
+                Vec3::new(bounds.minimum.x, bounds.minimum.y, bounds.minimum.z),
+                Vec3::new(bounds.maximum.x, bounds.minimum.y, bounds.minimum.z),
+                Vec3::new(bounds.minimum.x, bounds.maximum.y, bounds.minimum.z),
+                Vec3::new(bounds.maximum.x, bounds.maximum.y, bounds.minimum.z),
+                Vec3::new(bounds.minimum.x, bounds.minimum.y, bounds.maximum.z),
+                Vec3::new(bounds.maximum.x, bounds.minimum.y, bounds.maximum.z),
+                Vec3::new(bounds.minimum.x, bounds.maximum.y, bounds.maximum.z),
+                Vec3::new(bounds.maximum.x, bounds.maximum.y, bounds.maximum.z),
+            ];
+            let mut minimum = Vec3::splat(f32::INFINITY);
+            let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+            for corner in local_corners {
+                let position = instance.transform.transform_point(corner);
+                minimum = minimum.min(position);
+                maximum = maximum.max(position);
+            }
+            GeometryBounds { minimum, maximum }
+        })
+        .collect()
+}
+
 fn sdf_geometries(instances: &[MeshInstance]) -> Vec<SdfGeometry> {
     instances
         .iter()
@@ -5803,24 +5862,15 @@ fn segment_triangle_intersection(start: Vec3, direction: Vec3, segment_length: f
     Some((distance, Vec3::new(1.0 - barycentric_u - barycentric_v, barycentric_u, barycentric_v)))
 }
 
-fn shadow_draw_data(instances: &[MeshInstance]) -> (Vec<Range<u32>>, Vec<GeometryBounds>) {
+fn shadow_draw_ranges(instances: &[MeshInstance]) -> Vec<Range<u32>> {
     let mut ranges = Vec::with_capacity(instances.len());
-    let mut bounds = Vec::with_capacity(instances.len());
     let mut index_start = 0_u32;
     for instance in instances {
         let index_count = instance.mesh.indices().len() as u32;
         ranges.push(index_start..index_start + index_count);
         index_start += index_count;
-        let mut minimum = Vec3::splat(f32::INFINITY);
-        let mut maximum = Vec3::splat(f32::NEG_INFINITY);
-        for vertex in instance.mesh.vertices() {
-            let position = instance.transform.transform_point(Vec3::from_array(vertex.position));
-            minimum = minimum.min(position);
-            maximum = maximum.max(position);
-        }
-        bounds.push(GeometryBounds { minimum, maximum });
     }
-    (ranges, bounds)
+    ranges
 }
 
 fn shadow_bounds_intersect(matrix: Mat4, bounds: GeometryBounds) -> bool {

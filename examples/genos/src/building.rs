@@ -6,6 +6,7 @@ const ROOF_THICKNESS: f32 = 0.25;
 const WALL_THICKNESS: f32 = 0.3;
 const LAMP_HEIGHT: f32 = 2.6;
 const YARD: f32 = 8.0;
+const LOCAL_LAMP_SLOTS: usize = 128;
 
 #[derive(Clone, Copy)]
 struct Opening {
@@ -118,14 +119,13 @@ impl Building {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut rng = Rng(seed);
-        let mut building = Self { cols, rows, static_boxes: Vec::new(), moving_boxes: Vec::new(), lamps: Vec::new() };
+        let mut building = Self { cols, rows, static_boxes: Vec::new(), moving_boxes: Vec::new(), lamps: lamp_slots(&mut rng) };
         for row in 0..rows {
             for col in 0..cols {
                 let origin = Vec3::new(col as f32 * SECTION_SIZE, 0.0, row as f32 * SECTION_SIZE);
                 building.add_section(origin, col == 0, row == 0, col + 1 == cols, row + 1 == rows, &mut rng);
             }
         }
-        building.lamps = lamp_slots();
         building
     }
 
@@ -286,19 +286,107 @@ pub fn distributed_lamps(building: &Building, count: usize) -> Vec<LampSlot> {
         .collect()
 }
 
-fn lamp_slots() -> Vec<LampSlot> {
+fn lamp_slots(rng: &mut Rng) -> Vec<LampSlot> {
     let x_axis = Vec3::X;
     let z_axis = Vec3::Z;
     let lamp = |u, v, motion, tint| LampSlot { home: Vec3::new(u, LAMP_HEIGHT, v), motion, tint };
-    vec![
+    let warm = Color::rgb(1.0, 0.9, 0.75);
+    let cool = Color::rgb(0.8, 0.88, 1.0);
+    let mut slots = vec![
         lamp(4.5, 13.5, LampMotion::Sway { axis: z_axis, amplitude: 2.0, rate: 0.7 }, Color::rgb(1.0, 0.9, 0.75)),
         lamp(21.0, 4.0, LampMotion::Orbit { radius: 1.5, rate: 0.9 }, Color::rgb(0.8, 0.88, 1.0)),
         lamp(20.5, 21.0, LampMotion::Sway { axis: x_axis, amplitude: 1.5, rate: 0.6 }, Color::rgb(1.0, 0.9, 0.75)),
         lamp(12.5, 21.5, LampMotion::Orbit { radius: 1.5, rate: -0.8 }, Color::rgb(1.0, 0.9, 0.75)),
         lamp(12.5, 4.5, LampMotion::Sway { axis: x_axis, amplitude: 2.0, rate: 0.5 }, Color::rgb(0.8, 0.88, 1.0)),
-        lamp(14.5, 6.0, LampMotion::Orbit { radius: 1.0, rate: 0.65 }, Color::rgb(0.8, 0.88, 1.0)),
-        lamp(10.0, 21.5, LampMotion::Sway { axis: z_axis, amplitude: 1.2, rate: 0.85 }, Color::rgb(1.0, 0.9, 0.75)),
+    ];
+    let tall = tall_rects();
+    while slots.len() < LOCAL_LAMP_SLOTS {
+        let home = Vec3::new(rng.range_between(0.6, SECTION_SIZE - 0.6), LAMP_HEIGHT, rng.range_between(0.6, SECTION_SIZE - 0.6));
+        let rate = rng.range_between(0.4, 1.2) * if rng.unit() < 0.5 { -1.0 } else { 1.0 };
+        let motion = if rng.unit() < 0.5 {
+            LampMotion::Orbit { radius: rng.range_between(0.8, 1.6), rate }
+        } else {
+            let axis = if rng.unit() < 0.5 { x_axis } else { z_axis };
+            LampMotion::Sway { axis, amplitude: rng.range_between(1.0, 2.5), rate }
+        };
+        if !lamp_path_is_clear(home, motion, &tall) {
+            continue;
+        }
+        let tint = if slots.len() % 3 == 1 { cool } else { warm };
+        slots.push(LampSlot { home, motion, tint });
+    }
+    slots
+}
+
+fn tall_rects() -> Vec<[f32; 4]> {
+    // Full-height inner-wall footprints used to keep generated lamp paths clear.
+    vec![
+        [7.85, 0.0, 8.15, 8.0],
+        [0.0, 7.85, 1.0, 8.15],
+        [7.0, 7.85, 8.0, 8.15],
+        [0.0, 10.35, 9.0, 10.65],
+        [16.85, 0.0, 17.15, 2.0],
+        [16.85, 3.4, 17.15, 8.0],
+        [17.0, 7.85, 20.0, 8.15],
+        [21.6, 7.85, 25.0, 8.15],
+        [17.0, 15.85, 19.0, 16.15],
+        [20.4, 15.85, 25.0, 16.15],
+        [16.85, 16.0, 17.15, 19.0],
+        [16.85, 23.0, 17.15, 25.0],
     ]
+}
+
+fn lamp_path_is_clear(home: Vec3, motion: LampMotion, tall: &[[f32; 4]]) -> bool {
+    let rate = match motion {
+        LampMotion::Orbit { rate, .. } | LampMotion::Sway { rate, .. } => rate.abs().max(1.0e-3),
+    };
+    let period = std::f32::consts::TAU / rate;
+    (0..32).all(|index| {
+        let offset = motion.offset(period * index as f32 / 32.0);
+        lamp_spot_is_clear(home.x + offset.x, home.z + offset.z, tall)
+    })
+}
+
+fn lamp_spot_is_clear(x: f32, z: f32, tall: &[[f32; 4]]) -> bool {
+    const MARGIN: f32 = 0.6;
+    const CLEAR: f32 = 0.35;
+    if !(MARGIN..=SECTION_SIZE - MARGIN).contains(&x) || !(MARGIN..=SECTION_SIZE - MARGIN).contains(&z) || x < 8.0 + MARGIN && z < 8.0 + MARGIN {
+        return false;
+    }
+    let near = |rect: &[f32; 4]| x > rect[0] - CLEAR && x < rect[2] + CLEAR && z > rect[1] - CLEAR && z < rect[3] + CLEAR;
+    if tall.iter().any(near) || PILLARS.iter().any(|[px, pz]| (x - px).abs() < 0.5 && (z - pz).abs() < 0.5) {
+        return false;
+    }
+    (0..=12).all(|index| {
+        let at = 1.0 + 0.05 + (6.0 - 0.1) * index as f32 / 12.0;
+        tall.iter().any(|rect| segment_hits([x, z], [at, 8.0], *rect))
+    })
+}
+
+fn segment_hits(a: [f32; 2], b: [f32; 2], rect: [f32; 4]) -> bool {
+    let lo = [rect[0], rect[1]];
+    let hi = [rect[2], rect[3]];
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+    for axis in 0..2 {
+        let delta = b[axis] - a[axis];
+        if delta.abs() < 1.0e-6 {
+            if a[axis] < lo[axis] || a[axis] > hi[axis] {
+                return false;
+            }
+        } else {
+            let (mut near, mut far) = ((lo[axis] - a[axis]) / delta, (hi[axis] - a[axis]) / delta);
+            if near > far {
+                std::mem::swap(&mut near, &mut far);
+            }
+            t0 = t0.max(near);
+            t1 = t1.min(far);
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 struct Rng(u64);
@@ -313,6 +401,14 @@ impl Rng {
     }
 
     fn range(&mut self, maximum: f32) -> f32 {
-        (self.next() >> 40) as f32 / (1_u32 << 24) as f32 * maximum
+        self.unit() * maximum
+    }
+
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1_u32 << 24) as f32
+    }
+
+    fn range_between(&mut self, minimum: f32, maximum: f32) -> f32 {
+        minimum + (maximum - minimum) * self.unit()
     }
 }

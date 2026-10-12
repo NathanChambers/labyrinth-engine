@@ -61,7 +61,7 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Genos capture script](../examples/genos/scripts/global_grid_diagnostic.rhai) | [Debug Capture](systems/capture.md) | Global-grid GI-only and lit scene screenshots | Capture run |
 | [Genos stress example](../examples/genos/src/main.rs) | [Scene](systems/scene.md) | Building meshes, animated point-light and box transforms, and active light handles | Setup and each update |
 | [Application](../examples/lighting/src/main.rs) | [Windowing](systems/windowing.md) | Master gizmo visibility plus normals, lights, and global-probe toggles | Each redraw |
-| [Mesh](systems/mesh.md) | [Rendering](systems/rendering.md) | Validated vertices and triangle indices | Renderer initialization and scene topology updates |
+| [Mesh](systems/mesh.md) | [Rendering](systems/rendering.md) | Geometry version plus validated vertices and triangle indices | Initialization; version changes trigger renderer cache updates |
 | [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Window surface, assigned camera, assigned lights, mesh instances | Resume or startup |
 | [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Updated mesh instances, including topology changes | Each redraw; renderer skips unchanged instance data, updates changed vertex ranges, and rebuilds flattened buffers when topology changes |
 | [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Resize dimensions and draw requests | Window events |
