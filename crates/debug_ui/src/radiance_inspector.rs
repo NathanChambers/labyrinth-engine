@@ -520,12 +520,7 @@ impl RadianceInspector {
 }
 
 fn selected_grid(context: &RuntimeContext) -> RendererRadianceFieldGrid {
-    let mut grid = context.gi_radiance_field_grid;
-    if grid.resolution.contains(&0) {
-        grid.resolution = context.gi_radiance_field_resolution.resolution;
-        grid.resolution = grid.resolution.map(|count| count.max(1));
-    }
-    grid
+    context.gi_radiance_field_grid
 }
 
 fn nearest_cell_in_grid(position: Vec3, grid: RendererRadianceFieldGrid) -> Option<([u32; 3], f32)> {

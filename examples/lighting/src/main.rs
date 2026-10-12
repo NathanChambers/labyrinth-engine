@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, Easing, EulerRot, FontAsset, GraphicsApi, IrradianceMode, IrradianceVolumeDesc, IrradianceVolumeId, KeyCode, LightId, Material, MeshId,
-    PointLight, Quat, RendererSkyLighting, RuntimeContext, SpotLight, Transform, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run,
+    Application, Camera, CameraId, Color, DirectionalLight, Easing, FontAsset, GraphicsApi, IrradianceMode, KeyCode, LightId, Material, MeshId, PointLight, Quat, RendererSkyLighting, RuntimeContext,
+    SpotLight, Transform, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run,
 };
-use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
+use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig, FreeCamera};
 
 struct LightingDemo {
     cube: Option<MeshId>,
@@ -14,19 +14,16 @@ struct LightingDemo {
     fill_light: Option<LightId>,
     point_light: Option<LightId>,
     spot_light: Option<LightId>,
-    irradiance_volume: Option<IrradianceVolumeId>,
     large_scene: bool,
     gi_test_scene: bool,
     open_world: bool,
     shadow_test_scene: bool,
     room_test_scene: bool,
     shadow_isolation: bool,
-    gi_mode_key_was_down: bool,
     debug_panels: Option<DebugPanels>,
     cube_rotation: Quat,
     sphere_time: f32,
-    camera_yaw: f32,
-    camera_pitch: f32,
+    free_camera: FreeCamera,
     light_angle: f32,
     font: Option<FontAsset>,
 }
@@ -47,19 +44,6 @@ impl LightingDemo {
             context.scene.spawn_static_mesh(primitives::plane(20.0, Color::WHITE), Transform::IDENTITY);
             self.spawn_lighting_test_room(context);
         }
-        self.irradiance_volume = Some(context.irradiance_volumes.add(if self.room_test_scene {
-            IrradianceVolumeDesc { minimum: Vec3::new(-15.0, 0.0, -15.0), maximum: Vec3::new(15.0, 6.0, 15.0), resolution: [12, 7, 12], enabled: true }
-        } else if self.shadow_test_scene {
-            IrradianceVolumeDesc { minimum: Vec3::new(-8.0, 0.0, -8.0), maximum: Vec3::new(8.0, 6.0, 8.0), resolution: [4, 2, 4], enabled: false }
-        } else if self.gi_test_scene {
-            IrradianceVolumeDesc { minimum: Vec3::new(-5.0, 0.0, -5.0), maximum: Vec3::new(5.0, 5.0, 5.0), resolution: [16, 5, 12], enabled: true }
-        } else if self.open_world {
-            IrradianceVolumeDesc { minimum: Vec3::new(-64.0, 0.0, -64.0), maximum: Vec3::new(64.0, 12.0, 64.0), resolution: [12, 4, 12], enabled: true }
-        } else if self.large_scene {
-            IrradianceVolumeDesc { minimum: Vec3::new(-20.0, 0.18, -20.0), maximum: Vec3::new(20.0, 5.5, 20.0), resolution: [10, 5, 10], enabled: true }
-        } else {
-            IrradianceVolumeDesc { minimum: Vec3::new(-3.0, 0.12, -3.0), maximum: Vec3::new(3.0, 3.0, 3.0), resolution: [8, 4, 8], enabled: true }
-        }));
         if !self.room_test_scene {
             let object_depth = if self.gi_test_scene { -3.2 } else { 0.0 };
             let object_x = if self.gi_test_scene { 1.5 } else { 1.2 };
@@ -82,32 +66,27 @@ impl LightingDemo {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 3.8, 9.5);
             }
-            self.camera_yaw = 0.0;
-            self.camera_pitch = -0.2;
+            self.free_camera = FreeCamera::new(0.0, -0.2);
         } else if self.gi_test_scene {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 2.4, 7.0);
             }
-            self.camera_yaw = 0.0;
-            self.camera_pitch = -0.16;
+            self.free_camera = FreeCamera::new(0.0, -0.16);
         } else if self.open_world {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 8.0, 22.0);
             }
-            self.camera_yaw = 0.0;
-            self.camera_pitch = -0.22;
+            self.free_camera = FreeCamera::new(0.0, -0.22);
         } else if self.room_test_scene {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 4.0, 13.0);
             }
-            self.camera_yaw = 0.0;
-            self.camera_pitch = -0.2;
+            self.free_camera = FreeCamera::new(0.0, -0.2);
         } else if self.large_scene {
             if let Some(camera) = self.camera.and_then(|id| context.scene.get_camera_mut(id)) {
                 camera.transform.position = Vec3::new(0.0, 2.8, 12.0);
             }
-            self.camera_yaw = 0.0;
-            self.camera_pitch = -0.18;
+            self.free_camera = FreeCamera::new(0.0, -0.18);
         }
         if self.room_test_scene {
             context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.08, 0.09, 0.11), intensity: 0.04 };
@@ -302,7 +281,7 @@ impl LightingDemo {
         }
         let camera_id = self.camera.ok_or("camera was not created")?;
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was not stored")?;
-        camera.transform.rotation = Quat::from_euler(EulerRot::YXZ, self.camera_yaw, self.camera_pitch, 0.0);
+        camera.transform.rotation = self.free_camera.rotation();
         Ok(())
     }
 
@@ -325,32 +304,7 @@ impl LightingDemo {
     }
 
     fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32, movement_keys_active: bool) -> Result<(), String> {
-        let mouse_delta = context.input.mouse_delta();
-        if context.input.cursor_captured() {
-            self.camera_yaw -= mouse_delta.x * 0.002;
-            self.camera_pitch = (self.camera_pitch - mouse_delta.y * 0.002).clamp(-1.5, 1.5);
-        }
-        let camera_id = self.camera.ok_or("camera was not initialized")?;
-        let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was removed before update")?;
-        let rotation = Quat::from_euler(EulerRot::YXZ, self.camera_yaw, self.camera_pitch, 0.0);
-        let mut movement = Vec3::ZERO;
-        if !movement_keys_active {
-            if context.input.is_key_down(KeyCode::KeyW) {
-                movement += rotation * Vec3::NEG_Z;
-            }
-            if context.input.is_key_down(KeyCode::KeyS) {
-                movement += rotation * Vec3::Z;
-            }
-            if context.input.is_key_down(KeyCode::KeyD) {
-                movement += rotation * Vec3::X;
-            }
-            if context.input.is_key_down(KeyCode::KeyA) {
-                movement += rotation * Vec3::NEG_X;
-            }
-        }
-        camera.transform.rotation = rotation;
-        camera.transform.translate(movement.normalize_or_zero() * (4.0 * delta_seconds));
-        Ok(())
+        self.free_camera.update(context, self.camera.ok_or("camera was not initialized")?, delta_seconds, movement_keys_active)
     }
 
     fn update_light(&mut self, context: &mut RuntimeContext, delta_seconds: f32) -> Result<(), String> {
@@ -395,9 +349,7 @@ impl LightingDemo {
 impl Application for LightingDemo {
     fn setup(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         self.setup_scene(context);
-        if self.room_test_scene {
-            context.irradiance_mode = IrradianceMode::AabbSdf;
-        }
+        context.irradiance_mode = IrradianceMode::AabbSdf;
         context.gi_radiance_temporal_accumulation_enabled = true;
         context.gizmos_enabled = false;
         self.setup_ui(context)?;
@@ -406,16 +358,6 @@ impl Application for LightingDemo {
 
     fn update(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         let delta_seconds = context.time.delta_seconds();
-        let gi_mode_key_down = context.input.is_key_down(KeyCode::KeyC);
-        if gi_mode_key_down && !self.gi_mode_key_was_down {
-            context.irradiance_mode = match context.irradiance_mode {
-                IrradianceMode::Volumes => IrradianceMode::Clipmap,
-                IrradianceMode::Clipmap => IrradianceMode::Combined,
-                IrradianceMode::Combined => IrradianceMode::AabbSdf,
-                IrradianceMode::AabbSdf => IrradianceMode::Volumes,
-            };
-        }
-        self.gi_mode_key_was_down = gi_mode_key_down;
         if !self.shadow_test_scene && !self.room_test_scene {
             self.update_cube(context, delta_seconds)?;
         }
@@ -467,12 +409,10 @@ fn main() -> Result<(), String> {
             fill_light: None,
             point_light: None,
             spot_light: None,
-            irradiance_volume: None,
             debug_panels: None,
             cube_rotation: Quat::IDENTITY,
             sphere_time: 0.0,
-            camera_yaw: 0.58,
-            camera_pitch: -0.33,
+            free_camera: FreeCamera::new(0.58, -0.33),
             light_angle: 0.0,
             font: None,
             large_scene,
@@ -481,7 +421,6 @@ fn main() -> Result<(), String> {
             shadow_test_scene,
             room_test_scene,
             shadow_isolation,
-            gi_mode_key_was_down: false,
         },
     )
 }

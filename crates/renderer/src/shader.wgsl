@@ -74,6 +74,8 @@ struct TriangleBvhNode {
 struct TriangleBvhTriangle {
     vertices: array<vec4<f32>, 3>,
     source: vec4<u32>,
+    albedo: vec4<f32>,
+    emission: vec4<f32>,
 };
 
 struct TriangleBvhSettings {
@@ -274,7 +276,16 @@ var<storage, read_write> triangle_bvh_diagnostics: TriangleBvhDiagnostics;
 var base_color_texture: texture_2d<f32>;
 
 @group(2) @binding(1)
-var base_color_sampler: sampler;
+var normal_texture: texture_2d<f32>;
+
+@group(2) @binding(2)
+var metallic_texture: texture_2d<f32>;
+
+@group(2) @binding(3)
+var roughness_texture: texture_2d<f32>;
+
+@group(2) @binding(4)
+var material_sampler: sampler;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -337,13 +348,26 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fragment_main(input: VertexOutput) -> FragmentOutput {
-    let base_color_sample = textureSample(base_color_texture, base_color_sampler, input.tex_coord);
+    let base_color_sample = textureSample(base_color_texture, material_sampler, input.tex_coord);
     let albedo = input.color.rgb * input.material_base_color.rgb * base_color_sample.rgb;
     let emission = input.material_emission.rgb * input.material_params.w;
     if camera.debug_mode.x == 1u || camera.debug_mode.x == 2u {
         return FragmentOutput(vec4<f32>(albedo + emission, input.color.a * input.material_base_color.a * base_color_sample.a));
     }
-    let normal = normalize(input.normal);
+    let geometric_normal = normalize(input.normal);
+    let position_dx = dpdx(input.world_position);
+    let position_dy = dpdy(input.world_position);
+    let uv_dx = dpdx(input.tex_coord);
+    let uv_dy = dpdy(input.tex_coord);
+    let uv_determinant = uv_dx.x * uv_dy.y - uv_dx.y * uv_dy.x;
+    var normal = geometric_normal;
+    if abs(uv_determinant) > 1.0e-8 {
+        let tangent_derivative = (position_dx * uv_dy.y - position_dy * uv_dx.y) / uv_determinant;
+        let tangent = normalize(tangent_derivative - geometric_normal * dot(geometric_normal, tangent_derivative));
+        let bitangent = normalize(cross(geometric_normal, tangent)) * sign(uv_determinant);
+        let tangent_normal = textureSample(normal_texture, material_sampler, input.tex_coord).xyz * 2.0 - vec3<f32>(1.0);
+        normal = normalize(mat3x3<f32>(tangent, bitangent, geometric_normal) * tangent_normal);
+    }
     if camera.debug_mode.x == 5u {
         if camera.debug_mode.z == 1u && sdf_clipmap.settings.x == 1u {
             let radiance_sample = sample_world_radiance_field_with_support(input.world_position, normal);
@@ -364,8 +388,8 @@ fn fragment_main(input: VertexOutput) -> FragmentOutput {
     if camera.debug_mode.x == 4u {
         return FragmentOutput(vec4<f32>(max(indirect, vec3<f32>(0.0)), 1.0));
     }
-    let metallic = input.material_params.x;
-    let roughness = input.material_params.y;
+    let metallic = clamp(input.material_params.x * textureSample(metallic_texture, material_sampler, input.tex_coord).r, 0.0, 1.0);
+    let roughness = clamp(input.material_params.y * textureSample(roughness_texture, material_sampler, input.tex_coord).r, 0.04, 1.0);
     let view_direction = normalize(camera.camera_position.xyz - input.world_position);
     var lighting = vec3<f32>(camera.ambient_light.x) * ambient_occlusion;
     var primary_shadow = 1.0;
@@ -660,13 +684,16 @@ fn sample_sdf_normal(position: vec3<f32>, voxel_size: vec3<f32>) -> vec3<f32> {
     return normalize(gradient);
 }
 
-fn relocate_radiance_probe(position: vec3<f32>) -> vec4<f32> {
+fn relocate_radiance_probe(position: vec3<f32>, relocation_enabled: bool) -> vec4<f32> {
     let voxel_size = (sdf_clipmap.maximum.xyz - sdf_clipmap.minimum.xyz) / vec3<f32>(sdf_clipmap.resolution.xyz);
     let minimum_voxel_size = min(min(voxel_size.x, voxel_size.y), voxel_size.z);
     let clearance = 0.35;
     let maximum_offset = 1.0;
     let minimum_step = max(minimum_voxel_size * 0.25, 0.05);
     let original_distance = sample_sdf_distance(position);
+    if !relocation_enabled {
+        return vec4<f32>(position, select(-1.0, 1.0, original_distance >= clearance));
+    }
     if original_distance >= clearance {
         return vec4<f32>(position, 1.0);
     }
@@ -743,7 +770,10 @@ fn trace_conservative_voxels(origin: vec3<f32>, direction: vec3<f32>, maximum_di
         let is_initial_cell = all(coordinate == initial_coordinate);
         if sdf_value.x <= 0.0 && !(ignore_initial_occupied_cell && is_initial_cell) {
             let gradient = sample_sdf_normal(position, voxel_size);
-            let normal = select(-direction, normalize(gradient), dot(gradient, gradient) > 0.000001);
+            var normal = select(-direction, normalize(gradient), dot(gradient, gradient) > 0.000001);
+            if dot(normal, direction) > 0.0 {
+                normal = -normal;
+            }
             return SdfTraceResult(position, normal, travelled, TRACE_TERMINATION_HIT, sdf_value.x);
         }
         let cell_center = sdf_clipmap.minimum.xyz + (vec3<f32>(coordinate) + vec3<f32>(0.5)) * voxel_size;
@@ -842,6 +872,7 @@ fn update_radiance_field_cell(invocation: vec3<u32>, field: RadianceFieldData) {
     let debug_field_offset = 0u;
     let cell_seed = radiance_cell_seed(world_position, cell_size);
     let full_refresh = (field.settings.w & 1u) != 0u;
+    let relocation_enabled = (field.settings.w & 8u) != 0u;
     let new_cell = full_refresh;
     var scheduled_refresh = field.schedule_metadata.y != 0u;
     if full_refresh {
@@ -859,13 +890,13 @@ fn update_radiance_field_cell(invocation: vec3<u32>, field: RadianceFieldData) {
     }
     if !scheduled_refresh {
         if new_cell {
-            let relocation = relocate_radiance_probe(world_position);
+            let relocation = relocate_radiance_probe(world_position, relocation_enabled);
             radiance_field_probes.values[physical_probe_index] = vec4<f32>(relocation.xyz, relocation.w);
         }
         return;
     }
 
-    let relocation = relocate_radiance_probe(world_position);
+    let relocation = relocate_radiance_probe(world_position, relocation_enabled);
     if relocation.w < 0.0 {
         radiance_field_probes.values[physical_probe_index] = vec4<f32>(relocation.xyz, relocation.w);
         for (var region_index = 0u; region_index < field.settings.z; region_index++) {

@@ -15,11 +15,24 @@ pub struct Material {
     pub emission: Color,
     pub emission_strength: f32,
     pub base_color_texture: Option<Texture>,
+    pub normal_texture: Option<Texture>,
+    pub metallic_texture: Option<Texture>,
+    pub roughness_texture: Option<Texture>,
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Self { base_color: Color::WHITE, metallic: 0.0, roughness: 0.5, emission: Color::BLACK, emission_strength: 0.0, base_color_texture: None }
+        Self {
+            base_color: Color::WHITE,
+            metallic: 0.0,
+            roughness: 0.5,
+            emission: Color::BLACK,
+            emission_strength: 0.0,
+            base_color_texture: None,
+            normal_texture: None,
+            metallic_texture: None,
+            roughness_texture: None,
+        }
     }
 }
 

@@ -22,17 +22,18 @@ const SPOT_SHADOW_MAP_SIZE: u32 = 2048;
 const SHADOW_CASCADE_COUNT: usize = 3;
 const MAX_IRRADIANCE_VOLUMES: usize = 4;
 const MAX_IRRADIANCE_PROBES: usize = 4096;
-const PROBE_SURFACE_SAMPLE_SCALE: f32 = 1.25;
+const PROBE_SURFACE_SAMPLE_TARGET_AREA: f32 = 0.1;
+const PROBE_SURFACE_SAMPLE_MIN_COUNT: usize = 24;
+const PROBE_SURFACE_SAMPLE_MAX_COUNT: usize = 256;
+const PROBE_SURFACE_SAMPLE_SCALE: f32 = 0.5;
 const VISIBILITY_REBUILD_INTERVAL: u32 = 4;
 const GPU_TIMESTAMP_COUNT: u32 = 14;
-const SDF_CLIPMAP_RESOLUTION: [u32; 3] = [128, 32, 128];
-const SDF_CLIPMAP_EXTENT: Vec3 = Vec3::new(64.0, 16.0, 64.0);
-const SCENE_GI_PADDING: Vec3 = Vec3::new(8.0, 4.0, 8.0);
+const SDF_TARGET_CELL_SIZE: f32 = 0.375;
+const SDF_CLIPMAP_PADDING: Vec3 = Vec3::new(8.0, 4.0, 8.0);
 const SDF_MAX_DISTANCE: f32 = 16.0;
 const SDF_CLEARANCE_RADIUS_VOXELS: u16 = 4;
-const RADIANCE_FIELD_DEFAULT_RESOLUTION: [u32; 3] = [32, 8, 32];
-const RADIANCE_FIELD_MAX_RESOLUTION: [u32; 3] = [40, 10, 40];
-const RADIANCE_FIELD_EXTENT: Vec3 = SDF_CLIPMAP_EXTENT;
+const RADIANCE_FIELD_TARGET_CELL_SIZE: f32 = 1.5;
+const RADIANCE_FIELD_PADDING: Vec3 = Vec3::new(8.0, 4.0, 8.0);
 pub const RADIANCE_FIELD_RAY_COUNT: usize = 2;
 pub const RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS: usize = 64;
 pub const RADIANCE_SURFACE_CANDIDATE_COUNT: usize = 8;
@@ -335,11 +336,19 @@ struct MeshDrawBatch {
     wireframe_range: Range<u32>,
     instance_range: Range<usize>,
     instance_indices: Vec<usize>,
-    base_color_texture_id: Option<u64>,
+    material_texture_ids: MaterialTextureIds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MaterialTextureIds {
+    base_color: Option<u64>,
+    normal: Option<u64>,
+    metallic: Option<u64>,
+    roughness: Option<u64>,
 }
 
 struct MaterialTextureBinding {
-    _texture: wgpu::Texture,
+    _textures: Vec<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
 }
 
@@ -423,15 +432,6 @@ struct SdfClipmapUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SdfGpuGeometry {
-    minimum: [f32; 4],
-    maximum: [f32; 4],
-    albedo: [f32; 4],
-    emission: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct SdfGpuUpdateSettings {
     minimum: [f32; 4],
     voxel_size: [f32; 4],
@@ -462,12 +462,15 @@ struct SdfGeometry {
     bounds: GeometryBounds,
     albedo: Vec3,
     emission: Vec3,
+    surface_signature: u64,
 }
 
 #[derive(Clone, Copy)]
 struct SurfaceInspectionTriangle {
     vertices: [Vec3; 3],
     triangle_index: u32,
+    albedo: Vec3,
+    emission: Vec3,
 }
 
 #[derive(Clone)]
@@ -500,6 +503,8 @@ struct TriangleBvhNode {
 struct TriangleBvhTriangle {
     vertices: [[f32; 4]; 3],
     source: [u32; 4],
+    albedo: [f32; 4],
+    emission: [f32; 4],
 }
 
 #[repr(C)]
@@ -528,6 +533,7 @@ enum TriangleBvhBuildStrategy {
 }
 
 struct SdfClipmap {
+    resolution: [u32; 3],
     minimum: Vec3,
     maximum: Vec3,
     voxel_size: Vec3,
@@ -603,22 +609,21 @@ pub struct RendererIrradianceVolume {
     pub enabled: bool,
 }
 
-/// Radiance-field cell counts, ordered as X, Y, Z.
-/// The renderer clamps horizontal axes to 40 cells and the vertical axis to 10 cells.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RadianceFieldResolution {
-    pub resolution: [u32; 3],
+/// Target world-space spacing between radiance-field probes, in meters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RadianceFieldCellSize {
+    pub meters: f32,
 }
 
-impl Default for RadianceFieldResolution {
+impl Default for RadianceFieldCellSize {
     fn default() -> Self {
-        Self { resolution: RADIANCE_FIELD_DEFAULT_RESOLUTION }
+        Self { meters: RADIANCE_FIELD_TARGET_CELL_SIZE }
     }
 }
 
-impl RadianceFieldResolution {
+impl RadianceFieldCellSize {
     fn bounded(self) -> Self {
-        Self { resolution: std::array::from_fn(|axis| self.resolution[axis].clamp(1, RADIANCE_FIELD_MAX_RESOLUTION[axis])) }
+        Self { meters: if self.meters.is_finite() { self.meters.clamp(0.25, 8.0) } else { RADIANCE_FIELD_TARGET_CELL_SIZE } }
     }
 }
 
@@ -811,6 +816,14 @@ struct ProbeSurfaceSample {
     weight: f32,
 }
 
+#[derive(Clone, Copy)]
+struct ProbeSampleTriangle {
+    vertices: [MeshVertex; 3],
+    positions: [Vec3; 3],
+    normals: [Vec3; 3],
+    cumulative_area: f32,
+}
+
 impl Default for RendererSkyLighting {
     fn default() -> Self {
         Self { color: Color::rgb(0.12, 0.18, 0.3), intensity: 0.35 }
@@ -880,10 +893,11 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     material_texture_bind_group_layout: wgpu::BindGroupLayout,
-    material_texture_bindings: HashMap<Option<u64>, MaterialTextureBinding>,
+    material_texture_bindings: HashMap<MaterialTextureIds, MaterialTextureBinding>,
     material_texture_sampler: wgpu::Sampler,
     irradiance_buffer: wgpu::Buffer,
     irradiance_cache: Box<IrradianceUniform>,
+    irradiance_direct_cache: Box<IrradianceUniform>,
     irradiance_volume_layout: Vec<RendererIrradianceVolume>,
     sdf_clipmap: SdfClipmap,
     sdf_geometry_cache: Vec<SdfGeometry>,
@@ -926,6 +940,7 @@ pub struct Renderer {
     sdf_gi_enabled: bool,
     gi_radiance_frozen: bool,
     gi_radiance_temporal_accumulation_enabled: bool,
+    gi_radiance_probe_relocation_enabled: bool,
     irradiance_probe_ages: [u32; MAX_IRRADIANCE_PROBES],
     irradiance_update_budget: usize,
     sky_lighting: RendererSkyLighting,
@@ -1022,19 +1037,19 @@ impl Renderer {
     }
 
     pub fn new(window: Arc<Window>, graphics_api: GraphicsApi, camera: &Camera, lights: &[Light], instances: &[MeshInstance], irradiance_volumes: &[RendererIrradianceVolume]) -> Result<Self, String> {
-        Self::new_with_radiance_field_resolution(window, graphics_api, camera, lights, instances, irradiance_volumes, RadianceFieldResolution::default())
+        Self::new_with_radiance_field_cell_size(window, graphics_api, camera, lights, instances, irradiance_volumes, RadianceFieldCellSize::default())
     }
 
-    pub fn new_with_radiance_field_resolution(
+    pub fn new_with_radiance_field_cell_size(
         window: Arc<Window>,
         graphics_api: GraphicsApi,
         camera: &Camera,
         lights: &[Light],
         instances: &[MeshInstance],
         irradiance_volumes: &[RendererIrradianceVolume],
-        radiance_field_resolution: RadianceFieldResolution,
+        radiance_field_cell_size: RadianceFieldCellSize,
     ) -> Result<Self, String> {
-        let radiance_field_resolution = radiance_field_resolution.bounded();
+        let radiance_field_cell_size = radiance_field_cell_size.bounded();
         let (vertices, indices, mesh_draw_batches) = flatten_meshes(instances)?;
         let (instance_data, instance_data_offsets) = build_instance_data(instances, &mesh_draw_batches);
         let local_mesh_bounds = mesh_local_bounds(instances);
@@ -1298,10 +1313,11 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
-        let mut sdf_clipmap = SdfClipmap::new(scene_bounds, &sdf_geometries);
+        let mut sdf_clipmap = SdfClipmap::new(scene_bounds, &[]);
+        let sdf_resolution = sdf_clipmap.resolution;
         let sdf_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("AABB SDF geometry and albedo clipmap"),
-            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            label: Some("triangle surface SDF and albedo clipmap"),
+            size: wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -1311,8 +1327,8 @@ impl Renderer {
         });
         let sdf_view = sdf_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
         let sdf_emission_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("AABB SDF emission clipmap"),
-            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            label: Some("triangle surface SDF emission clipmap"),
+            size: wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -1323,7 +1339,7 @@ impl Renderer {
         let sdf_emission_view = sdf_emission_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
         let sdf_clearance_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("SDF conservative clearance clipmap"),
-            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            size: wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -1333,7 +1349,7 @@ impl Renderer {
         });
         let sdf_clearance_work_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("SDF conservative clearance update target"),
-            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            size: wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -1345,7 +1361,7 @@ impl Renderer {
         let sdf_clearance_work_view = sdf_clearance_work_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
         let sdf_clearance_sdf_input_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("SDF clearance source snapshot"),
-            size: wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            size: wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -1358,29 +1374,30 @@ impl Renderer {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &sdf_clearance_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&initial_clearance),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 4), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
-            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(sdf_resolution[0] * 4), rows_per_image: Some(sdf_resolution[1]) },
+            wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
         );
-        let radiance_field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, radiance_field_resolution.resolution);
+        let radiance_field = WorldRadianceField::new(scene_bounds, radiance_field_cell_size.meters);
+        let radiance_field_grid_resolution = radiance_field.resolution;
         let radiance_field_uniform = RadianceFieldUniform::zeroed();
         let radiance_field_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field uniform"),
             contents: bytemuck::bytes_of(&radiance_field_uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let radiance_field_values = vec![RadianceFieldAngularSample::zeroed(); radiance_field_resolution.resolution.iter().product::<u32>() as usize * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS];
+        let radiance_field_values = vec![RadianceFieldAngularSample::zeroed(); radiance_field_grid_resolution.iter().product::<u32>() as usize * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS];
         let radiance_field_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field angular regions"),
             contents: bytemuck::cast_slice(&radiance_field_values),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
-        let radiance_field_probe_values = vec![[0.0_f32; 4]; radiance_field_resolution.resolution.iter().product::<u32>() as usize];
+        let radiance_field_probe_values = vec![[0.0_f32; 4]; radiance_field_grid_resolution.iter().product::<u32>() as usize];
         let radiance_field_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field probe relocation state"),
             contents: bytemuck::cast_slice(&radiance_field_probe_values),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let radiance_field_trace_debug_count = radiance_field_resolution.resolution.iter().product::<u32>() as usize;
+        let radiance_field_trace_debug_count = radiance_field_grid_resolution.iter().product::<u32>() as usize;
         let radiance_field_trace_debug_values = vec![[[0.0_f32; 4]; RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT]; radiance_field_trace_debug_count * RADIANCE_FIELD_RAY_COUNT];
         let radiance_field_trace_debug_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field trace diagnostics"),
@@ -1418,14 +1435,14 @@ impl Renderer {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &sdf_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&sdf_clipmap.values),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 16), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
-            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(sdf_resolution[0] * 16), rows_per_image: Some(sdf_resolution[1]) },
+            wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
         );
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &sdf_emission_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&sdf_clipmap.emission_values),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SDF_CLIPMAP_RESOLUTION[0] * 16), rows_per_image: Some(SDF_CLIPMAP_RESOLUTION[1]) },
-            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(sdf_resolution[0] * 16), rows_per_image: Some(sdf_resolution[1]) },
+            wgpu::Extent3d { width: sdf_resolution[0], height: sdf_resolution[1], depth_or_array_layers: sdf_resolution[2] },
         );
         sdf_clipmap.release_cpu_fields();
         let sdf_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1435,7 +1452,9 @@ impl Renderer {
         });
         let (static_probe_samples, dynamic_probe_samples) = build_probe_samples(instances, true);
         let static_probe_signature = static_probe_signature(instances);
-        let initial_irradiance = Box::new(irradiance_uniform(irradiance_volumes, &static_probe_samples, &dynamic_probe_samples, lights, sky_lighting, &visibility_grid, true));
+        let initial_direct_irradiance = Box::new(irradiance_uniform(irradiance_volumes, &static_probe_samples, &dynamic_probe_samples, lights, sky_lighting, &visibility_grid, true));
+        let mut initial_irradiance = initial_direct_irradiance.clone();
+        apply_second_diffuse_bounce(&mut initial_irradiance, &initial_direct_irradiance, &static_probe_samples, &dynamic_probe_samples, &visibility_grid);
         let irradiance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("irradiance probes"),
             contents: bytemuck::bytes_of(initial_irradiance.as_ref()),
@@ -1716,7 +1735,7 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba32Float, view_dimension: wgpu::TextureViewDimension::D3 },
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -1728,11 +1747,17 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba32Float, view_dimension: wgpu::TextureViewDimension::D3 },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::R32Float, view_dimension: wgpu::TextureViewDimension::D3 },
                     count: None,
@@ -1764,7 +1789,7 @@ impl Renderer {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse shader"), source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()) });
         let material_texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("base color texture layout"),
+            label: Some("PBR material texture layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -1772,11 +1797,29 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
         let material_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("base color texture sampler"),
+            label: Some("PBR material texture sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
@@ -2132,6 +2175,7 @@ impl Renderer {
             material_texture_sampler,
             irradiance_buffer,
             irradiance_cache: initial_irradiance,
+            irradiance_direct_cache: initial_direct_irradiance,
             irradiance_volume_layout: irradiance_volumes.to_vec(),
             sdf_clipmap,
             sdf_geometry_cache: sdf_geometries,
@@ -2174,6 +2218,7 @@ impl Renderer {
             sdf_gi_enabled: false,
             gi_radiance_frozen: false,
             gi_radiance_temporal_accumulation_enabled: true,
+            gi_radiance_probe_relocation_enabled: false,
             irradiance_probe_ages: [0; MAX_IRRADIANCE_PROBES],
             irradiance_update_budget: 8,
             sky_lighting,
@@ -2572,7 +2617,7 @@ impl Renderer {
                 self.surface_inspection_meshes = surface_inspection_meshes(instances);
                 self.surface_inspection_meshes_dirty = false;
             }
-            if self.render_settings.triangle_probe_occlusion_enabled && self.triangle_bvh_dirty {
+            if (self.render_settings.triangle_probe_occlusion_enabled || sdf_gi_enabled) && self.triangle_bvh_dirty {
                 if self.triangle_bvh_topology_dirty || !self.refit_triangle_bvh() {
                     self.rebuild_triangle_bvh();
                 }
@@ -2603,7 +2648,7 @@ impl Renderer {
             let geometry_changed = self.sdf_clipmap.geometry_bounds != self.sdf_geometry_cache;
             let scene_bounds = combined_geometry_bounds(&geometry_bounds(instances));
             let sdf_update = self.sdf_clipmap.update_gpu(scene_bounds, &self.sdf_geometry_cache);
-            let field_reanchored = self.radiance_field.reanchor(scene_bounds, RADIANCE_FIELD_EXTENT);
+            let field_reanchored = self.radiance_field.reanchor(scene_bounds);
             if field_reanchored {
                 self.queue.write_buffer(
                     &self._radiance_field_buffer,
@@ -2629,7 +2674,8 @@ impl Renderer {
                 self.sdf_gpu_updated_this_frame = true;
                 self.performance_stats.sdf_upload_ms = sdf_upload_start.elapsed().as_secs_f32() * 1000.0;
             }
-            let radiance_field_uniform = self.radiance_field.uniform(self.gi_radiance_temporal_accumulation_enabled, self.radiance_angular_resolution.segment_count());
+            let radiance_field_uniform =
+                self.radiance_field.uniform(self.gi_radiance_temporal_accumulation_enabled, self.radiance_angular_resolution.segment_count(), self.gi_radiance_probe_relocation_enabled);
             self.queue.write_buffer(&self.radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&radiance_field_uniform));
             self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(true, self.sky_lighting)));
             self.performance_stats.probe_update_ms = 0.0;
@@ -2656,17 +2702,22 @@ impl Renderer {
             self.visibility_grid = VisibilityGrid::from_bounds(&geometry_bounds);
             self.visibility_bounds = geometry_bounds;
             refresh_probe_locations(self.irradiance_cache.as_mut(), volumes, &self.visibility_grid);
+            refresh_probe_locations(self.irradiance_direct_cache.as_mut(), volumes, &self.visibility_grid);
             self.irradiance_probe_ages.fill(u32::MAX);
             self.visibility_rebuild_cooldown = VISIBILITY_REBUILD_INTERVAL;
             visibility_rebuild_ms = visibility_start.elapsed().as_secs_f32() * 1000.0;
         }
         if volumes != self.irradiance_volume_layout.as_slice() {
             let old_cache = self.irradiance_cache.clone();
+            let old_direct_cache = self.irradiance_direct_cache.clone();
             let old_ages = self.irradiance_probe_ages;
             let mut new_cache = Box::new(irradiance_uniform(volumes, &self.static_probe_samples, &self.dynamic_probe_samples, lights, self.sky_lighting, &self.visibility_grid, false));
+            let mut new_direct_cache = Box::new(irradiance_uniform(volumes, &self.static_probe_samples, &self.dynamic_probe_samples, lights, self.sky_lighting, &self.visibility_grid, false));
             let mut new_ages = [u32::MAX; MAX_IRRADIANCE_PROBES];
             preserve_overlapping_probes(&old_cache, &old_ages, &mut new_cache, &mut new_ages);
+            preserve_overlapping_probes(&old_direct_cache, &old_ages, &mut new_direct_cache, &mut new_ages);
             self.irradiance_cache = new_cache;
+            self.irradiance_direct_cache = new_direct_cache;
             self.irradiance_probe_ages = new_ages;
             self.irradiance_volume_layout = volumes.to_vec();
         }
@@ -2692,7 +2743,9 @@ impl Renderer {
                         continue;
                     }
                     let Some(location) = probe_location_for_index(&active_volumes, index, &self.visibility_grid) else { continue };
-                    self.irradiance_cache.probe_positions[index] = [location.position.x, location.position.y, location.position.z, 1.0];
+                    let probe_position = [location.position.x, location.position.y, location.position.z, 1.0];
+                    self.irradiance_cache.probe_positions[index] = probe_position;
+                    self.irradiance_direct_cache.probe_positions[index] = probe_position;
                     let position = location.position;
                     let distance_score = 4.0 / (1.0 + self.camera.transform.position.distance_squared(position));
                     let score = self.irradiance_probe_ages[index] as f32 * 0.15 + distance_score;
@@ -2703,18 +2756,27 @@ impl Renderer {
                 }
                 let Some(index) = best_index else { break };
                 let Some(location) = probe_location_for_index(&active_volumes, index, &self.visibility_grid) else { continue };
-                self.irradiance_cache.probe_positions[index] = [location.position.x, location.position.y, location.position.z, 1.0];
+                let probe_position = [location.position.x, location.position.y, location.position.z, 1.0];
+                self.irradiance_cache.probe_positions[index] = probe_position;
+                self.irradiance_direct_cache.probe_positions[index] = probe_position;
                 let position = location.position;
                 let (color, sky_visibility, direction) = probe_irradiance(position, &self.static_probe_samples, &self.dynamic_probe_samples, lights, &self.visibility_grid, self.sky_lighting);
                 let blend = if self.irradiance_probe_ages[index] == u32::MAX { 1.0 } else { 0.25 };
-                let previous_color = Vec3::new(self.irradiance_cache.probes[index][0], self.irradiance_cache.probes[index][1], self.irradiance_cache.probes[index][2]);
+                let previous_color = Vec3::new(self.irradiance_direct_cache.probes[index][0], self.irradiance_direct_cache.probes[index][1], self.irradiance_direct_cache.probes[index][2]);
                 let blended_color = previous_color.lerp(color, blend);
-                let previous_visibility = self.irradiance_cache.probes[index][3];
+                let previous_visibility = self.irradiance_direct_cache.probes[index][3];
                 let blended_visibility = previous_visibility + (sky_visibility - previous_visibility) * blend;
-                self.irradiance_cache.probes[index] = [blended_color.x, blended_color.y, blended_color.z, blended_visibility];
-                let previous_direction = Vec4::from_array(self.irradiance_cache.directions[index]);
+                self.irradiance_direct_cache.probes[index] = [blended_color.x, blended_color.y, blended_color.z, blended_visibility];
+                let previous_direction = Vec4::from_array(self.irradiance_direct_cache.directions[index]);
                 let blended_direction = previous_direction.lerp(direction, blend);
-                self.irradiance_cache.directions[index] = blended_direction.to_array();
+                self.irradiance_direct_cache.directions[index] = blended_direction.to_array();
+                let (second_bounce, second_bounce_direction) =
+                    probe_second_diffuse_bounce(position, &self.static_probe_samples, &self.dynamic_probe_samples, &self.irradiance_direct_cache, &self.visibility_grid);
+                let final_color = blended_color + second_bounce;
+                let final_direction = (blended_direction.truncate() * blended_direction.w + second_bounce_direction.truncate() * second_bounce_direction.w).normalize_or_zero();
+                let final_direction_weight = (blended_direction.w + second_bounce_direction.w).clamp(0.0, 1.0);
+                self.irradiance_cache.probes[index] = [final_color.x, final_color.y, final_color.z, blended_visibility];
+                self.irradiance_cache.directions[index] = final_direction.extend(final_direction_weight).to_array();
                 self.irradiance_probe_ages[index] = 0;
                 updated[index] = true;
                 probes_updated += 1;
@@ -2980,6 +3042,14 @@ impl Renderer {
 
     pub fn set_gi_radiance_temporal_accumulation_enabled(&mut self, enabled: bool) {
         self.gi_radiance_temporal_accumulation_enabled = enabled;
+    }
+
+    pub fn set_gi_radiance_probe_relocation_enabled(&mut self, enabled: bool) {
+        if self.gi_radiance_probe_relocation_enabled == enabled {
+            return;
+        }
+        self.gi_radiance_probe_relocation_enabled = enabled;
+        self.radiance_field.invalidate();
     }
 
     pub fn set_radiance_angular_resolution(&mut self, resolution: RadianceAngularResolution) {
@@ -3405,57 +3475,45 @@ impl Renderer {
     }
 
     fn update_sdf_gpu(&self, update: &SdfClipmapUpdate) {
-        let mut voxel_indices = sdf_region_indices(&update.texture_regions).into_iter().map(|index| index as u32).collect::<Vec<_>>();
-        let clearance_indices = sdf_region_indices(&update.clearance_regions).into_iter().map(|index| index as u32).collect::<Vec<_>>();
+        let resolution = self.sdf_clipmap.resolution;
+        let mut voxel_indices = sdf_region_indices(&update.texture_regions, resolution).into_iter().map(|index| index as u32).collect::<Vec<_>>();
+        let clearance_indices = sdf_region_indices(&update.clearance_regions, resolution).into_iter().map(|index| index as u32).collect::<Vec<_>>();
         let clearance_offset = voxel_indices.len() as u32;
         voxel_indices.extend(clearance_indices);
         if voxel_indices.is_empty() {
             return;
         }
-        let gpu_geometries = self
-            .sdf_clipmap
-            .geometry_bvh
-            .geometry_indices
-            .iter()
-            .map(|geometry_index| self.sdf_clipmap.geometry_bvh.geometries[*geometry_index])
-            .map(|geometry| SdfGpuGeometry {
-                minimum: geometry.bounds.minimum.extend(0.0).to_array(),
-                maximum: geometry.bounds.maximum.extend(0.0).to_array(),
-                albedo: geometry.albedo.extend(0.0).to_array(),
-                emission: geometry.emission.extend(0.0).to_array(),
-            })
-            .collect::<Vec<_>>();
         let settings = SdfGpuUpdateSettings {
             minimum: self.sdf_clipmap.minimum.extend(0.0).to_array(),
             voxel_size: self.sdf_clipmap.voxel_size.extend(0.0).to_array(),
-            counts: [SDF_CLIPMAP_RESOLUTION[0], SDF_CLIPMAP_RESOLUTION[1], SDF_CLIPMAP_RESOLUTION[2], gpu_geometries.len() as u32],
-            update: [clearance_offset, (voxel_indices.len() as u32).saturating_sub(clearance_offset), clearance_offset, 0],
+            counts: [resolution[0], resolution[1], resolution[2], self.triangle_bvh_nodes.len() as u32],
+            update: [clearance_offset, (voxel_indices.len() as u32).saturating_sub(clearance_offset), clearance_offset, self.triangle_bvh_triangles.len() as u32],
         };
         let settings_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("incremental SDF update settings"),
             contents: bytemuck::bytes_of(&settings),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let geometry_buffer = storage_buffer_or_dummy(&self.device, "incremental SDF geometry", &gpu_geometries);
         let dirty_buffer = storage_buffer_or_dummy(&self.device, "incremental SDF dirty voxels", &voxel_indices);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("incremental SDF update resources"),
             layout: &self.sdf_update_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: settings_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: geometry_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dirty_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sdf_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.sdf_emission_view) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.sdf_clearance_sdf_input_view) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.sdf_clearance_work_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dirty_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.sdf_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.sdf_emission_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.sdf_clearance_sdf_input_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.sdf_clearance_work_view) },
             ],
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("incremental SDF GPU update") });
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_work_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            wgpu::Extent3d { width: resolution[0], height: resolution[1], depth_or_array_layers: resolution[2] },
         );
         let clearance_count = settings.update[1];
         if clearance_offset > 0 {
@@ -3473,7 +3531,7 @@ impl Renderer {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo { texture: &self._sdf_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_sdf_input_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+                wgpu::Extent3d { width: resolution[0], height: resolution[1], depth_or_array_layers: resolution[2] },
             );
             let timestamp_writes = self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
                 query_set: &timestamps.query_set,
@@ -3488,7 +3546,7 @@ impl Renderer {
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_work_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: SDF_CLIPMAP_RESOLUTION[0], height: SDF_CLIPMAP_RESOLUTION[1], depth_or_array_layers: SDF_CLIPMAP_RESOLUTION[2] },
+            wgpu::Extent3d { width: resolution[0], height: resolution[1], depth_or_array_layers: resolution[2] },
         );
         self.queue.submit(Some(encoder.finish()));
     }
@@ -3726,7 +3784,7 @@ impl Renderer {
             pass.set_pipeline(&self.wireframe_pipeline);
             pass.set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             for batch in &self.mesh_draw_batches {
-                let material_texture = self.material_texture_bindings.get(&batch.base_color_texture_id).expect("material texture binding was not created");
+                let material_texture = self.material_texture_bindings.get(&batch.material_texture_ids).expect("material texture binding was not created");
                 pass.set_bind_group(2, &material_texture.bind_group, &[]);
                 let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
                 let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
@@ -3736,7 +3794,7 @@ impl Renderer {
         } else {
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             for batch in &self.mesh_draw_batches {
-                let material_texture = self.material_texture_bindings.get(&batch.base_color_texture_id).expect("material texture binding was not created");
+                let material_texture = self.material_texture_bindings.get(&batch.material_texture_ids).expect("material texture binding was not created");
                 pass.set_bind_group(2, &material_texture.bind_group, &[]);
                 let instance_start = (batch.instance_range.start * mem::size_of::<RendererInstanceData>()) as u64;
                 let instance_end = (batch.instance_range.end * mem::size_of::<RendererInstanceData>()) as u64;
@@ -3993,7 +4051,7 @@ impl Renderer {
         }
         if self.sdf_occupancy_gizmos_enabled {
             pass.set_pipeline(&self.sdf_occupancy_gizmo_pipeline);
-            pass.draw(0..36, 0..SDF_CLIPMAP_RESOLUTION.iter().product());
+            pass.draw(0..36, 0..self.sdf_clipmap.resolution.iter().product());
         }
     }
 
@@ -4294,12 +4352,21 @@ pub fn point_shadow_view_projections(position: Vec3, range: f32) -> [Mat4; 6] {
     faces.map(|(direction, up)| projection * Mat4::look_at_rh(position, position + direction, up))
 }
 
+fn material_texture_ids(material: &mesh::Material) -> MaterialTextureIds {
+    MaterialTextureIds {
+        base_color: material.base_color_texture.as_ref().map(mesh::Texture::id),
+        normal: material.normal_texture.as_ref().map(mesh::Texture::id),
+        metallic: material.metallic_texture.as_ref().map(mesh::Texture::id),
+        roughness: material.roughness_texture.as_ref().map(mesh::Texture::id),
+    }
+}
+
 fn mesh_topology_signature(instances: &[MeshInstance]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     instances.len().hash(&mut hasher);
     for instance in instances {
         instance.mesh.geometry_version().hash(&mut hasher);
-        instance.material.base_color_texture.as_ref().map(mesh::Texture::id).hash(&mut hasher);
+        material_texture_ids(&instance.material).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -4309,7 +4376,7 @@ fn unique_mesh_geometry_counts(instances: &[MeshInstance]) -> (usize, usize) {
     let mut vertex_count = 0;
     let mut index_count = 0;
     for instance in instances {
-        let key = (instance.mesh.geometry_version(), instance.material.base_color_texture.as_ref().map(mesh::Texture::id));
+        let key = (instance.mesh.geometry_version(), material_texture_ids(&instance.material));
         if meshes.insert(key, ()).is_none() {
             vertex_count += instance.mesh.vertices().len();
             index_count += instance.mesh.indices().len();
@@ -4329,7 +4396,7 @@ fn mesh_instance_signature(instance: &MeshInstance) -> u64 {
     instance.material.roughness.to_bits().hash(&mut hasher);
     instance.material.emission.to_array().map(|value| value.to_bits()).hash(&mut hasher);
     instance.material.emission_strength.to_bits().hash(&mut hasher);
-    instance.material.base_color_texture.as_ref().map(mesh::Texture::id).hash(&mut hasher);
+    material_texture_ids(&instance.material).hash(&mut hasher);
     instance.probe_dynamic.hash(&mut hasher);
     hasher.finish()
 }
@@ -4343,13 +4410,13 @@ fn flatten_meshes(instances: &[MeshInstance]) -> Result<(Vec<RendererMeshVertex>
     let mut batch_indices = HashMap::new();
     for (instance_index, instance) in instances.iter().enumerate() {
         let version = instance.mesh.geometry_version();
-        let texture_id = instance.material.base_color_texture.as_ref().map(mesh::Texture::id);
-        let batch_key = (version, texture_id);
+        let texture_ids = material_texture_ids(&instance.material);
+        let batch_key = (version, texture_ids);
         let batch_index = match batch_indices.get(&batch_key) {
             Some(batch_index) => *batch_index,
             None => {
                 let batch_index = mesh_batches.len();
-                mesh_batches.push(MeshDrawBatch { index_range: 0..0, wireframe_range: 0..0, instance_range: 0..0, instance_indices: Vec::new(), base_color_texture_id: texture_id });
+                mesh_batches.push(MeshDrawBatch { index_range: 0..0, wireframe_range: 0..0, instance_range: 0..0, instance_indices: Vec::new(), material_texture_ids: texture_ids });
                 batch_indices.insert(batch_key, batch_index);
                 batch_index
             }
@@ -4431,13 +4498,25 @@ fn create_material_texture_bindings(
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     instances: &[MeshInstance],
-) -> HashMap<Option<u64>, MaterialTextureBinding> {
+) -> HashMap<MaterialTextureIds, MaterialTextureBinding> {
     let mut bindings = HashMap::new();
-    bindings.insert(None, create_material_texture_binding(device, queue, layout, sampler, "default base color", 1, 1, &[255, 255, 255, 255]));
-    for texture in instances.iter().filter_map(|instance| instance.material.base_color_texture.as_ref()) {
-        bindings
-            .entry(Some(texture.id()))
-            .or_insert_with(|| create_material_texture_binding(device, queue, layout, sampler, "material base color", texture.width(), texture.height(), texture.rgba8()));
+    let default_ids = MaterialTextureIds { base_color: None, normal: None, metallic: None, roughness: None };
+    bindings.insert(default_ids, create_material_texture_binding(device, queue, layout, sampler, "default PBR material".into(), None, None, None, None));
+    for instance in instances {
+        let texture_ids = material_texture_ids(&instance.material);
+        bindings.entry(texture_ids).or_insert_with(|| {
+            create_material_texture_binding(
+                device,
+                queue,
+                layout,
+                sampler,
+                "PBR material".into(),
+                instance.material.base_color_texture.as_ref(),
+                instance.material.normal_texture.as_ref(),
+                instance.material.metallic_texture.as_ref(),
+                instance.material.roughness_texture.as_ref(),
+            )
+        });
     }
     bindings
 }
@@ -4447,37 +4526,54 @@ fn create_material_texture_binding(
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
-    label: &str,
-    width: u32,
-    height: u32,
-    rgba8: &[u8],
+    label: String,
+    base_color: Option<&mesh::Texture>,
+    normal: Option<&mesh::Texture>,
+    metallic: Option<&mesh::Texture>,
+    roughness: Option<&mesh::Texture>,
 ) -> MaterialTextureBinding {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        rgba8,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut textures = Vec::with_capacity(4);
+    let mut views = Vec::with_capacity(4);
+    let channels = [
+        (base_color, "base color", [255, 255, 255, 255], wgpu::TextureFormat::Rgba8UnormSrgb),
+        (normal, "normal", [128, 128, 255, 255], wgpu::TextureFormat::Rgba8Unorm),
+        (metallic, "metallic", [255, 255, 255, 255], wgpu::TextureFormat::Rgba8Unorm),
+        (roughness, "roughness", [255, 255, 255, 255], wgpu::TextureFormat::Rgba8Unorm),
+    ];
+    for (texture, channel, default_pixels, format) in channels {
+        let (width, height, rgba8) = texture.map_or((1, 1, &default_pixels[..]), |texture| (texture.width(), texture.height(), texture.rgba8()));
+        let texture_label = format!("{label} {channel}");
+        let gpu_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&texture_label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &gpu_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba8,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        views.push(gpu_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        textures.push(gpu_texture);
+    }
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
+        label: Some(&label),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[3]) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
         ],
     });
-    MaterialTextureBinding { _texture: texture, bind_group }
+    MaterialTextureBinding { _textures: textures, bind_group }
 }
 
 fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -4889,11 +4985,11 @@ impl SdfGeometryBvh {
 
 impl SdfClipmap {
     fn new(scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry]) -> Self {
-        let extent = scene_sdf_extent(scene_bounds);
-        let voxel_size = extent / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
+        let (resolution, extent) = padded_grid_shape(scene_bounds, SDF_CLIPMAP_PADDING, SDF_TARGET_CELL_SIZE);
+        let voxel_size = Vec3::splat(SDF_TARGET_CELL_SIZE);
         let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
         let maximum = minimum + extent;
-        let mut clipmap = Self { minimum, maximum, voxel_size, values: Vec::new(), emission_values: Vec::new(), geometry_bounds: Vec::new(), geometry_bvh: SdfGeometryBvh::new(&[]) };
+        let mut clipmap = Self { resolution, minimum, maximum, voxel_size, values: Vec::new(), emission_values: Vec::new(), geometry_bounds: Vec::new(), geometry_bvh: SdfGeometryBvh::new(&[]) };
         clipmap.rebuild(geometry_bounds);
         clipmap
     }
@@ -4908,31 +5004,30 @@ impl SdfClipmap {
     }
 
     fn update_with_cpu_fields(&mut self, scene_bounds: GeometryBounds, geometry_bounds: &[SdfGeometry], compute_cpu_fields: bool) -> Option<SdfClipmapUpdate> {
-        let extent = scene_sdf_extent(scene_bounds);
-        let voxel_size = extent / Vec3::new(SDF_CLIPMAP_RESOLUTION[0] as f32, SDF_CLIPMAP_RESOLUTION[1] as f32, SDF_CLIPMAP_RESOLUTION[2] as f32);
-        let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
-        let bounds_changed = self.minimum != minimum || self.maximum != minimum + extent;
+        let extent = self.maximum - self.minimum;
+        let minimum =
+            if scene_bounds.minimum.cmpge(self.minimum).all() && scene_bounds.maximum.cmple(self.maximum).all() { self.minimum } else { static_grid_minimum(bounds_center(scene_bounds), extent) };
+        let scene_within_grid = scene_bounds.minimum.cmpge(self.minimum).all() && scene_bounds.maximum.cmple(self.maximum).all();
+        let bounds_changed = !scene_within_grid && self.minimum != minimum;
         if self.geometry_bounds == geometry_bounds && !bounds_changed {
             return None;
         }
         if bounds_changed || self.geometry_bounds.len() != geometry_bounds.len() {
             self.minimum = minimum;
             self.maximum = minimum + extent;
-            self.voxel_size = voxel_size;
             let build_timing = if compute_cpu_fields {
                 self.rebuild(geometry_bounds)
             } else {
                 self.geometry_bounds.clear();
                 self.geometry_bounds.extend_from_slice(geometry_bounds);
-                let geometry_bvh_build_start = Instant::now();
-                self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
-                SdfClipmapBuildTiming { geometry_bvh_build_ms: geometry_bvh_build_start.elapsed().as_secs_f32() * 1000.0, ..SdfClipmapBuildTiming::default() }
+                self.geometry_bvh = SdfGeometryBvh::new(&[]);
+                SdfClipmapBuildTiming::default()
             };
-            let full_region = SdfTextureRegion { origin: [0; 3], size: SDF_CLIPMAP_RESOLUTION };
+            let full_region = SdfTextureRegion { origin: [0; 3], size: self.resolution };
             return Some(SdfClipmapUpdate {
                 texture_regions: vec![full_region],
                 clearance_regions: vec![full_region],
-                voxels_updated: SDF_CLIPMAP_RESOLUTION.iter().product(),
+                voxels_updated: self.resolution.iter().product(),
                 geometry_bvh_build_ms: build_timing.geometry_bvh_build_ms,
                 voxel_build_ms: build_timing.voxel_build_ms,
                 clearance_build_ms: build_timing.clearance_build_ms,
@@ -4947,17 +5042,13 @@ impl SdfClipmap {
         let clearance_regions = changed_bounds
             .iter()
             .filter_map(|bounds| self.sdf_bounds_region(*bounds, self.voxel_size * 0.5))
-            .map(|region| expand_sdf_texture_region(region, SDF_CLEARANCE_RADIUS_VOXELS as u32))
+            .map(|region| expand_sdf_texture_region(region, SDF_CLEARANCE_RADIUS_VOXELS as u32, self.resolution))
             .collect::<Vec<_>>();
         let clearance_regions = merge_sdf_texture_regions(clearance_regions);
-        self.minimum = minimum;
-        self.maximum = minimum + extent;
-        self.voxel_size = voxel_size;
         self.geometry_bounds.clear();
         self.geometry_bounds.extend_from_slice(geometry_bounds);
-        let geometry_bvh_build_start = Instant::now();
-        self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
-        let geometry_bvh_build_ms = geometry_bvh_build_start.elapsed().as_secs_f32() * 1000.0;
+        self.geometry_bvh = SdfGeometryBvh::new(&[]);
+        let geometry_bvh_build_ms = 0.0;
         let (voxel_build_ms, clearance_build_ms) = if compute_cpu_fields {
             let voxel_build_start = Instant::now();
             self.rebuild_voxel_regions(&texture_regions);
@@ -4977,7 +5068,7 @@ impl SdfClipmap {
         SdfClipmapUniform {
             minimum: self.minimum.extend(0.0).to_array(),
             maximum: self.maximum.extend(0.0).to_array(),
-            resolution: [SDF_CLIPMAP_RESOLUTION[0], SDF_CLIPMAP_RESOLUTION[1], SDF_CLIPMAP_RESOLUTION[2], 0],
+            resolution: [self.resolution[0], self.resolution[1], self.resolution[2], 0],
             settings: [u32::from(enabled), 0, 0, 0],
             sky_radiance: [sky_lighting.color.red * sky_lighting.intensity, sky_lighting.color.green * sky_lighting.intensity, sky_lighting.color.blue * sky_lighting.intensity, 0.0],
         }
@@ -4992,13 +5083,13 @@ impl SdfClipmap {
     }
 
     fn rebuild(&mut self, geometry_bounds: &[SdfGeometry]) -> SdfClipmapBuildTiming {
-        // This field represents the union of per-instance AABBs, not the source mesh surfaces.
+        // CPU reference fields retain proxy bounds; runtime GPU updates query source triangles.
         self.geometry_bounds.clear();
         self.geometry_bounds.extend_from_slice(geometry_bounds);
         let geometry_bvh_build_start = Instant::now();
         self.geometry_bvh = SdfGeometryBvh::new(geometry_bounds);
         let geometry_bvh_build_ms = geometry_bvh_build_start.elapsed().as_secs_f32() * 1000.0;
-        let voxel_count = SDF_CLIPMAP_RESOLUTION.iter().product::<u32>() as usize;
+        let voxel_count = self.resolution.iter().product::<u32>() as usize;
         self.values = vec![[SDF_MAX_DISTANCE, 0.0, 0.0, 0.0]; voxel_count];
         self.emission_values = vec![[0.0; 4]; voxel_count];
         let voxel_build_start = Instant::now();
@@ -5013,9 +5104,9 @@ impl SdfClipmap {
     fn sdf_bounds_region(&self, bounds: GeometryBounds, margin: Vec3) -> Option<SdfTextureRegion> {
         let minimum = ((bounds.minimum - margin - self.minimum) / self.voxel_size - Vec3::splat(0.5)).floor().max(Vec3::ZERO);
         let maximum = ((bounds.maximum + margin - self.minimum) / self.voxel_size - Vec3::splat(0.5)).ceil().min(Vec3::new(
-            (SDF_CLIPMAP_RESOLUTION[0] - 1) as f32,
-            (SDF_CLIPMAP_RESOLUTION[1] - 1) as f32,
-            (SDF_CLIPMAP_RESOLUTION[2] - 1) as f32,
+            (self.resolution[0] - 1) as f32,
+            (self.resolution[1] - 1) as f32,
+            (self.resolution[2] - 1) as f32,
         ));
         if !minimum.cmple(maximum).all() {
             return None;
@@ -5024,7 +5115,7 @@ impl SdfClipmap {
     }
 
     fn rebuild_voxel_regions(&mut self, regions: &[SdfTextureRegion]) {
-        let mut dirty_indices = sdf_region_indices(regions);
+        let mut dirty_indices = sdf_region_indices(regions, self.resolution);
         dirty_indices.sort_unstable();
         dirty_indices.dedup();
         if dirty_indices.is_empty() {
@@ -5036,15 +5127,16 @@ impl SdfClipmap {
         let minimum = self.minimum;
         let voxel_size = self.voxel_size;
         let voxel_padding = voxel_size * 0.5;
+        let resolution = self.resolution;
         let geometry_bvh = &self.geometry_bvh;
         std::thread::scope(|scope| {
             for (worker_index, updates) in updates.chunks_mut(indices_per_worker).enumerate() {
                 let indices = &dirty_indices[worker_index * indices_per_worker..worker_index * indices_per_worker + updates.len()];
                 scope.spawn(move || {
                     for ((index, value, emission_value), voxel_index) in updates.iter_mut().zip(indices) {
-                        let x = *voxel_index % SDF_CLIPMAP_RESOLUTION[0] as usize;
-                        let y = (*voxel_index / SDF_CLIPMAP_RESOLUTION[0] as usize) % SDF_CLIPMAP_RESOLUTION[1] as usize;
-                        let z = *voxel_index / (SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                        let x = *voxel_index % resolution[0] as usize;
+                        let y = (*voxel_index / resolution[0] as usize) % resolution[1] as usize;
+                        let z = *voxel_index / (resolution[0] * resolution[1]) as usize;
                         let position = minimum + (Vec3::new(x as f32, y as f32, z as f32) + Vec3::splat(0.5)) * voxel_size;
                         let (distance, albedo, emission) = geometry_bvh.nearest(position, voxel_padding);
                         *index = *voxel_index;
@@ -5061,7 +5153,7 @@ impl SdfClipmap {
     }
 
     fn rebuild_clearance_regions(&mut self, regions: &[SdfTextureRegion]) {
-        let mut dirty_indices = sdf_region_indices(regions);
+        let mut dirty_indices = sdf_region_indices(regions, self.resolution);
         dirty_indices.sort_unstable();
         dirty_indices.dedup();
         if dirty_indices.is_empty() {
@@ -5073,14 +5165,15 @@ impl SdfClipmap {
         let half_voxel_diagonal = self.voxel_size.length() * 0.5;
         let minimum_voxel_size = self.voxel_size.min_element();
         let values = &self.values;
+        let resolution = self.resolution;
         std::thread::scope(|scope| {
             for (worker_index, updates) in updates.chunks_mut(indices_per_worker).enumerate() {
                 let indices = &dirty_indices[worker_index * indices_per_worker..worker_index * indices_per_worker + updates.len()];
                 scope.spawn(move || {
                     for ((index, safe_distance), voxel_index) in updates.iter_mut().zip(indices) {
-                        let x = *voxel_index % SDF_CLIPMAP_RESOLUTION[0] as usize;
-                        let y = (*voxel_index / SDF_CLIPMAP_RESOLUTION[0] as usize) % SDF_CLIPMAP_RESOLUTION[1] as usize;
-                        let z = *voxel_index / (SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                        let x = *voxel_index % resolution[0] as usize;
+                        let y = (*voxel_index / resolution[0] as usize) % resolution[1] as usize;
+                        let z = *voxel_index / (resolution[0] * resolution[1]) as usize;
                         let mut distance = SDF_CLEARANCE_RADIUS_VOXELS;
                         'neighborhood: for offset_z in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
                             for offset_y in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
@@ -5091,15 +5184,13 @@ impl SdfClipmap {
                                     if neighbor_x < 0
                                         || neighbor_y < 0
                                         || neighbor_z < 0
-                                        || neighbor_x >= SDF_CLIPMAP_RESOLUTION[0] as i32
-                                        || neighbor_y >= SDF_CLIPMAP_RESOLUTION[1] as i32
-                                        || neighbor_z >= SDF_CLIPMAP_RESOLUTION[2] as i32
+                                        || neighbor_x >= resolution[0] as i32
+                                        || neighbor_y >= resolution[1] as i32
+                                        || neighbor_z >= resolution[2] as i32
                                     {
                                         continue;
                                     }
-                                    let neighbor_index = neighbor_x as usize
-                                        + neighbor_y as usize * SDF_CLIPMAP_RESOLUTION[0] as usize
-                                        + neighbor_z as usize * SDF_CLIPMAP_RESOLUTION[0] as usize * SDF_CLIPMAP_RESOLUTION[1] as usize;
+                                    let neighbor_index = neighbor_x as usize + neighbor_y as usize * resolution[0] as usize + neighbor_z as usize * resolution[0] as usize * resolution[1] as usize;
                                     if values[neighbor_index][0] <= 0.0 {
                                         distance = distance.min(offset_x.unsigned_abs().max(offset_y.unsigned_abs()).max(offset_z.unsigned_abs()) as u16);
                                         if distance == 0 {
@@ -5121,7 +5212,7 @@ impl SdfClipmap {
     }
 
     fn rebuild_conservative_clearance(&mut self) {
-        let resolution = SDF_CLIPMAP_RESOLUTION;
+        let resolution = self.resolution;
         let voxel_count = resolution.iter().product::<u32>() as usize;
         let mut clearance = vec![u16::MAX; voxel_count];
         let index = |x: u32, y: u32, z: u32| (x + y * resolution[0] + z * resolution[0] * resolution[1]) as usize;
@@ -5197,8 +5288,9 @@ impl SdfClipmap {
     }
 
     fn rebuild_all_voxels(&mut self) {
-        let row_width = SDF_CLIPMAP_RESOLUTION[0] as usize;
-        let row_count = SDF_CLIPMAP_RESOLUTION[1] as usize * SDF_CLIPMAP_RESOLUTION[2] as usize;
+        let resolution = self.resolution;
+        let row_width = resolution[0] as usize;
+        let row_count = resolution[1] as usize * resolution[2] as usize;
         let worker_count = std::thread::available_parallelism().map(usize::from).unwrap_or(1).min(row_count);
         let rows_per_worker = row_count.div_ceil(worker_count);
         let values_per_worker = rows_per_worker * row_width;
@@ -5212,8 +5304,8 @@ impl SdfClipmap {
                     for local_index in 0..values.len() {
                         let row = first_row + local_index / row_width;
                         let x = local_index % row_width;
-                        let y = row % SDF_CLIPMAP_RESOLUTION[1] as usize;
-                        let z = row / SDF_CLIPMAP_RESOLUTION[1] as usize;
+                        let y = row % resolution[1] as usize;
+                        let z = row / resolution[1] as usize;
                         let position = minimum + Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) * voxel_size;
                         let (distance, albedo, emission) = geometry_bvh.nearest(position, voxel_size * 0.5);
                         values[local_index] = [distance.clamp(-SDF_MAX_DISTANCE, SDF_MAX_DISTANCE), albedo.x, albedo.y, albedo.z];
@@ -5234,9 +5326,9 @@ impl WorldRadianceField {
         self.resolution.iter().product::<u32>() as usize
     }
 
-    fn new(scene_bounds: GeometryBounds, extent: Vec3, resolution: [u32; 3]) -> Self {
-        let extent = scene_radiance_extent(scene_bounds, extent);
-        let cell_size = extent / Vec3::new(resolution[0] as f32, resolution[1] as f32, resolution[2] as f32);
+    fn new(scene_bounds: GeometryBounds, cell_size: f32) -> Self {
+        let (resolution, extent) = padded_grid_shape(scene_bounds, RADIANCE_FIELD_PADDING, cell_size);
+        let cell_size = Vec3::splat(cell_size);
         let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
         Self {
             resolution,
@@ -5254,9 +5346,12 @@ impl WorldRadianceField {
         }
     }
 
-    fn reanchor(&mut self, scene_bounds: GeometryBounds, extent: Vec3) -> bool {
-        let extent = scene_radiance_extent(scene_bounds, extent);
-        let cell_size = extent / Vec3::new(self.resolution[0] as f32, self.resolution[1] as f32, self.resolution[2] as f32);
+    fn reanchor(&mut self, scene_bounds: GeometryBounds) -> bool {
+        if scene_bounds.minimum.cmpge(self.minimum).all() && scene_bounds.maximum.cmple(self.maximum).all() {
+            return false;
+        }
+        let extent = self.cell_size * Vec3::new(self.resolution[0] as f32, self.resolution[1] as f32, self.resolution[2] as f32);
+        let cell_size = self.cell_size;
         let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
         if self.minimum == minimum && self.maximum == minimum + extent {
             return false;
@@ -5268,7 +5363,7 @@ impl WorldRadianceField {
         true
     }
 
-    fn uniform(&mut self, temporal_accumulation_enabled: bool, angular_region_count: u32) -> RadianceFieldUniform {
+    fn uniform(&mut self, temporal_accumulation_enabled: bool, angular_region_count: u32, probe_relocation_enabled: bool) -> RadianceFieldUniform {
         let full_refresh = self.needs_full_refresh;
         if full_refresh {
             self.needs_full_refresh = false;
@@ -5297,7 +5392,12 @@ impl WorldRadianceField {
             minimum: self.minimum.extend(0.0).to_array(),
             maximum: self.maximum.extend(0.0).to_array(),
             resolution: [self.resolution[0], self.resolution[1], self.resolution[2], 0],
-            settings: [self.frame_index, RADIANCE_FIELD_RAY_COUNT as u32, angular_region_count, u32::from(full_refresh)],
+            settings: [
+                self.frame_index,
+                RADIANCE_FIELD_RAY_COUNT as u32,
+                angular_region_count,
+                u32::from(full_refresh) | (u32::from(dirty_refresh) << 1) | (u32::from(temporal_accumulation_enabled) << 2) | (u32::from(probe_relocation_enabled) << 3),
+            ],
             scheduled_cells: packed_scheduled_cells,
             schedule_metadata: [scheduled_cells.len() as u32, u32::from(temporal_accumulation_enabled || full_refresh), 0, 0],
         }
@@ -5450,21 +5550,20 @@ fn changed_light_priority(previous: &[Light], current: &[Light]) -> Option<Radia
     Some(RadianceFieldPriority { position: center, radius: (maximum - minimum).length() * 0.5 })
 }
 
-fn expand_sdf_texture_region(region: SdfTextureRegion, amount: u32) -> SdfTextureRegion {
+fn expand_sdf_texture_region(region: SdfTextureRegion, amount: u32, resolution: [u32; 3]) -> SdfTextureRegion {
     let end = [region.origin[0] + region.size[0], region.origin[1] + region.size[1], region.origin[2] + region.size[2]];
     let origin = [region.origin[0].saturating_sub(amount), region.origin[1].saturating_sub(amount), region.origin[2].saturating_sub(amount)];
-    let expanded_end =
-        [end[0].saturating_add(amount).min(SDF_CLIPMAP_RESOLUTION[0]), end[1].saturating_add(amount).min(SDF_CLIPMAP_RESOLUTION[1]), end[2].saturating_add(amount).min(SDF_CLIPMAP_RESOLUTION[2])];
+    let expanded_end = [end[0].saturating_add(amount).min(resolution[0]), end[1].saturating_add(amount).min(resolution[1]), end[2].saturating_add(amount).min(resolution[2])];
     SdfTextureRegion { origin, size: [expanded_end[0] - origin[0], expanded_end[1] - origin[1], expanded_end[2] - origin[2]] }
 }
 
-fn sdf_region_indices(regions: &[SdfTextureRegion]) -> Vec<usize> {
+fn sdf_region_indices(regions: &[SdfTextureRegion], resolution: [u32; 3]) -> Vec<usize> {
     let voxel_count = regions.iter().map(|region| region.size.iter().product::<u32>() as usize).sum();
     let mut indices = Vec::with_capacity(voxel_count);
     for region in regions {
         for z in region.origin[2]..region.origin[2] + region.size[2] {
             for y in region.origin[1]..region.origin[1] + region.size[1] {
-                let row_start = (region.origin[0] + y * SDF_CLIPMAP_RESOLUTION[0] + z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+                let row_start = (region.origin[0] + y * resolution[0] + z * resolution[0] * resolution[1]) as usize;
                 indices.extend(row_start..row_start + region.size[0] as usize);
             }
         }
@@ -5520,6 +5619,7 @@ struct VisibilityGrid {
     occupied: Vec<bool>,
     distance: Vec<f32>,
     regions: Vec<u16>,
+    region_sizes: Vec<u32>,
 }
 
 impl VisibilityGrid {
@@ -5537,10 +5637,11 @@ impl VisibilityGrid {
         let padding = Vec3::splat(0.25);
         minimum -= padding;
         maximum += padding;
-        let resolution = [32, 16, 32];
+        let resolution = [32, 64, 32];
         let cell_size = (maximum - minimum) / Vec3::new(resolution[0] as f32, resolution[1] as f32, resolution[2] as f32);
         let cell_count = (resolution[0] * resolution[1] * resolution[2]) as usize;
-        let mut grid = Self { minimum, maximum, cell_size, resolution, occupied: vec![false; cell_count], distance: vec![f32::INFINITY; cell_count], regions: vec![0; cell_count] };
+        let mut grid =
+            Self { minimum, maximum, cell_size, resolution, occupied: vec![false; cell_count], distance: vec![f32::INFINITY; cell_count], regions: vec![0; cell_count], region_sizes: vec![0] };
         for bound in bounds {
             let minimum_cell = grid.cell_coordinate(bound.minimum);
             let maximum_cell = grid.cell_coordinate(bound.maximum);
@@ -5590,6 +5691,12 @@ impl VisibilityGrid {
                 }
             }
             next_region = next_region.saturating_add(1).max(1);
+        }
+        grid.region_sizes = vec![0; next_region as usize];
+        for region in &grid.regions {
+            if *region != 0 {
+                grid.region_sizes[*region as usize] += 1;
+            }
         }
         grid
     }
@@ -5647,6 +5754,10 @@ impl VisibilityGrid {
         self.regions[self.index(self.cell_coordinate(position))]
     }
 
+    fn region_size(&self, region: u16) -> u32 {
+        self.region_sizes.get(region as usize).copied().unwrap_or(0)
+    }
+
     fn surface_region_at(&self, position: Vec3, normal: Vec3) -> u16 {
         let direction = normal.normalize_or_zero();
         let offset_distance = direction.abs().dot(self.cell_size).max(self.cell_size.min_element());
@@ -5654,27 +5765,27 @@ impl VisibilityGrid {
     }
 
     fn probe_location(&self, position: Vec3) -> Option<ProbeLocation> {
-        let region = self.region_at(position);
-        if region == 0 {
-            return None;
-        }
+        let origin_region = self.region_at(position);
         let minimum_distance = self.cell_size.min_element() * 0.75;
-        if self.distance_at(position) > minimum_distance {
+        if origin_region != 0 && self.distance_at(position) > minimum_distance {
             return Some(ProbeLocation { position });
         }
         let offsets = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
         let mut best_position = None;
-        let mut best_distance = f32::NEG_INFINITY;
+        let mut best_score = f32::NEG_INFINITY;
         for radius in 1..=3 {
             for offset in offsets {
                 let candidate = position + offset * self.cell_size * radius as f32;
-                if self.region_at(candidate) != region {
+                let candidate_region = self.region_at(candidate);
+                if candidate_region == 0 || (origin_region != 0 && candidate_region != origin_region) {
                     continue;
                 }
                 let distance = self.distance_at(candidate);
-                if distance > best_distance && distance > minimum_distance {
+                let region_preference = if origin_region == 0 { self.region_size(candidate_region) as f32 } else { 0.0 };
+                let score = region_preference + distance;
+                if distance > minimum_distance && score > best_score {
                     best_position = Some(candidate);
-                    best_distance = distance;
+                    best_score = score;
                 }
             }
             if best_position.is_some() {
@@ -5738,17 +5849,84 @@ fn build_probe_samples(instances: &[MeshInstance], include_static: bool) -> (Vec
             continue;
         }
         let target = if instance.probe_dynamic { &mut dynamic_samples } else { &mut static_samples };
-        let weight = 1.0 / instance.mesh.vertices().len().max(1) as f32;
-        target.extend(instance.mesh.vertices().iter().map(|vertex| ProbeSurfaceSample {
-            position: instance.transform.transform_point(Vec3::from_array(vertex.position)),
-            normal: instance.transform.transform_vector(Vec3::from_array(vertex.normal)).normalize_or_zero(),
-            color: Vec3::new(vertex.color[0], vertex.color[1], vertex.color[2]) * Vec3::new(instance.material.base_color.red, instance.material.base_color.green, instance.material.base_color.blue),
-            emission: Vec3::new(instance.material.emission.red, instance.material.emission.green, instance.material.emission.blue),
-            emission_strength: instance.material.emission_strength,
-            weight,
-        }));
+        target.extend(sample_mesh_surface(instance));
     }
     (static_samples, dynamic_samples)
+}
+
+fn sample_mesh_surface(instance: &MeshInstance) -> Vec<ProbeSurfaceSample> {
+    let vertices = instance.mesh.vertices();
+    let mut triangles = Vec::new();
+    let mut total_area = 0.0;
+    for indices in instance.mesh.indices().chunks_exact(3) {
+        let vertex_indices = [indices[0] as usize, indices[1] as usize, indices[2] as usize];
+        let Some(vertex_a) = vertices.get(vertex_indices[0]).copied() else { continue };
+        let Some(vertex_b) = vertices.get(vertex_indices[1]).copied() else { continue };
+        let Some(vertex_c) = vertices.get(vertex_indices[2]).copied() else { continue };
+        let triangle_vertices = [vertex_a, vertex_b, vertex_c];
+        let positions = triangle_vertices.map(|vertex| instance.transform.transform_point(Vec3::from_array(vertex.position)));
+        let area = (positions[1] - positions[0]).cross(positions[2] - positions[0]).length() * 0.5;
+        if !area.is_finite() || area <= 0.000001 {
+            continue;
+        }
+        total_area += area;
+        triangles.push(ProbeSampleTriangle {
+            vertices: triangle_vertices,
+            positions,
+            normals: triangle_vertices.map(|vertex| instance.transform.transform_vector(Vec3::from_array(vertex.normal)).normalize_or_zero()),
+            cumulative_area: total_area,
+        });
+    }
+    if triangles.is_empty() || !total_area.is_finite() {
+        let weight = 1.0 / vertices.len().max(1) as f32;
+        return vertices
+            .iter()
+            .map(|vertex| ProbeSurfaceSample {
+                position: instance.transform.transform_point(Vec3::from_array(vertex.position)),
+                normal: instance.transform.transform_vector(Vec3::from_array(vertex.normal)).normalize_or_zero(),
+                color: Vec3::new(vertex.color[0], vertex.color[1], vertex.color[2])
+                    * Vec3::new(instance.material.base_color.red, instance.material.base_color.green, instance.material.base_color.blue),
+                emission: Vec3::new(instance.material.emission.red, instance.material.emission.green, instance.material.emission.blue),
+                emission_strength: instance.material.emission_strength,
+                weight,
+            })
+            .collect();
+    }
+
+    let sample_count = ((total_area / PROBE_SURFACE_SAMPLE_TARGET_AREA).ceil() as usize).clamp(PROBE_SURFACE_SAMPLE_MIN_COUNT, PROBE_SURFACE_SAMPLE_MAX_COUNT);
+    let sample_weight = 1.0 / sample_count as f32;
+    let material_color = Vec3::new(instance.material.base_color.red, instance.material.base_color.green, instance.material.base_color.blue);
+    let emission = Vec3::new(instance.material.emission.red, instance.material.emission.green, instance.material.emission.blue);
+    (0..sample_count)
+        .map(|sample_index| {
+            let area_coordinate = (sample_index as f32 + 0.5) / sample_count as f32 * total_area;
+            let triangle_index = triangles.partition_point(|triangle| triangle.cumulative_area < area_coordinate).min(triangles.len() - 1);
+            let triangle = triangles[triangle_index];
+            let previous_area = if triangle_index == 0 { 0.0 } else { triangles[triangle_index - 1].cumulative_area };
+            let triangle_fraction = ((area_coordinate - previous_area) / (triangle.cumulative_area - previous_area)).clamp(0.0, 1.0);
+            let root = triangle_fraction.sqrt();
+            let split = radical_inverse(sample_index as u32 + 1, 2);
+            let barycentric = [1.0 - root, root * (1.0 - split), root * split];
+            let position = triangle.positions[0] * barycentric[0] + triangle.positions[1] * barycentric[1] + triangle.positions[2] * barycentric[2];
+            let normal = (triangle.normals[0] * barycentric[0] + triangle.normals[1] * barycentric[1] + triangle.normals[2] * barycentric[2]).normalize_or_zero();
+            let color = (Vec3::new(triangle.vertices[0].color[0], triangle.vertices[0].color[1], triangle.vertices[0].color[2]) * barycentric[0]
+                + Vec3::new(triangle.vertices[1].color[0], triangle.vertices[1].color[1], triangle.vertices[1].color[2]) * barycentric[1]
+                + Vec3::new(triangle.vertices[2].color[0], triangle.vertices[2].color[1], triangle.vertices[2].color[2]) * barycentric[2])
+                * material_color;
+            ProbeSurfaceSample { position, normal, color, emission, emission_strength: instance.material.emission_strength, weight: sample_weight }
+        })
+        .collect()
+}
+
+fn radical_inverse(mut value: u32, base: u32) -> f32 {
+    let mut inverse_base = 1.0 / base as f32;
+    let mut result = 0.0;
+    while value > 0 {
+        result += (value % base) as f32 * inverse_base;
+        value /= base;
+        inverse_base /= base as f32;
+    }
+    result
 }
 
 fn build_dynamic_probe_samples(instances: &[MeshInstance]) -> Vec<ProbeSurfaceSample> {
@@ -5848,7 +6026,7 @@ fn sdf_geometries(instances: &[MeshInstance]) -> Vec<SdfGeometry> {
             vertex_color /= instance.mesh.vertices().len() as f32;
             let material_color = Vec3::new(instance.material.base_color.red, instance.material.base_color.green, instance.material.base_color.blue);
             let emission_color = Vec3::new(instance.material.emission.red, instance.material.emission.green, instance.material.emission.blue) * instance.material.emission_strength;
-            Some(SdfGeometry { bounds: GeometryBounds { minimum, maximum }, albedo: vertex_color * material_color, emission: emission_color })
+            Some(SdfGeometry { bounds: GeometryBounds { minimum, maximum }, albedo: vertex_color * material_color, emission: emission_color, surface_signature: mesh_instance_signature(instance) })
         })
         .collect()
 }
@@ -5873,9 +6051,22 @@ fn surface_inspection_meshes(instances: &[MeshInstance]) -> Vec<SurfaceInspectio
                 .indices()
                 .chunks_exact(3)
                 .enumerate()
-                .map(|(triangle_index, indices)| SurfaceInspectionTriangle {
-                    vertices: [indices[0], indices[1], indices[2]].map(|index| instance.transform.transform_point(Vec3::from_array(instance.mesh.vertices()[index as usize].position))),
-                    triangle_index: triangle_index as u32,
+                .map(|(triangle_index, indices)| {
+                    let vertices = [indices[0], indices[1], indices[2]].map(|index| instance.transform.transform_point(Vec3::from_array(instance.mesh.vertices()[index as usize].position)));
+                    let vertex_color = [indices[0], indices[1], indices[2]]
+                        .map(|index| {
+                            let color = instance.mesh.vertices()[index as usize].color;
+                            Vec3::new(color[0], color[1], color[2])
+                        })
+                        .into_iter()
+                        .sum::<Vec3>()
+                        / 3.0;
+                    SurfaceInspectionTriangle {
+                        vertices,
+                        triangle_index: triangle_index as u32,
+                        albedo: vertex_color * Vec3::new(instance.material.base_color.red, instance.material.base_color.green, instance.material.base_color.blue),
+                        emission: Vec3::new(instance.material.emission.red, instance.material.emission.green, instance.material.emission.blue) * instance.material.emission_strength,
+                    }
                 })
                 .collect();
             Some(SurfaceInspectionMesh { instance_index: instance_index as u32, bounds: GeometryBounds { minimum, maximum }, triangles })
@@ -5897,7 +6088,12 @@ fn build_triangle_bvh(meshes: &[SurfaceInspectionMesh], strategy: TriangleBvhBui
             let minimum = triangle.vertices.iter().copied().fold(Vec3::splat(f32::INFINITY), Vec3::min);
             let maximum = triangle.vertices.iter().copied().fold(Vec3::splat(f32::NEG_INFINITY), Vec3::max);
             TriangleBvhBuildItem {
-                triangle: TriangleBvhTriangle { vertices: triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]), source: [instance_index, triangle.triangle_index, 0, 0] },
+                triangle: TriangleBvhTriangle {
+                    vertices: triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]),
+                    source: [instance_index, triangle.triangle_index, 0, 0],
+                    albedo: triangle.albedo.extend(0.0).to_array(),
+                    emission: triangle.emission.extend(0.0).to_array(),
+                },
                 bounds: GeometryBounds { minimum, maximum },
                 centroid: (minimum + maximum) * 0.5,
             }
@@ -5921,6 +6117,8 @@ fn refit_triangle_bvh_data(nodes: &mut [TriangleBvhNode], triangles: &mut [Trian
             return false;
         };
         triangle.vertices = source_triangle.vertices.map(|vertex| [vertex.x, vertex.y, vertex.z, 0.0]);
+        triangle.albedo = source_triangle.albedo.extend(0.0).to_array();
+        triangle.emission = source_triangle.emission.extend(0.0).to_array();
     }
     for node_index in (0..nodes.len()).rev() {
         let metadata = nodes[node_index].metadata;
@@ -6207,14 +6405,12 @@ fn static_grid_minimum(center: Vec3, extent: Vec3) -> Vec3 {
     center - extent * 0.5
 }
 
-fn scene_sdf_extent(scene_bounds: GeometryBounds) -> Vec3 {
-    let required_extent = scene_bounds.maximum - scene_bounds.minimum + SCENE_GI_PADDING * 2.0;
-    SDF_CLIPMAP_EXTENT.max(required_extent)
-}
-
-fn scene_radiance_extent(scene_bounds: GeometryBounds, default_extent: Vec3) -> Vec3 {
-    let required_extent = scene_bounds.maximum - scene_bounds.minimum + SCENE_GI_PADDING * 2.0;
-    if required_extent.cmpgt(SDF_CLIPMAP_EXTENT).any() { default_extent.max(required_extent) } else { default_extent }
+fn padded_grid_shape(scene_bounds: GeometryBounds, padding: Vec3, cell_size: f32) -> ([u32; 3], Vec3) {
+    let bounds_size = (scene_bounds.maximum - scene_bounds.minimum).max(Vec3::ZERO);
+    let padded_extent = bounds_size + padding * 2.0;
+    let resolution = std::array::from_fn(|axis| (padded_extent[axis] / cell_size).ceil().max(1.0) as u32);
+    let extent = Vec3::new(resolution[0] as f32, resolution[1] as f32, resolution[2] as f32) * cell_size;
+    (resolution, extent)
 }
 
 fn probe_irradiance(
@@ -6292,6 +6488,159 @@ fn probe_irradiance(
     (irradiance + sky, sky_visibility, direction)
 }
 
+fn apply_second_diffuse_bounce(
+    final_cache: &mut IrradianceUniform,
+    direct_cache: &IrradianceUniform,
+    static_samples: &[ProbeSurfaceSample],
+    dynamic_samples: &[ProbeSurfaceSample],
+    visibility_grid: &VisibilityGrid,
+) {
+    for index in 0..MAX_IRRADIANCE_PROBES {
+        let position = final_cache.probe_positions[index];
+        if position[3] < 0.5 {
+            continue;
+        }
+        let position = Vec3::new(position[0], position[1], position[2]);
+        let (bounce, bounce_direction) = probe_second_diffuse_bounce(position, static_samples, dynamic_samples, direct_cache, visibility_grid);
+        let direct = Vec3::new(direct_cache.probes[index][0], direct_cache.probes[index][1], direct_cache.probes[index][2]);
+        let final_color = direct + bounce;
+        let direct_direction = Vec4::from_array(direct_cache.directions[index]);
+        let direction = (direct_direction.truncate() * direct_direction.w + bounce_direction.truncate() * bounce_direction.w).normalize_or_zero();
+        let direction_weight = (direct_direction.w + bounce_direction.w).clamp(0.0, 1.0);
+        final_cache.probes[index] = [final_color.x, final_color.y, final_color.z, direct_cache.probes[index][3]];
+        final_cache.directions[index] = direction.extend(direction_weight).to_array();
+    }
+}
+
+fn probe_second_diffuse_bounce(
+    position: Vec3,
+    static_samples: &[ProbeSurfaceSample],
+    dynamic_samples: &[ProbeSurfaceSample],
+    direct_cache: &IrradianceUniform,
+    visibility_grid: &VisibilityGrid,
+) -> (Vec3, Vec4) {
+    let mut irradiance = Vec3::ZERO;
+    let mut direction_sum = Vec3::ZERO;
+    let mut direction_weight = 0.0;
+    let probe_region = visibility_grid.region_at(position);
+    for sample in static_samples.iter().chain(dynamic_samples.iter()) {
+        let sample_region = visibility_grid.surface_region_at(sample.position, sample.normal);
+        if probe_region != 0 && sample_region != 0 && probe_region != sample_region {
+            continue;
+        }
+        let distance = position.distance(sample.position);
+        let sample_attenuation = 1.0 / (1.0 + distance * distance * 0.25);
+        if sample_attenuation < 0.01 {
+            continue;
+        }
+        if !visibility_grid.ray_reaches_target(position, sample.position, sample.normal) {
+            continue;
+        }
+        let source_to_probe = (position - sample.position).normalize_or_zero();
+        let source_cosine = sample.normal.dot(source_to_probe).max(0.0);
+        if source_cosine <= 0.0 {
+            continue;
+        }
+        let incoming = sample_cached_irradiance(sample.position, sample.normal, direct_cache);
+        if incoming.max_element() <= 0.0 {
+            continue;
+        }
+        let reflected = incoming * sample.color;
+        let contribution = source_cosine * sample_attenuation * PROBE_SURFACE_SAMPLE_SCALE * sample.weight * std::f32::consts::FRAC_1_PI;
+        irradiance += reflected * contribution;
+        let contribution_weight = reflected.max_element().max(0.0) * contribution;
+        direction_sum += (sample.position - position).normalize_or_zero() * contribution_weight;
+        direction_weight += contribution_weight;
+    }
+    let direction = direction_sum.normalize_or_zero().extend((direction_weight * 0.35).clamp(0.0, 1.0));
+    (irradiance, direction)
+}
+
+fn sample_cached_irradiance(position: Vec3, normal: Vec3, cache: &IrradianceUniform) -> Vec3 {
+    let mut result = Vec3::ZERO;
+    let mut blended_weight = 0.0;
+    let mut remaining_weight = 1.0;
+    let normal = normal.normalize_or_zero();
+    for volume_index in 0..cache.volume_count[0].min(MAX_IRRADIANCE_VOLUMES as u32) as usize {
+        let volume = cache.volumes[volume_index];
+        let minimum = Vec3::new(volume.minimum[0], volume.minimum[1], volume.minimum[2]);
+        let maximum = Vec3::new(volume.maximum[0], volume.maximum[1], volume.maximum[2]);
+        if position.cmplt(minimum).any() || position.cmpgt(maximum).any() {
+            continue;
+        }
+        let resolution = [volume.resolution[0].max(1), volume.resolution[1].max(1), volume.resolution[2].max(1)];
+        let maximum_coordinate = [resolution[0] - 1, resolution[1] - 1, resolution[2] - 1];
+        let size = (maximum - minimum).max(Vec3::splat(0.001));
+        let spacing = Vec3::new(size.x / maximum_coordinate[0].max(1) as f32, size.y / maximum_coordinate[1].max(1) as f32, size.z / maximum_coordinate[2].max(1) as f32);
+        let receiver_bias_scale = if normal.y.abs() < 0.5 { 0.25 } else { 0.75 };
+        let receiver_bias = normal.abs().dot(spacing) * receiver_bias_scale;
+        let wall_receiver_lift = if normal.y.abs() < 0.5 { spacing.y * 0.5 } else { 0.0 };
+        let sample_position = position + normal * receiver_bias + Vec3::Y * wall_receiver_lift;
+        let coordinate = ((sample_position - minimum) / size).clamp(Vec3::ZERO, Vec3::ONE) * Vec3::new(maximum_coordinate[0] as f32, maximum_coordinate[1] as f32, maximum_coordinate[2] as f32);
+        let base = [coordinate.x.floor() as u32, coordinate.y.floor() as u32, coordinate.z.floor() as u32];
+        let fraction = coordinate - Vec3::new(base[0] as f32, base[1] as f32, base[2] as f32);
+        let side_blend_width = spacing.min_element().max(0.001);
+        let mut volume_result = Vec3::ZERO;
+        let mut volume_direction = Vec3::ZERO;
+        let mut volume_direction_weight = 0.0;
+        let mut volume_weight = 0.0;
+        let mut volume_color_weight = 0.0;
+        for z in 0..=1 {
+            for y in 0..=1 {
+                for x in 0..=1 {
+                    let sample_coordinate = [(base[0] + x).min(maximum_coordinate[0]), (base[1] + y).min(maximum_coordinate[1]), (base[2] + z).min(maximum_coordinate[2])];
+                    let local_index =
+                        sample_coordinate[0] as usize + sample_coordinate[1] as usize * resolution[0] as usize + sample_coordinate[2] as usize * resolution[0] as usize * resolution[1] as usize;
+                    let probe_index = volume.probe_offset as usize + local_index;
+                    if probe_index >= MAX_IRRADIANCE_PROBES || cache.probe_positions[probe_index][3] < 0.5 {
+                        continue;
+                    }
+                    let probe_position = cache.probe_positions[probe_index];
+                    let probe_offset = Vec3::new(probe_position[0], probe_position[1], probe_position[2]) - position;
+                    let front_distance = normal.dot(probe_offset);
+                    let probe_distance = probe_offset.length();
+                    if front_distance <= 0.0 || probe_distance <= 0.0001 {
+                        continue;
+                    }
+                    let face_alignment = front_distance / probe_distance;
+                    let side_weight = smoothstep(0.0, side_blend_width, front_distance);
+                    let facing_weight = smoothstep(0.0, 0.25, face_alignment);
+                    let trilinear_weight = if x == 1 { fraction.x } else { 1.0 - fraction.x } * if y == 1 { fraction.y } else { 1.0 - fraction.y } * if z == 1 { fraction.z } else { 1.0 - fraction.z };
+                    let interpolation_weight = trilinear_weight * side_weight;
+                    let weight = interpolation_weight * facing_weight;
+                    let probe = cache.probes[probe_index];
+                    let direction = cache.directions[probe_index];
+                    volume_result += Vec3::new(probe[0], probe[1], probe[2]) * weight;
+                    volume_direction += Vec3::new(direction[0], direction[1], direction[2]) * direction[3] * weight;
+                    volume_direction_weight += direction[3] * weight;
+                    volume_weight += interpolation_weight;
+                    volume_color_weight += weight;
+                }
+            }
+        }
+        let support_weight = smoothstep(0.0, 0.1, volume_weight);
+        if support_weight > 0.0 && volume_color_weight > 0.0001 {
+            volume_result /= volume_color_weight;
+            volume_direction /= volume_color_weight;
+            volume_direction_weight /= volume_color_weight;
+            if volume_direction_weight > 0.0 {
+                let direction_alignment = normal.dot(volume_direction.normalize_or_zero()).max(0.0);
+                volume_result *= 1.0 + direction_alignment * volume_direction_weight.min(1.0) * 0.35;
+            }
+            let blend_weight = remaining_weight * support_weight;
+            result += volume_result * blend_weight;
+            blended_weight += blend_weight;
+            remaining_weight *= 1.0 - support_weight;
+        }
+    }
+    result / blended_weight.max(0.0001)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let amount = ((value - edge0) / (edge1 - edge0).max(f32::EPSILON)).clamp(0.0, 1.0);
+    amount * amount * (3.0 - 2.0 * amount)
+}
+
 fn probe_sky_visibility(position: Vec3, visibility_grid: &VisibilityGrid) -> f32 {
     let directions = [Vec3::Y, Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z];
     let visible = directions.iter().filter(|direction| visibility_grid.ray_reaches_sky(position, **direction)).count();
@@ -6338,7 +6687,7 @@ mod triangle_bvh_tests {
                 let y = (triangle_index / 16) as f32 - 4.0;
                 let z = (triangle_index * 13 % 19) as f32 * 0.15;
                 let origin = Vec3::new(x, y, z);
-                SurfaceInspectionTriangle { vertices: [origin, origin + Vec3::X * 0.8, origin + Vec3::Y * 0.8], triangle_index }
+                SurfaceInspectionTriangle { vertices: [origin, origin + Vec3::X * 0.8, origin + Vec3::Y * 0.8], triangle_index, albedo: Vec3::ONE, emission: Vec3::ZERO }
             })
             .collect::<Vec<_>>();
         let bounds = triangles
@@ -6382,17 +6731,18 @@ mod sdf_clearance_tests {
 
     fn occupied_at(clipmap: &SdfClipmap, position: Vec3) -> bool {
         let logical = ((position - clipmap.minimum) / clipmap.voxel_size).floor().as_uvec3();
-        let index = (logical.x + logical.y * SDF_CLIPMAP_RESOLUTION[0] + logical.z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+        let resolution = clipmap.resolution;
+        let index = (logical.x + logical.y * resolution[0] + logical.z * resolution[0] * resolution[1]) as usize;
         clipmap.values[index][0] <= 0.0
     }
 
     #[test]
     fn conservative_voxel_field_covers_geometry_inside_static_scene_bounds() {
         let geometries = [
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-4.0, -1.0, 0.0), maximum: Vec3::new(-3.99, 1.0, 0.01) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO, surface_signature: 0 },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO, surface_signature: 0 },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO, surface_signature: 0 },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-4.0, -1.0, 0.0), maximum: Vec3::new(-3.99, 1.0, 0.01) }, albedo: Vec3::ONE, emission: Vec3::ZERO, surface_signature: 0 },
         ];
         let scene_bounds = GeometryBounds { minimum: Vec3::new(-8.0, -2.0, -8.0), maximum: Vec3::new(8.0, 4.0, 8.0) };
         let mut clipmap = SdfClipmap::new(scene_bounds, &geometries);
@@ -6401,7 +6751,8 @@ mod sdf_clearance_tests {
 
         let empty_position = Vec3::new(8.0, 1.0, 8.0);
         let empty_logical = ((empty_position - clipmap.minimum) / clipmap.voxel_size).floor().as_uvec3();
-        let empty_index = (empty_logical.x + empty_logical.y * SDF_CLIPMAP_RESOLUTION[0] + empty_logical.z * SDF_CLIPMAP_RESOLUTION[0] * SDF_CLIPMAP_RESOLUTION[1]) as usize;
+        let resolution = clipmap.resolution;
+        let empty_index = (empty_logical.x + empty_logical.y * resolution[0] + empty_logical.z * resolution[0] * resolution[1]) as usize;
         let empty_center = clipmap.minimum + (empty_logical.as_vec3() + Vec3::splat(0.5)) * clipmap.voxel_size;
         let nearest_geometry_distance = geometries.iter().map(|geometry| signed_distance_to_bounds(empty_center, geometry.bounds)).fold(f32::INFINITY, f32::min);
         let safe_clearance = clipmap.emission_values[empty_index][3];
@@ -6415,9 +6766,14 @@ mod sdf_clearance_tests {
     #[test]
     fn incremental_sdf_update_matches_full_rebuild_after_geometry_motion() {
         let geometries = [
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) }, albedo: Vec3::new(0.7, 0.3, 0.1), emission: Vec3::ZERO },
-            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(-2.0, -0.03, -2.0), maximum: Vec3::new(2.0, 0.03, 2.0) }, albedo: Vec3::ONE, emission: Vec3::ZERO, surface_signature: 0 },
+            SdfGeometry {
+                bounds: GeometryBounds { minimum: Vec3::new(3.0, 0.0, -2.0), maximum: Vec3::new(3.02, 3.0, 2.0) },
+                albedo: Vec3::new(0.7, 0.3, 0.1),
+                emission: Vec3::ZERO,
+                surface_signature: 0,
+            },
+            SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(4.0, 0.0, 4.0), maximum: Vec3::new(4.1, 0.2, 4.1) }, albedo: Vec3::ONE, emission: Vec3::ZERO, surface_signature: 0 },
         ];
         let moved_geometries = [geometries[0], SdfGeometry { bounds: GeometryBounds { minimum: Vec3::new(3.5, 0.0, -2.0), maximum: Vec3::new(3.52, 3.0, 2.0) }, ..geometries[1] }, geometries[2]];
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-8.0), maximum: Vec3::splat(8.0) };
@@ -6425,7 +6781,7 @@ mod sdf_clearance_tests {
         let update = incremental.update(scene_bounds, &moved_geometries).expect("moving geometry must update the field");
         let rebuilt = SdfClipmap::new(scene_bounds, &moved_geometries);
 
-        assert!(update.voxels_updated < SDF_CLIPMAP_RESOLUTION.iter().product());
+        assert!(update.voxels_updated < incremental.resolution.iter().product());
         assert_eq!(incremental.values, rebuilt.values);
         assert_eq!(incremental.emission_values, rebuilt.emission_values);
     }
@@ -6438,50 +6794,54 @@ mod radiance_field_tests {
     #[test]
     fn room_test_outer_walls_fit_inside_single_radiance_and_sdf_fields() {
         let scene_bounds = GeometryBounds { minimum: Vec3::new(-16.0, 0.0, -16.0), maximum: Vec3::new(16.0, 5.2, 16.0) };
-        let sdf_extent = scene_sdf_extent(scene_bounds);
+        let (_, sdf_extent) = padded_grid_shape(scene_bounds, SDF_CLIPMAP_PADDING, SDF_TARGET_CELL_SIZE);
         let sdf_minimum = static_grid_minimum(bounds_center(scene_bounds), sdf_extent);
         let sdf_maximum = sdf_minimum + sdf_extent;
-        let radiance_field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
+        let radiance_field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
 
         for position in [Vec3::new(-13.15, 0.0, -13.15), Vec3::new(13.15, 5.2, 13.15)] {
             assert!(position.cmpge(sdf_minimum).all() && position.cmplt(sdf_maximum).all());
             assert!(position.cmpge(radiance_field.minimum).all() && position.cmplt(radiance_field.maximum).all());
         }
 
-        assert_eq!(radiance_field.cell_size, Vec3::splat(4.0));
+        assert_eq!(radiance_field.cell_size, Vec3::splat(RADIANCE_FIELD_TARGET_CELL_SIZE));
     }
 
     #[test]
-    fn large_static_scene_expands_and_reanchors_single_world_radiance_field() {
+    fn radiance_field_reanchors_without_changing_cell_spacing() {
         let small_bounds = GeometryBounds { minimum: Vec3::new(-16.0, 0.0, -16.0), maximum: Vec3::new(16.0, 5.2, 16.0) };
-        let large_bounds = GeometryBounds { minimum: Vec3::new(0.0, 0.0, 0.0), maximum: Vec3::new(116.0, 3.25, 116.0) };
-        let sdf_extent = scene_sdf_extent(large_bounds);
+        let large_bounds = GeometryBounds { minimum: Vec3::new(20.0, 0.0, 0.0), maximum: Vec3::new(30.0, 5.2, 10.0) };
+        let (resolution, sdf_extent) = padded_grid_shape(large_bounds, SDF_CLIPMAP_PADDING, SDF_TARGET_CELL_SIZE);
         let sdf_minimum = static_grid_minimum(bounds_center(large_bounds), sdf_extent);
         let sdf_maximum = sdf_minimum + sdf_extent;
-        let mut field = WorldRadianceField::new(small_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
-        field.uniform(false, RadianceAngularResolution::default().segment_count());
+        let mut field = WorldRadianceField::new(small_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
 
-        assert!(sdf_minimum.cmple(large_bounds.minimum - SCENE_GI_PADDING).all());
-        assert!(sdf_maximum.cmpge(large_bounds.maximum + SCENE_GI_PADDING).all());
-        assert!(field.reanchor(large_bounds, RADIANCE_FIELD_EXTENT));
+        assert_eq!(resolution, std::array::from_fn(|axis| ((large_bounds.maximum[axis] - large_bounds.minimum[axis] + SDF_CLIPMAP_PADDING[axis] * 2.0) / SDF_TARGET_CELL_SIZE).ceil() as u32));
+        assert!(sdf_minimum.cmple(large_bounds.minimum - SDF_CLIPMAP_PADDING).all());
+        assert!(sdf_maximum.cmpge(large_bounds.maximum + SDF_CLIPMAP_PADDING).all());
+        assert!(field.reanchor(large_bounds));
         assert!(field.needs_full_refresh);
-        assert!(field.minimum.cmple(large_bounds.minimum - SCENE_GI_PADDING).all());
-        assert!(field.maximum.cmpge(large_bounds.maximum + SCENE_GI_PADDING).all());
-        assert!(field.cell_size.x > 4.0);
-        field.uniform(false, RadianceAngularResolution::default().segment_count());
-        assert!(field.reanchor(small_bounds, RADIANCE_FIELD_EXTENT));
+        assert!(field.minimum.cmple(large_bounds.minimum - RADIANCE_FIELD_PADDING).all());
+        assert!(field.maximum.cmpge(large_bounds.maximum + RADIANCE_FIELD_PADDING).all());
+        assert_eq!(field.cell_size, Vec3::splat(RADIANCE_FIELD_TARGET_CELL_SIZE));
+        field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
+        let expanded_minimum = field.minimum;
+        let expanded_maximum = field.maximum;
+        assert!(field.reanchor(small_bounds));
         assert!(field.needs_full_refresh);
-        assert_eq!(field.cell_size, Vec3::splat(4.0));
+        assert_ne!(field.minimum, expanded_minimum);
+        assert_ne!(field.maximum, expanded_maximum);
+        assert_eq!(field.cell_size, Vec3::splat(RADIANCE_FIELD_TARGET_CELL_SIZE));
     }
 
     #[test]
     fn static_radiance_cells_keep_their_world_bounds_across_updates() {
-        let resolution = RADIANCE_FIELD_DEFAULT_RESOLUTION;
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
-        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, resolution);
-        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count());
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
         let fixed_minimum = field.minimum;
-        let next = field.uniform(true, RadianceAngularResolution::default().segment_count());
+        let next = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
 
         assert_eq!(initial.settings[3] & 1, 1);
         assert_eq!(next.settings[3] & 1, 0);
@@ -6491,27 +6851,27 @@ mod radiance_field_tests {
     #[test]
     fn radiance_refinement_updates_the_full_field_and_refinement_is_toggleable() {
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
-        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_EXTENT, RADIANCE_FIELD_DEFAULT_RESOLUTION);
-        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count());
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
         assert_eq!(initial.settings[3] & 1, 1);
         assert_eq!(initial.settings[3] & 4, 4);
         assert_eq!(initial.schedule_metadata[0], 0);
         assert_eq!(initial.schedule_metadata[1], 1);
 
-        let continuous_update = field.uniform(true, RadianceAngularResolution::default().segment_count());
+        let continuous_update = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
         assert_eq!(continuous_update.schedule_metadata[0], 0);
         assert_eq!(continuous_update.schedule_metadata[1], 1);
 
         field.refresh_temporally(true);
-        let changed = field.uniform(true, RadianceAngularResolution::default().segment_count());
+        let changed = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
         assert_eq!(changed.settings[3] & 2, 2);
         assert_eq!(changed.schedule_metadata[0], 0);
         assert_eq!(changed.schedule_metadata[1], 1);
 
-        let refinement_disabled = field.uniform(false, RadianceAngularResolution::default().segment_count());
+        let refinement_disabled = field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
         assert_eq!(refinement_disabled.settings[3] & 4, 0);
 
-        let disabled_update = field.uniform(false, RadianceAngularResolution::default().segment_count());
+        let disabled_update = field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
         assert_eq!(disabled_update.schedule_metadata[0], 0);
         assert_eq!(disabled_update.schedule_metadata[1], 0);
     }

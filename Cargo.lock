@@ -354,6 +354,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cornell-box"
+version = "0.1.0"
+dependencies = [
+ "labyrinth",
+ "labyrinth_debug_ui",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -523,15 +531,6 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fx"
-version = "0.1.0"
-dependencies = [
- "asset_import",
- "labyrinth",
- "labyrinth_debug_ui",
 ]
 
 [[package]]
@@ -1867,6 +1866,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "sponza"
+version = "0.1.0"
+dependencies = [
+ "asset_import",
+ "labyrinth",
+ "labyrinth_debug_ui",
 ]
 
 [[package]]

@@ -34,7 +34,7 @@ pub use logging::init_logging;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
 pub use mesh::{Material, Mesh, MeshInstance, MeshVertex, Texture};
 pub use renderer::{
-    GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldResolution, RenderDebugMode, RenderSettings,
+    GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldCellSize, RenderDebugMode, RenderSettings,
     RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceAngularSegment, RendererRadianceFieldGrid,
     RendererRadianceSurfaceCandidate, RendererRadianceSurfaceInspection, RendererSkyLighting, ShadowQuality,
 };
@@ -88,8 +88,10 @@ pub struct RuntimeContext {
     pub irradiance_mode: IrradianceMode,
     pub irradiance_clipmap: IrradianceClipmapDesc,
     pub irradiance_update_budget: usize,
-    /// World radiance-field cell counts, read when the renderer initializes.
-    pub gi_radiance_field_resolution: RadianceFieldResolution,
+    /// Target world-space spacing between global radiance probes, read when the renderer initializes.
+    pub gi_radiance_field_cell_size: RadianceFieldCellSize,
+    /// Whether AABB-SDF radiance probes may move away from their cell centers to find clearance.
+    pub gi_radiance_probe_relocation_enabled: bool,
     /// Current renderer-owned bounds and resolution for the scene radiance field.
     pub gi_radiance_field_grid: RendererRadianceFieldGrid,
     pub sky_lighting: RendererSkyLighting,
@@ -225,7 +227,8 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         irradiance_mode: IrradianceMode::default(),
         irradiance_clipmap: IrradianceClipmapDesc::default(),
         irradiance_update_budget: 8,
-        gi_radiance_field_resolution: RadianceFieldResolution::default(),
+        gi_radiance_field_cell_size: RadianceFieldCellSize::default(),
+        gi_radiance_probe_relocation_enabled: false,
         gi_radiance_field_grid: RendererRadianceFieldGrid::default(),
         sky_lighting: RendererSkyLighting::default(),
         performance_stats: RendererPerformanceStats::default(),
@@ -372,14 +375,14 @@ where
         };
         let lights = self.context.active_lights.iter().filter_map(|id| self.context.scene.get_light(*id)).copied().collect::<Vec<_>>();
         let irradiance_volumes = renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera);
-        let renderer = match Renderer::new_with_radiance_field_resolution(
+        let renderer = match Renderer::new_with_radiance_field_cell_size(
             window.clone(),
             self.settings.graphics_api,
             camera,
             &lights,
             self.context.scene.instances(),
             &irradiance_volumes,
-            self.context.gi_radiance_field_resolution,
+            self.context.gi_radiance_field_cell_size,
         ) {
             Ok(renderer) => renderer,
             Err(error) => return self.fail(event_loop, error),
@@ -567,6 +570,7 @@ where
                         renderer.set_triangle_bvh_diagnostics_enabled(triangle_probe_diagnostics_enabled && render_settings.triangle_probe_occlusion_enabled);
                         renderer.update_sky_lighting(self.context.sky_lighting);
                         renderer.set_gi_radiance_temporal_accumulation_enabled(self.context.gi_radiance_temporal_accumulation_enabled);
+                        renderer.set_gi_radiance_probe_relocation_enabled(self.context.gi_radiance_probe_relocation_enabled);
                         renderer.set_radiance_angular_resolution(self.context.gi_angular_resolution);
                         let sdf_gi_active = irradiance_available && render_settings.irradiance_enabled && self.context.irradiance_mode == IrradianceMode::AabbSdf;
                         renderer.update_irradiance_volumes(&irradiance_volumes, self.context.scene.instances(), &lights, sdf_gi_active);

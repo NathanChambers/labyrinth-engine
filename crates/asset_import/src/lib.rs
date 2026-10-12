@@ -20,8 +20,17 @@ pub fn load_fbx(path: impl AsRef<Path>) -> Result<Vec<ImportedMesh>, String> {
     load_fbx_with_texture_roots(path, &texture_roots)
 }
 
-pub fn load_fbx_with_texture_roots(path: impl AsRef<Path>, texture_roots: &[PathBuf]) -> Result<Vec<ImportedMesh>, String> {
+pub fn load_fbx_allow_missing_textures(path: impl AsRef<Path>) -> Result<Vec<ImportedMesh>, String> {
     let path = path.as_ref();
+    let texture_roots = path.parent().map(Path::to_path_buf).into_iter().collect::<Vec<_>>();
+    load_fbx_internal(path, &texture_roots, true)
+}
+
+pub fn load_fbx_with_texture_roots(path: impl AsRef<Path>, texture_roots: &[PathBuf]) -> Result<Vec<ImportedMesh>, String> {
+    load_fbx_internal(path.as_ref(), texture_roots, false)
+}
+
+fn load_fbx_internal(path: &Path, texture_roots: &[PathBuf], allow_missing_textures: bool) -> Result<Vec<ImportedMesh>, String> {
     let path_string = path.to_str().ok_or_else(|| format!("model path is not valid UTF-8: {}", path.display()))?;
     let scene = ufbx::load_file(
         path_string,
@@ -37,6 +46,7 @@ pub fn load_fbx_with_texture_roots(path: impl AsRef<Path>, texture_roots: &[Path
     .map_err(|error| format!("failed to import {}: {}", path.display(), error.description))?;
 
     let mut texture_cache = HashMap::new();
+    let mut file_texture_cache = HashMap::new();
     let mut imported_meshes = Vec::new();
     for node in &scene.nodes {
         let Some(source_mesh) = node.mesh.as_ref().map(AsRef::as_ref) else {
@@ -73,7 +83,7 @@ pub fn load_fbx_with_texture_roots(path: impl AsRef<Path>, texture_roots: &[Path
             }
 
             let material = node.materials.get(part.index as usize).map(AsRef::as_ref).or_else(|| source_mesh.materials.get(part.index as usize).map(AsRef::as_ref));
-            let material = import_material(material, path, texture_roots, &mut texture_cache)?;
+            let material = import_material(material, path, texture_roots, &mut texture_cache, &mut file_texture_cache, allow_missing_textures)?;
             let mesh = Mesh::from_data(vertices, indices).map_err(|error| format!("{}: {error}", node.element.name))?;
             imported_meshes.push(ImportedMesh { name: node.element.name.as_ref().to_owned(), mesh, transform, material });
         }
@@ -85,28 +95,132 @@ pub fn load_fbx_with_texture_roots(path: impl AsRef<Path>, texture_roots: &[Path
     Ok(imported_meshes)
 }
 
-fn import_material(source: Option<&ufbx::Material>, model_path: &Path, texture_roots: &[PathBuf], texture_cache: &mut HashMap<u32, Texture>) -> Result<Material, String> {
+fn import_material(
+    source: Option<&ufbx::Material>,
+    model_path: &Path,
+    texture_roots: &[PathBuf],
+    texture_cache: &mut HashMap<u32, Texture>,
+    file_texture_cache: &mut HashMap<PathBuf, Texture>,
+    allow_missing_textures: bool,
+) -> Result<Material, String> {
     let Some(source) = source else {
         return Ok(Material::default());
     };
     let color_map = if source.pbr.base_color.has_value { &source.pbr.base_color } else { &source.fbx.diffuse_color };
     let color = if color_map.has_value { color_map.value_vec4 } else { ufbx::Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 } };
-    let texture_ref = source.pbr.base_color.texture.as_ref().or(source.fbx.diffuse_color.texture.as_ref());
-    let base_color_texture = texture_ref.map(|texture| load_texture(texture, model_path, texture_roots, texture_cache)).transpose()?;
-    let roughness = if source.pbr.roughness.has_value { source.pbr.roughness.value_vec4.x as f32 } else { 0.7 };
-    let metallic = if source.pbr.metalness.has_value { source.pbr.metalness.value_vec4.x as f32 } else { 0.0 };
+    let texture_ref = source.pbr.base_color.texture.as_ref().or(source.fbx.diffuse_color.texture.as_ref()).map(|texture| &**texture);
+    let base_color_texture = texture_ref.map(|texture| load_texture(texture, model_path, texture_roots, texture_cache, allow_missing_textures)).transpose()?.flatten();
+    let normal_map = source.pbr.normal_map.texture.as_ref().or(source.fbx.normal_map.texture.as_ref()).map(|texture| &**texture);
+    let roughness_map = source.pbr.roughness.texture.as_ref().map(|texture| &**texture);
+    let metallic_map = source.pbr.metalness.texture.as_ref().map(|texture| &**texture);
+    let normal_texture = load_material_map_texture(normal_map, texture_ref, "normal", model_path, texture_roots, texture_cache, file_texture_cache, allow_missing_textures)?;
+    let roughness_texture = load_material_map_texture(roughness_map, texture_ref, "roughness", model_path, texture_roots, texture_cache, file_texture_cache, allow_missing_textures)?;
+    let metallic_texture = load_material_map_texture(metallic_map, texture_ref, "metallic", model_path, texture_roots, texture_cache, file_texture_cache, allow_missing_textures)?;
+    let roughness = if source.pbr.roughness.has_value {
+        source.pbr.roughness.value_vec4.x as f32
+    } else if roughness_texture.is_some() {
+        1.0
+    } else {
+        0.7
+    };
+    let metallic = if source.pbr.metalness.has_value {
+        source.pbr.metalness.value_vec4.x as f32
+    } else if metallic_texture.is_some() {
+        1.0
+    } else {
+        0.0
+    };
 
-    Ok(Material { base_color: Color::rgba(color.x as f32, color.y as f32, color.z as f32, color.w as f32), metallic, roughness, base_color_texture, ..Material::default() })
+    Ok(Material {
+        base_color: Color::rgba(color.x as f32, color.y as f32, color.z as f32, color.w as f32),
+        metallic,
+        roughness,
+        base_color_texture,
+        normal_texture,
+        metallic_texture,
+        roughness_texture,
+        ..Material::default()
+    })
 }
 
-fn load_texture(texture: &ufbx::Texture, model_path: &Path, texture_roots: &[PathBuf], texture_cache: &mut HashMap<u32, Texture>) -> Result<Texture, String> {
+fn load_material_map_texture(
+    map: Option<&ufbx::Texture>,
+    base_color_map: Option<&ufbx::Texture>,
+    map_kind: &str,
+    model_path: &Path,
+    texture_roots: &[PathBuf],
+    texture_cache: &mut HashMap<u32, Texture>,
+    file_texture_cache: &mut HashMap<PathBuf, Texture>,
+    allow_missing_textures: bool,
+) -> Result<Option<Texture>, String> {
+    if let Some(texture) = map {
+        if let Some(texture) = load_texture(texture, model_path, texture_roots, texture_cache, allow_missing_textures)? {
+            return Ok(Some(texture));
+        }
+    }
+    let Some(base_color_map) = base_color_map else {
+        return Ok(None);
+    };
+    let Some(path) = resolve_conventional_texture(base_color_map, map_kind, texture_roots) else {
+        return Ok(None);
+    };
+    let key = path.canonicalize().unwrap_or(path.clone());
+    if let Some(texture) = file_texture_cache.get(&key) {
+        return Ok(Some(texture.clone()));
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("failed to read texture {}: {error}", path.display()))?;
+    let filename = path.to_string_lossy();
+    let (width, height, rgba8) = decode_texture(&bytes, &filename)?;
+    let texture = Texture::from_rgba8(width, height, rgba8)?;
+    file_texture_cache.insert(key, texture.clone());
+    Ok(Some(texture))
+}
+
+fn resolve_conventional_texture(base_color_map: &ufbx::Texture, map_kind: &str, texture_roots: &[PathBuf]) -> Option<PathBuf> {
+    let filename = Path::new(&*base_color_map.filename).file_name()?;
+    let stem = Path::new(filename).file_stem()?.to_string_lossy();
+    let extension = Path::new(filename).extension()?.to_string_lossy();
+    let base_stem =
+        ["_diffuse", "_albedo", "_basecolor", "_base_color"].into_iter().find_map(|suffix| stem.to_ascii_lowercase().strip_suffix(suffix).map(|_| stem[..stem.len() - suffix.len()].to_owned()))?;
+    let mut base_stems = vec![base_stem.clone()];
+    for color in ["_Red", "_Green", "_Blue"] {
+        if let Some(shared_stem) = base_stem.strip_suffix(color) {
+            base_stems.push(shared_stem.to_owned());
+            break;
+        }
+    }
+    let map_suffix = match map_kind {
+        "normal" => ["normal", "Normal"],
+        "roughness" => ["roughness", "Roughness"],
+        "metallic" => ["metallic", "Metallic"],
+        _ => return None,
+    };
+    for base_stem in base_stems {
+        for suffix in map_suffix {
+            let candidate = format!("{base_stem}_{suffix}.{extension}");
+            for root in texture_roots {
+                if let Some(path) = find_file_named(root, std::ffi::OsStr::new(&candidate)) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn load_texture(texture: &ufbx::Texture, model_path: &Path, texture_roots: &[PathBuf], texture_cache: &mut HashMap<u32, Texture>, allow_missing_textures: bool) -> Result<Option<Texture>, String> {
     let texture_id = texture.element.element_id;
     if let Some(texture) = texture_cache.get(&texture_id) {
-        return Ok(texture.clone());
+        return Ok(Some(texture.clone()));
     }
 
     let (bytes, filename) = if texture.content.is_empty() {
-        let texture_path = resolve_texture_path(texture, model_path, texture_roots).ok_or_else(|| format!("could not find texture {} referenced by {}", texture.filename, model_path.display()))?;
+        let Some(texture_path) = resolve_texture_path(texture, model_path, texture_roots) else {
+            if allow_missing_textures {
+                return Ok(None);
+            }
+            return Err(format!("could not find texture {} referenced by {}", texture.filename, model_path.display()));
+        };
         let bytes = fs::read(&texture_path).map_err(|error| format!("failed to read texture {}: {error}", texture_path.display()))?;
         (bytes, texture_path.to_string_lossy().into_owned())
     } else {
@@ -115,7 +229,7 @@ fn load_texture(texture: &ufbx::Texture, model_path: &Path, texture_roots: &[Pat
     let (width, height, rgba8) = decode_texture(&bytes, &filename)?;
     let texture_asset = Texture::from_rgba8(width, height, rgba8)?;
     texture_cache.insert(texture_id, texture_asset.clone());
-    Ok(texture_asset)
+    Ok(Some(texture_asset))
 }
 
 fn resolve_texture_path(texture: &ufbx::Texture, model_path: &Path, texture_roots: &[PathBuf]) -> Option<PathBuf> {

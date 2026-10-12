@@ -4,10 +4,10 @@ use std::path::Path;
 
 use building::{Building, LampSlot, MovingBox, distributed_lamps};
 use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, EulerRot, FontAsset, IrradianceMode, KeyCode, LightId, Material, PointLight, Quat, RadianceFieldResolution, RuntimeContext, Transform,
-    UiAnchor, UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run,
+    Application, Camera, CameraId, Color, DirectionalLight, FontAsset, IrradianceMode, LightId, Material, PointLight, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId,
+    UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run,
 };
-use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
+use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig, FreeCamera};
 
 const MAX_POINT_LIGHTS: usize = 7;
 const LAMP_TOTAL: f32 = 1.0;
@@ -61,8 +61,7 @@ struct GenosDemo {
     time: f32,
     box_time: f32,
     day: f32,
-    yaw: f32,
-    pitch: f32,
+    free_camera: FreeCamera,
     camera: Option<CameraId>,
     sun: Option<LightId>,
     lamps: Vec<LampEntity>,
@@ -74,7 +73,6 @@ struct GenosDemo {
 impl Application for GenosDemo {
     fn setup(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         context.irradiance_mode = IrradianceMode::AabbSdf;
-        context.gi_radiance_field_resolution = RadianceFieldResolution { resolution: [40, 10, 40] };
         context.render_settings.ambient_intensity = 0.0;
         self.build_scene(context);
         self.setup_ui(context)
@@ -141,8 +139,8 @@ impl GenosDemo {
         let mut camera = Camera { clear_color: Color::rgb(0.0, 0.0, 0.0), ..Camera::default() };
         camera.transform.position = Vec3::new(14.5, 1.7, 23.5);
         camera.look_at(Vec3::new(8.0, 3.2, 6.0));
-        self.yaw = self.yaw_from_camera(camera.transform.rotation);
-        self.pitch = 0.08;
+        let forward = camera.transform.rotation * Vec3::NEG_Z;
+        self.free_camera = FreeCamera::new((-forward.x).atan2(-forward.z), 0.08);
         let camera_id = context.scene.spawn_camera(camera);
         context.active_camera = Some(camera_id);
         self.camera = Some(camera_id);
@@ -323,44 +321,7 @@ impl GenosDemo {
     }
 
     fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32, movement_keys_active: bool) -> Result<(), String> {
-        if context.input.cursor_captured() {
-            let mouse = context.input.mouse_delta();
-            self.yaw -= mouse.x * 0.002;
-            self.pitch = (self.pitch - mouse.y * 0.002).clamp(-1.5, 1.5);
-        }
-        let camera_id = self.camera.ok_or("camera was not initialized")?;
-        let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was removed")?;
-        let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
-        let mut movement = Vec3::ZERO;
-        if !movement_keys_active {
-            if context.input.is_key_down(KeyCode::KeyW) {
-                movement += rotation * Vec3::NEG_Z;
-            }
-            if context.input.is_key_down(KeyCode::KeyS) {
-                movement += rotation * Vec3::Z;
-            }
-            if context.input.is_key_down(KeyCode::KeyD) {
-                movement += rotation * Vec3::X;
-            }
-            if context.input.is_key_down(KeyCode::KeyA) {
-                movement += rotation * Vec3::NEG_X;
-            }
-            if context.input.is_key_down(KeyCode::Space) {
-                movement += Vec3::Y;
-            }
-            if context.input.is_key_down(KeyCode::KeyC) {
-                movement -= Vec3::Y;
-            }
-        }
-        let speed = if context.input.is_key_down(KeyCode::ShiftLeft) { 20.0 } else { 5.0 };
-        camera.transform.rotation = rotation;
-        camera.transform.translate(movement.normalize_or_zero() * speed * delta_seconds);
-        Ok(())
-    }
-
-    fn yaw_from_camera(&self, rotation: Quat) -> f32 {
-        let forward = rotation * Vec3::NEG_Z;
-        (-forward.x).atan2(-forward.z)
+        self.free_camera.update(context, self.camera.ok_or("camera was not initialized")?, delta_seconds, movement_keys_active)
     }
 }
 
@@ -503,8 +464,7 @@ fn main() -> Result<(), String> {
             time: 0.0,
             box_time: 0.0,
             day: 0.12,
-            yaw: 0.0,
-            pitch: 0.0,
+            free_camera: FreeCamera::default(),
             camera: None,
             sun: None,
             lamps: Vec::new(),

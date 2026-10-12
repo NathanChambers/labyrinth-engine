@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/engine", "crates/math", "crates/mesh", "crates/renderer", "crates/scripting", "crates/debug_ui", "crates/asset_import", "examples/primitives", "examples/lighting", "examples/genos", "examples/control", "examples/fx"]
+members = ["crates/engine", "crates/math", "crates/mesh", "crates/renderer", "crates/scripting", "crates/debug_ui", "crates/asset_import", "examples/primitives", "examples/lighting", "examples/genos", "examples/control", "examples/cornell_box", "examples/sponza"]
 resolver = "3"
 
 [workspace.package]

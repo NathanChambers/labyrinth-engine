@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, Easing, EulerRot, FontAsset, GraphicsApi, KeyCode, LightId, MeshId, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId,
+    Application, Camera, CameraId, Color, DirectionalLight, Easing, FontAsset, GraphicsApi, IrradianceMode, LightId, MeshId, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId,
     UiLayout, UiSliderId, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run,
 };
-use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig};
+use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig, FreeCamera};
 
 const PROFILE_WARMUP_SECONDS: f32 = 2.0;
 
@@ -18,8 +18,7 @@ struct PrimitiveDemo {
     time_slider: Option<UiSliderId>,
     cube_rotation: Quat,
     sphere_time: f32,
-    camera_yaw: f32,
-    camera_pitch: f32,
+    free_camera: FreeCamera,
     light_angle: f32,
     font: Option<FontAsset>,
     debug_panels: Option<DebugPanels>,
@@ -82,7 +81,7 @@ impl PrimitiveDemo {
         context.active_lights = self.light.into_iter().collect();
         let camera_id = self.camera.ok_or("camera was not created")?;
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was not stored")?;
-        camera.transform.rotation = Quat::from_euler(EulerRot::YXZ, self.camera_yaw, self.camera_pitch, 0.0);
+        camera.transform.rotation = self.free_camera.rotation();
         Ok(())
     }
 
@@ -106,32 +105,7 @@ impl PrimitiveDemo {
     }
 
     fn update_camera(&mut self, context: &mut RuntimeContext, delta_seconds: f32, movement_keys_active: bool) -> Result<(), String> {
-        let mouse_delta = context.input.mouse_delta();
-        if context.input.cursor_captured() {
-            self.camera_yaw -= mouse_delta.x * 0.002;
-            self.camera_pitch = (self.camera_pitch - mouse_delta.y * 0.002).clamp(-1.5, 1.5);
-        }
-        let camera_id = self.camera.ok_or("camera was not initialized")?;
-        let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was removed before update")?;
-        let rotation = Quat::from_euler(EulerRot::YXZ, self.camera_yaw, self.camera_pitch, 0.0);
-        let mut movement = Vec3::ZERO;
-        if !movement_keys_active {
-            if context.input.is_key_down(KeyCode::KeyW) {
-                movement += rotation * Vec3::NEG_Z;
-            }
-            if context.input.is_key_down(KeyCode::KeyS) {
-                movement += rotation * Vec3::Z;
-            }
-            if context.input.is_key_down(KeyCode::KeyD) {
-                movement += rotation * Vec3::X;
-            }
-            if context.input.is_key_down(KeyCode::KeyA) {
-                movement += rotation * Vec3::NEG_X;
-            }
-        }
-        camera.transform.rotation = rotation;
-        camera.transform.translate(movement.normalize_or_zero() * (4.0 * delta_seconds));
-        Ok(())
+        self.free_camera.update(context, self.camera.ok_or("camera was not initialized")?, delta_seconds, movement_keys_active)
     }
 
     fn update_light(&mut self, context: &mut RuntimeContext, delta_seconds: f32) -> Result<(), String> {
@@ -160,6 +134,7 @@ impl PrimitiveDemo {
 impl Application for PrimitiveDemo {
     fn setup(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         self.setup_scene(context);
+        context.irradiance_mode = IrradianceMode::AabbSdf;
         self.setup_ui(context)?;
         self.setup_active_entities(context)
     }
@@ -252,8 +227,7 @@ fn main() -> Result<(), String> {
             time_slider: None,
             cube_rotation: Quat::IDENTITY,
             sphere_time: 0.0,
-            camera_yaw: 0.58,
-            camera_pitch: -0.33,
+            free_camera: FreeCamera::new(0.58, -0.33),
             light_angle: 0.0,
             font: None,
             debug_panels: None,

@@ -1,8 +1,10 @@
 use labyrinth::{Color, IrradianceMode, RenderDebugMode, RuntimeContext, UiAnchor, UiAutoLayout, UiButtonId, UiContainerId, UiGraphId, UiLabelId, UiLayout, UiPanelWindowId, Vec2};
 
+mod free_camera;
 mod radiance_inspector;
 mod surface_inspector;
 
+pub use free_camera::FreeCamera;
 pub use radiance_inspector::RadianceInspector;
 pub use surface_inspector::SurfaceInspector;
 
@@ -108,10 +110,13 @@ pub struct DebugPanels {
     gizmos_drawer: Drawer,
     display_mode_buttons: [UiButtonId; 4],
     gi_mode_button_container: UiContainerId,
+    gi_support_hint: UiContainerId,
     irradiance_row: UiContainerId,
     irradiance_button: UiButtonId,
     triangle_probe_occlusion_row: UiContainerId,
     triangle_probe_occlusion_button: UiButtonId,
+    probe_relocation_row: UiContainerId,
+    probe_relocation_button: UiButtonId,
     shadows_row: UiContainerId,
     shadows_button: UiButtonId,
     gizmos_row: UiContainerId,
@@ -123,6 +128,7 @@ pub struct DebugPanels {
     gi_gizmos_content: UiContainerId,
     global_probes_row: UiContainerId,
     global_probes_button: UiButtonId,
+    volume_gi_hint: UiContainerId,
     sdf_gizmos_content: UiContainerId,
     sdf_occupancy_row: UiContainerId,
     sdf_occupancy_button: UiButtonId,
@@ -161,22 +167,24 @@ impl DebugPanels {
             context.ui.register_window_panel(inspector_header, inspector_content, HEADER_HEIGHT)
         };
 
-        let display_mode_drawer = add_drawer(context, inspector_content, "DISPLAY MODE", 70.0);
+        let display_mode_drawer = add_drawer(context, inspector_content, "DISPLAY MODE", 24.0);
         let mode_row = context.ui.add_container(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 24.0)), UiAutoLayout::row(0.0, 6.0));
         let lit_button = add_mode_button(context, mode_row, "Lit", context.render_debug_mode == RenderDebugMode::LitMaterials);
         let unlit_button = add_mode_button(context, mode_row, "Unlit", context.render_debug_mode == RenderDebugMode::UnlitMaterials);
         let wire_button = add_mode_button(context, mode_row, "Wire", context.render_debug_mode == RenderDebugMode::Wireframe);
         let gi_mode_button_container = context.ui.add_container(Some(mode_row), UiLayout::new(Vec2::new(68.0, 22.0)), UiAutoLayout::row(0.0, 0.0));
-        let gi_support_button = add_mode_button(context, gi_mode_button_container, "GI Support", context.render_debug_mode == RenderDebugMode::GiSupport);
+        let gi_support_button = add_mode_button(context, gi_mode_button_container, "SDF Support", context.render_debug_mode == RenderDebugMode::GiSupport);
         let display_mode_buttons = [lit_button, unlit_button, wire_button, gi_support_button];
-        context.ui.add_label_layout(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 16.0)), "GI Support: R valid cells · G spatial weight", 9.0, Color::rgb(0.72, 0.76, 0.82));
-        context.ui.add_label_layout(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 16.0)), "B directional support · magenta no usable cells", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        let gi_support_hint = context.ui.add_container(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 32.0)), UiAutoLayout::column(0.0, 0.0));
+        context.ui.add_label_layout(Some(gi_support_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "SDF Support: R valid cells · G spatial", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        context.ui.add_label_layout(Some(gi_support_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "B directional · magenta means no usable cells", 9.0, Color::rgb(0.72, 0.76, 0.82));
 
-        let render_options_drawer = add_drawer(context, inspector_content, "RENDER OPTIONS", 3.0 * CHECKBOX_ROW_HEIGHT + 2.0 * DRAWER_CONTENT_SPACING);
+        let render_options_drawer = add_drawer(context, inspector_content, "RENDER OPTIONS", 4.0 * CHECKBOX_ROW_HEIGHT + 3.0 * DRAWER_CONTENT_SPACING);
         let render_options_content = render_options_drawer.content.expect("render options drawer content exists");
         let (irradiance_row, irradiance_button) = add_checkbox(context, render_options_content, "Global illumination", context.render_settings.irradiance_enabled);
         let (triangle_probe_occlusion_row, triangle_probe_occlusion_button) =
             add_checkbox(context, render_options_content, "Triangle probe occlusion", context.render_settings.triangle_probe_occlusion_enabled);
+        let (probe_relocation_row, probe_relocation_button) = add_checkbox(context, render_options_content, "Relocate GI probes", context.gi_radiance_probe_relocation_enabled);
         let (shadows_row, shadows_button) = add_checkbox(context, render_options_content, "Shadows", context.render_settings.shadows_enabled);
 
         let gizmo_content_height = 3.0 * CHECKBOX_ROW_HEIGHT + 2.0 * DRAWER_CONTENT_SPACING + config.extra_gizmo_content_height;
@@ -187,6 +195,9 @@ impl DebugPanels {
         let (lights_row, lights_button) = add_checkbox(context, gizmos_content, "Lights", context.light_gizmos_enabled);
         let gi_gizmos_content = context.ui.add_container(Some(gizmos_content), UiLayout::new(Vec2::new(0.0, 23.0)), UiAutoLayout::column(0.0, DRAWER_CONTENT_SPACING));
         let (global_probes_row, global_probes_button) = add_checkbox(context, gi_gizmos_content, "GI global probes", context.gi_global_gizmos_enabled);
+        let volume_gi_hint = context.ui.add_container(Some(gi_gizmos_content), UiLayout::new(Vec2::new(0.0, 34.0)), UiAutoLayout::column(0.0, 0.0));
+        context.ui.add_label_layout(Some(volume_gi_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "Volume GI: show gizmos for its probe grid.", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        context.ui.add_label_layout(Some(volume_gi_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "Ray inspectors currently require AABB-SDF GI.", 9.0, Color::rgb(0.72, 0.76, 0.82));
         let sdf_gizmos_content = context.ui.add_container(Some(gi_gizmos_content), UiLayout::new(Vec2::new(0.0, 70.0)), UiAutoLayout::column(0.0, DRAWER_CONTENT_SPACING));
         let (sdf_occupancy_row, sdf_occupancy_button) = add_checkbox(context, sdf_gizmos_content, "SDF occupied voxels", context.sdf_occupancy_gizmos_enabled);
         let radiance_inspector = RadianceInspector::new(context, sdf_gizmos_content);
@@ -219,10 +230,13 @@ impl DebugPanels {
             gizmos_drawer,
             display_mode_buttons,
             gi_mode_button_container,
+            gi_support_hint,
             irradiance_row,
             irradiance_button,
             triangle_probe_occlusion_row,
             triangle_probe_occlusion_button,
+            probe_relocation_row,
+            probe_relocation_button,
             shadows_row,
             shadows_button,
             gizmos_row,
@@ -234,6 +248,7 @@ impl DebugPanels {
             gi_gizmos_content,
             global_probes_row,
             global_probes_button,
+            volume_gi_hint,
             sdf_gizmos_content,
             sdf_occupancy_row,
             sdf_occupancy_button,
@@ -296,6 +311,7 @@ impl DebugPanels {
         }
         if context.irradiance_mode == IrradianceMode::AabbSdf && context.has_irradiance_source() {
             settings.triangle_probe_occlusion_enabled = read_checkbox(context, self.triangle_probe_occlusion_button, settings.triangle_probe_occlusion_enabled);
+            context.gi_radiance_probe_relocation_enabled = read_checkbox(context, self.probe_relocation_button, context.gi_radiance_probe_relocation_enabled);
         }
         settings.shadows_enabled = read_checkbox(context, self.shadows_button, settings.shadows_enabled);
         context.render_settings = settings;
@@ -347,23 +363,30 @@ impl DebugPanels {
         let gi_enabled = gi_source_available && context.render_settings.irradiance_enabled;
         let sdf_gi_available = gi_source_available && context.irradiance_mode == IrradianceMode::AabbSdf;
         let sdf_gi_enabled = sdf_gi_available && context.render_settings.irradiance_enabled;
-        if !gi_enabled && context.render_debug_mode == RenderDebugMode::GiSupport {
+        if !sdf_gi_enabled && context.render_debug_mode == RenderDebugMode::GiSupport {
             context.render_debug_mode = RenderDebugMode::LitMaterials;
         }
 
-        context.ui.set_container_visible(self.gi_mode_button_container, gi_enabled);
+        context.ui.set_container_visible(self.gi_mode_button_container, sdf_gi_enabled);
+        context.ui.set_container_visible(self.gi_support_hint, sdf_gi_enabled);
+        self.display_mode_drawer.content_height = 24.0 + if sdf_gi_enabled { 3.0 + 32.0 } else { 0.0 };
+        if let Some(content) = self.display_mode_drawer.content {
+            context.ui.set_container_size(content, Vec2::new(0.0, self.display_mode_drawer.content_height));
+        }
         context.ui.set_container_visible(self.irradiance_row, gi_source_available);
         context.ui.set_container_visible(self.triangle_probe_occlusion_row, sdf_gi_available);
+        context.ui.set_container_visible(self.probe_relocation_row, sdf_gi_available);
         context.ui.set_container_visible(self.shadows_row, true);
         context.ui.set_container_visible(self.gizmos_row, true);
         context.ui.set_container_visible(self.normals_row, true);
         context.ui.set_container_visible(self.lights_row, true);
         context.ui.set_container_visible(self.gi_gizmos_content, gi_enabled);
         context.ui.set_container_visible(self.global_probes_row, gi_enabled);
+        context.ui.set_container_visible(self.volume_gi_hint, gi_enabled && !sdf_gi_available);
         context.ui.set_container_visible(self.sdf_gizmos_content, sdf_gi_enabled);
         context.ui.set_container_visible(self.sdf_occupancy_row, sdf_gi_enabled);
 
-        let render_options_count = 1 + usize::from(gi_source_available) + usize::from(sdf_gi_available);
+        let render_options_count = 1 + usize::from(gi_source_available) + 2 * usize::from(sdf_gi_available);
         let render_options_height = render_options_count as f32 * CHECKBOX_ROW_HEIGHT + (render_options_count - 1) as f32 * DRAWER_CONTENT_SPACING;
         self.render_options_drawer.content_height = render_options_height;
         if let Some(content) = self.render_options_drawer.content {
@@ -372,7 +395,13 @@ impl DebugPanels {
 
         let sdf_content_height = CHECKBOX_ROW_HEIGHT + 2.0 * 22.0 + 2.0 * DRAWER_CONTENT_SPACING;
         context.ui.set_container_size(self.sdf_gizmos_content, Vec2::new(0.0, sdf_content_height));
-        let gi_content_height = if sdf_gi_enabled { CHECKBOX_ROW_HEIGHT + DRAWER_CONTENT_SPACING + sdf_content_height } else { CHECKBOX_ROW_HEIGHT };
+        let gi_content_height = if sdf_gi_enabled {
+            CHECKBOX_ROW_HEIGHT + DRAWER_CONTENT_SPACING + sdf_content_height
+        } else if gi_enabled {
+            CHECKBOX_ROW_HEIGHT + DRAWER_CONTENT_SPACING + 34.0
+        } else {
+            CHECKBOX_ROW_HEIGHT
+        };
         context.ui.set_container_size(self.gi_gizmos_content, Vec2::new(0.0, gi_content_height));
         let gizmo_row_count = if gi_enabled { 4 } else { 3 };
         let gizmo_content_height =
