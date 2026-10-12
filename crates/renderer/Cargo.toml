@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 bytemuck.workspace = true
 math = { path = "../math" }
+log.workspace = true
 mesh = { path = "../mesh" }
 pollster.workspace = true
 wgpu.workspace = true

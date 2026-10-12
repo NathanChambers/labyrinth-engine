@@ -154,14 +154,14 @@ impl GenosDemo {
         }
         self.apply_active_lights(context);
 
-        eprintln!(
-            "Genos stress scene: {}×{} sections, {} static props, {} moving boxes, {} point lights ({} moving)",
-            self.cols,
-            self.rows,
-            building.static_boxes.len(),
-            self.moving_boxes.len(),
-            self.light_count,
-            moving_count
+        labyrinth::info!(
+            columns = self.cols,
+            rows = self.rows,
+            static_props = building.static_boxes.len(),
+            moving_boxes = self.moving_boxes.len(),
+            point_lights = self.light_count,
+            moving_lights = moving_count;
+            "Genos stress scene ready"
         );
         self.update_sun(context);
     }

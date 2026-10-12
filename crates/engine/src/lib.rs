@@ -6,6 +6,7 @@ mod font;
 mod gi;
 mod gizmo;
 mod input;
+pub mod logging;
 pub mod primitives;
 mod scene;
 mod time;
@@ -28,6 +29,8 @@ pub use font::FontAsset;
 pub use gi::{IrradianceClipmapDesc, IrradianceClipmapLevel, IrradianceMode, IrradianceVolume, IrradianceVolumeDesc, IrradianceVolumeId, IrradianceVolumes};
 pub use gizmo::{GizmoCanvas, GizmoVertex};
 pub use input::InputState;
+pub use log::{debug, error, info, trace, warn};
+pub use logging::init_logging;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
 pub use mesh::{Material, Mesh, MeshInstance, MeshVertex};
 pub use renderer::{
@@ -209,6 +212,7 @@ fn display_radiance(value: f32) -> f32 {
 }
 
 pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: A) -> Result<(), String> {
+    init_logging();
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut context = RuntimeContext {
         scene: Scene::default(),
@@ -348,7 +352,7 @@ where
             return;
         }
 
-        eprintln!("Creating window");
+        info!(window_title:? = self.settings.title; "Creating window");
         let attributes = Window::default_attributes().with_title(self.settings.title.clone()).with_inner_size(LogicalSize::new(self.settings.width, self.settings.height));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
@@ -357,7 +361,7 @@ where
         self.window = Some(window.clone());
         self.context.input.set_cursor_captured(self.context.active_camera.is_some() && self.context.cursor_capture_on_scene_click);
         self.apply_cursor_mode(&window);
-        eprintln!("Initializing {:?} renderer", self.settings.graphics_api);
+        info!(graphics_api:? = self.settings.graphics_api; "Initializing renderer");
         apply_window_mode(&window, self.settings.mode);
         let camera = match self.context.active_camera {
             Some(id) => match self.context.scene.get_camera(id) {
@@ -380,7 +384,7 @@ where
             Ok(renderer) => renderer,
             Err(error) => return self.fail(event_loop, error),
         };
-        eprintln!("Renderer ready");
+        info!("Renderer ready");
         window.request_redraw();
         self.renderer = Some(renderer);
     }
@@ -653,7 +657,7 @@ fn apply_window_mode(window: &Window, mode: WindowMode) {
             Some(match video_mode {
                 Some(video_mode) if exclusive_mode_supported(window, &video_mode) => Fullscreen::Exclusive(video_mode),
                 _ => {
-                    eprintln!("Exclusive fullscreen unavailable; using borderless fullscreen");
+                    warn!("Exclusive fullscreen unavailable; using borderless fullscreen");
                     Fullscreen::Borderless(None)
                 }
             })

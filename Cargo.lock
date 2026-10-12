@@ -299,6 +299,7 @@ name = "control"
 version = "0.1.0"
 dependencies = [
  "labyrinth",
+ "labyrinth_debug_ui",
 ]
 
 [[package]]
@@ -766,6 +767,7 @@ name = "labyrinth"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "log",
  "math",
  "mesh",
  "png",
@@ -1575,6 +1577,7 @@ name = "renderer"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "log",
  "math",
  "mesh",
  "pollster",

@@ -23,6 +23,7 @@ selected field cell + Geometry/Radiance mode ──> latest-sample gizmo pass �
 clicked viewport pixel ──> depth-prepass depth + world normal + surface ID ──> shared GPU candidate evaluator + SDF voxel segment checks ──async weights and RGB contributions──> readback ──> renderer CPU exact transformed-triangle segment checks ──> per-probe mesh/SDF visibility comparison, hit triangle and hit geometry ──> GI Surface Inspector and diagnostic gizmos
 panel header input ──click/drag──> shared UI window state ──collapse/position/size──> shared panels and Genos inspector
 F1 key press ──> UI visibility mode ──skip normal UI vertices and input; preserve marked FPS label──> rendering
+windowing run ──initialize once──> logging ──UTC timestamp + level + target + key-values──> stderr or application-provided log backend
 uniform angular-region radiance field + relocation validity ──trilinear + soft receiver-plane weighting ──SDF voxel + direct scene-AABB segment filters + optional source-triangle BVH segment filter──> cosine-weighted angular integration──> full-resolution raster GI
 SDF build/upload timings + radiance-field GPU timing/availability ──> renderer performance stats ──> lighting diagnostics
 ```
@@ -36,6 +37,10 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Math](systems/math.md) | [Rendering](systems/rendering.md) | Camera matrix and vector operations | Initialization and resize |
 | [Windowing](systems/windowing.md) | [Math](systems/math.md) | Frame delta and registered time scales | Each update |
 | [Windowing](systems/windowing.md) | [Input](systems/input.md) | Keyboard, mouse, focus, and cursor events; capture is cleared on suspension and shutdown | Event loop and teardown |
+| [Windowing](systems/windowing.md) | [Logging](systems/logging.md) | Initializes the default structured logger before application setup | Each `run` call; an earlier application logger is preserved |
+| [Rendering](systems/rendering.md) | [Logging](systems/logging.md) | Renderer startup and first-present records through the shared facade | Renderer creation and first presented frame |
+| [Debug Capture](systems/capture.md) | [Logging](systems/logging.md) | Capture and performance-report output paths | After writing a capture or report |
+| Applications | [Logging](systems/logging.md) | Level macros with messages and structured key-values | Whenever an application emits a record |
 | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | [Windowing](systems/windowing.md) | Suppresses cursor capture on scene clicks while surface picking is armed | Pick mode |
 | [Input](systems/input.md) | [Primitives example](../examples/primitives/src/main.rs) | Key state and mouse delta | Each update |
 | [Input](systems/input.md) | [UI](systems/ui.md) | Cursor position and left-button state | Each frame |

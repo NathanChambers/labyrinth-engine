@@ -12,7 +12,43 @@ const DRAWER_HEADER_HEIGHT: f32 = 22.0;
 const CHECKBOX_ROW_HEIGHT: f32 = 20.0;
 const DRAWER_CONTENT_SPACING: f32 = 3.0;
 const PERFORMANCE_REFRESH_SECONDS: f32 = 0.25;
+const FPS_SAMPLE_SECONDS: f32 = 0.5;
 const PERFORMANCE_HEIGHT: f32 = 180.0;
+
+#[derive(Clone, Copy, Default)]
+pub struct FpsCounter {
+    elapsed_seconds: f32,
+    frame_count: u32,
+}
+
+impl FpsCounter {
+    pub fn update(&mut self, delta_seconds: f32) -> Option<f32> {
+        if !delta_seconds.is_finite() || delta_seconds <= 0.0 {
+            return None;
+        }
+
+        self.elapsed_seconds += delta_seconds;
+        self.frame_count += 1;
+        if self.elapsed_seconds < FPS_SAMPLE_SECONDS {
+            return None;
+        }
+
+        let fps = self.frame_count as f32 / self.elapsed_seconds;
+        self.elapsed_seconds = 0.0;
+        self.frame_count = 0;
+        Some(fps)
+    }
+}
+
+pub fn format_fps_counter(fps: f32) -> String {
+    format!("{fps:5.0}")
+}
+
+pub fn add_fps_counter_overlay(context: &mut RuntimeContext) -> UiLabelId {
+    let label = context.ui.add_label_layout(None, UiLayout::absolute(labyrinth::UiRect::new(8.0, 8.0, 56.0, 20.0)), "   --", 16.0, Color::WHITE);
+    context.ui.set_label_visible_when_debug_ui_hidden(label, true);
+    label
+}
 
 #[derive(Clone, Debug)]
 pub struct DebugPanelsConfig {
@@ -97,7 +133,8 @@ pub struct DebugPanels {
     fps_counter_label: UiLabelId,
     performance_graph: UiGraphId,
     frame_history: Vec<f32>,
-    smoothed_fps: f32,
+    fps_counter: FpsCounter,
+    fps: Option<f32>,
     performance_refresh_elapsed: f32,
     radiance_inspector: RadianceInspector,
     surface_inspector: SurfaceInspector,
@@ -171,8 +208,7 @@ impl DebugPanels {
         );
         let performance_label = context.ui.add_label_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 20.0)), "CPU --", 11.0, Color::rgb(0.62, 0.68, 0.78));
         let performance_frame_label = context.ui.add_label_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 20.0)), "FPS -- | Frame -- ms", 12.0, Color::WHITE);
-        let fps_counter_label = context.ui.add_label_layout(None, UiLayout::absolute(labyrinth::UiRect::new(8.0, 8.0, 56.0, 20.0)), "    0", 16.0, Color::WHITE);
-        context.ui.set_label_visible_when_debug_ui_hidden(fps_counter_label, true);
+        let fps_counter_label = add_fps_counter_overlay(context);
         let performance_graph = context.ui.add_graph_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 72.0)), Color::rgb(0.25, 0.75, 1.0), Color::rgba(0.05, 0.07, 0.1, 0.95));
         let performance_window = context.ui.register_panel_window(performance_panel, performance_header, performance_content, HEADER_HEIGHT);
 
@@ -208,7 +244,8 @@ impl DebugPanels {
             fps_counter_label,
             performance_graph,
             frame_history: Vec::new(),
-            smoothed_fps: 0.0,
+            fps_counter: FpsCounter::default(),
+            fps: None,
             performance_refresh_elapsed: 0.0,
             radiance_inspector,
             surface_inspector,
@@ -263,9 +300,11 @@ impl DebugPanels {
         self.movement_keys_active = self.radiance_inspector.update(context, sdf_gi_available);
         self.surface_inspector.update(context, sdf_gi_available);
 
-        let delta_seconds = context.time.delta_seconds().max(0.0001);
-        let fps = 1.0 / delta_seconds;
-        self.smoothed_fps = if self.smoothed_fps == 0.0 { fps } else { self.smoothed_fps + (fps - self.smoothed_fps) * 0.1 };
+        let delta_seconds = context.time.delta_seconds();
+        if let Some(fps) = self.fps_counter.update(delta_seconds) {
+            self.fps = Some(fps);
+            context.ui.set_label_text(self.fps_counter_label, format_fps_counter(fps));
+        }
         self.performance_refresh_elapsed += delta_seconds;
         self.frame_history.push(delta_seconds * 1000.0);
         if self.frame_history.len() > 48 {
@@ -278,8 +317,8 @@ impl DebugPanels {
                 self.performance_label,
                 format!("CPU {:.1} ms | SDF CPU {:.2} GPU {:.2} | GI {:.2} ms", stats.frame_cpu_ms, stats.sdf_build_cpu_ms, stats.gpu_sdf_update_ms, stats.gpu_sdf_gi_ms),
             );
-            context.ui.set_label_text(self.performance_frame_label, format!("FPS {:.1} | Frame {:.2} ms", self.smoothed_fps, delta_seconds * 1000.0));
-            context.ui.set_label_text(self.fps_counter_label, format!("{:5.0}", self.smoothed_fps));
+            let fps_text = self.fps.map_or_else(|| "--".into(), |fps| format!("{fps:.1}"));
+            context.ui.set_label_text(self.performance_frame_label, format!("FPS {fps_text} | Frame {:.2} ms", delta_seconds * 1000.0));
             context.ui.set_graph_values(self.performance_graph, &self.frame_history);
         }
     }

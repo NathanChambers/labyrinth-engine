@@ -6,6 +6,7 @@ Each implemented engine system gets one page named for its responsibility. Use [
 | --- | --- | --- |
 | [Windowing](windowing.md) | `crates/engine` | Implemented |
 | [Input](input.md) | `crates/engine` | Implemented |
+| [Logging](logging.md) | `crates/engine` | Implemented |
 | [UI](ui.md) | `crates/engine` | Implemented |
 | [Scene](scene.md) | `crates/engine` | Implemented |
 | [Math](math.md) | `crates/math` | Implemented |

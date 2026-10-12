@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use labyrinth::{Application, Color, FontAsset, RuntimeContext, UiAnchor, UiLabelId, UiLayout, Vec2, WindowSettings, run};
+use labyrinth::{Application, FontAsset, RuntimeContext, UiLabelId, WindowSettings, run};
+use labyrinth_debug_ui::{FpsCounter, add_fps_counter_overlay, format_fps_counter};
 
 const WARMUP_SECONDS: f32 = 2.0;
-const FPS_UPDATE_SECONDS: f32 = 0.5;
 
 struct ControlScene {
     profile_seconds: Option<f32>,
@@ -12,9 +12,7 @@ struct ControlScene {
     frame_intervals_ms: Vec<f32>,
     engine_frame_ms: Vec<f32>,
     fps_label: Option<UiLabelId>,
-    fps_initialized: bool,
-    fps_window_frames: u32,
-    fps_window_seconds: f32,
+    fps_counter: FpsCounter,
     font: Option<FontAsset>,
 }
 
@@ -27,9 +25,7 @@ impl ControlScene {
             frame_intervals_ms: Vec::new(),
             engine_frame_ms: Vec::new(),
             fps_label: None,
-            fps_initialized: false,
-            fps_window_frames: 0,
-            fps_window_seconds: 0.0,
+            fps_counter: FpsCounter::default(),
             font: None,
         }
     }
@@ -51,15 +47,7 @@ impl Application for ControlScene {
             let font = FontAsset::from_file(font_path)?;
             context.ui.set_font(font.clone());
             self.font = Some(font);
-            context.ui.set_window_layout(UiLayout::anchored(Vec2::ZERO, UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::ZERO));
-            context.ui.add_panel(UiLayout::anchored(Vec2::new(48.0, 22.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::ZERO), Color::rgba(0.02, 0.02, 0.025, 0.78));
-            self.fps_label = Some(context.ui.add_label_layout(
-                None,
-                UiLayout::anchored(Vec2::new(42.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(3.0, 2.0)),
-                "   --",
-                13.0,
-                Color::rgb(0.52, 1.0, 0.56),
-            ));
+            self.fps_label = Some(add_fps_counter_overlay(context));
         }
         context.ui_enabled = self.fps_counter_enabled;
         context.cursor_capture_on_scene_click = false;
@@ -70,19 +58,12 @@ impl Application for ControlScene {
         let delta_seconds = context.time.delta_seconds();
         let sample_frame = self.elapsed_seconds >= WARMUP_SECONDS;
         self.elapsed_seconds += delta_seconds;
-        if self.fps_counter_enabled && self.fps_initialized {
-            self.fps_window_frames += 1;
-            self.fps_window_seconds += delta_seconds;
-            if self.fps_window_seconds >= FPS_UPDATE_SECONDS {
-                let fps = self.fps_window_frames as f32 / self.fps_window_seconds;
-                if let Some(label) = self.fps_label {
-                    context.ui.set_label_text(label, format!("{fps:5.0}"));
-                }
-                self.fps_window_frames = 0;
-                self.fps_window_seconds = 0.0;
+        if self.fps_counter_enabled
+            && let Some(fps) = self.fps_counter.update(delta_seconds)
+        {
+            if let Some(label) = self.fps_label {
+                context.ui.set_label_text(label, format_fps_counter(fps));
             }
-        } else if self.fps_counter_enabled {
-            self.fps_initialized = true;
         }
         if self.profile_seconds.is_some() && sample_frame {
             self.frame_intervals_ms.push(delta_seconds * 1000.0);

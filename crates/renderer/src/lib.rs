@@ -1048,7 +1048,7 @@ impl Renderer {
         let surface_capabilities = surface.get_capabilities(&adapter);
         config.present_mode = if surface_capabilities.present_modes.contains(&wgpu::PresentMode::Immediate) { wgpu::PresentMode::Immediate } else { wgpu::PresentMode::AutoNoVsync };
         config.desired_maximum_frame_latency = 3;
-        eprintln!("Renderer present mode: {:?}; GPU timestamps: {}", config.present_mode, gpu_timestamps.is_some());
+        log::info!(present_mode:? = config.present_mode, gpu_timestamps = gpu_timestamps.is_some(); "Renderer configured");
         surface.configure(&device, &config);
         let shadow_bounds = combined_geometry_bounds(&geometry_bounds(instances));
 
@@ -3410,7 +3410,7 @@ impl Renderer {
             self.queue.submit(Some(encoder.finish()));
             self.queue.present(frame);
             if !self.has_presented {
-                eprintln!("First frame presented");
+                log::debug!("First frame presented");
                 self.has_presented = true;
             }
             return Ok(());
@@ -3492,7 +3492,7 @@ impl Renderer {
         }
         self.queue.present(frame);
         if !self.has_presented {
-            eprintln!("First frame presented");
+            log::debug!("First frame presented");
             self.has_presented = true;
         }
         Ok(())

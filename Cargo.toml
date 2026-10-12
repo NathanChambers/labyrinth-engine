@@ -13,5 +13,6 @@ glam = "0.30"
 png = "0.17"
 pollster = "0.4"
 rhai = "1.23"
+log = { version = "0.4.34", features = ["kv"] }
 wgpu = "30.0.1"
 winit = "0.30.13"

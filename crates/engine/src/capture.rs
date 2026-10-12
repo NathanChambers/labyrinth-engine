@@ -179,7 +179,7 @@ impl DebugCapture {
         write_depth_capture(&directory, file_name, "directional_shadow", &frame.directional_shadow, None)?;
         write_depth_capture(&directory, file_name, "spot_shadow", &frame.spot_shadow, None)?;
         write_depth_capture(&directory, file_name, "point_shadow", &frame.point_shadow, None)?;
-        eprintln!("Capture written to {}", path.display());
+        crate::info!(capture_path:? = path.display().to_string(); "Capture written");
         Ok(())
     }
 
@@ -229,7 +229,7 @@ impl DebugCapture {
             stats.triangle_bvh_triangle_count,
         );
         fs::write(&path, contents).map_err(|error| format!("failed to write performance report: {error}"))?;
-        eprintln!("Performance report written to {}", path.display());
+        crate::info!(report_path:? = path.display().to_string(); "Performance report written");
         Ok(())
     }
 
