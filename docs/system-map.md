@@ -32,6 +32,8 @@ Cornell Box and Sponza examples ──DebugPanels──> shared display-mode, re
 Primitives, Lighting, Genos, and Sponza ──camera id + input + inspector key-capture──> shared FreeCamera ──transform──> active scene camera
 F1 key press ──> UI visibility mode ──skip normal UI vertices and input; preserve marked FPS label──> rendering
 windowing run ──initialize once──> logging ──UTC timestamp + level + target + key-values──> stderr or application-provided log backend
+Codex MCP client ──stdio tools──> Labyrinth MCP adapter ──loopback pause/inspect/resume──> engine redraw thread ──completed frame + camera/grid coordinates──> renderer scene queries/GPU readback ──PNG or frame-tagged JSON──> MCP client
+Codex MCP client ──performance snapshot or bounded frame profile──> Labyrinth MCP adapter ──loopback request──> engine MCP profiler ──completed-frame samples──> renderer CPU/GPU performance stats ──frame-tagged JSON and percentiles──> MCP client
 uniform angular-region radiance field + relocation validity ──trilinear + soft receiver-plane weighting ──SDF voxel + direct scene-AABB segment filters + optional source-triangle BVH segment filter──> cosine-weighted angular integration──> full-resolution raster GI
 SDF build/upload timings + GPU per-cell sampled-region summaries ──30-frame async readback and CPU aggregation──> field coverage and scheduler performance stats ──> lighting diagnostics and capture reports
 ```
@@ -52,6 +54,8 @@ SDF build/upload timings + GPU per-cell sampled-region summaries ──30-frame 
 | [Windowing](systems/windowing.md) | [Logging](systems/logging.md) | Initializes the default structured logger before application setup | Each `run` call; an earlier application logger is preserved |
 | [Rendering](systems/rendering.md) | [Logging](systems/logging.md) | Renderer startup and first-present records through the shared facade | Renderer creation and first presented frame |
 | [Debug Capture](systems/capture.md) | [Logging](systems/logging.md) | Capture and performance-report output paths | After writing a capture or report |
+| [Renderer](systems/rendering.md) | [Debug MCP](systems/debug-mcp.md) | Renderer CPU phase stats, GI work counters, GPU pass timestamps, and triangle-BVH diagnostics | On performance query or each requested profile frame |
+| [Debug MCP](systems/debug-mcp.md) | [Renderer](systems/rendering.md) | One-shot GPU timestamp and diagnostic readback requests | Explicit performance query; optional per sampled frame |
 | Applications | [Logging](systems/logging.md) | Level macros with messages and structured key-values | Whenever an application emits a record |
 | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | [Windowing](systems/windowing.md) | Suppresses cursor capture on scene clicks while surface picking is armed | Pick mode |
 | [Input](systems/input.md) | [Primitives example](../examples/primitives/src/main.rs) | Key state and mouse delta | Each update |
@@ -101,6 +105,9 @@ SDF build/upload timings + GPU per-cell sampled-region summaries ──30-frame 
 | [Debug Capture](systems/capture.md) | [UI](systems/ui.md) | Scripted UI composition setting | Render-effects action |
 | [Rendering](systems/rendering.md) | [Profiling](systems/profiling.md) | CPU phase timings, GPU dirty-region SDF compute timing, and GPU debug markers | Each redraw |
 | [Debug Capture](systems/capture.md) | [Profiling](systems/profiling.md) | Scripted performance report | Report action |
+| Codex MCP client | [Debug MCP](systems/debug-mcp.md) | MCP tool calls to pause/resume, capture buffers, and query grids, pixels, voxels, and probes | While the trusted project MCP server is active |
+| [Debug MCP](systems/debug-mcp.md) | [Windowing](systems/windowing.md) | Loopback pause/resume/status and inspection requests; pause state and completed frame ID | After current frame render; inspections continue during paused waits |
+| [Debug MCP](systems/debug-mcp.md) | [Rendering](systems/rendering.md) | Active-camera captures, viewport pixel picks, SDF voxel values, and radiance probe values tagged with frame ID | Tool request |
 | [Application](../examples/lighting/src/main.rs) | [Irradiance volumes](systems/irradiance.md) | Volume bounds and probe resolution | Setup |
 | Application | [Rendering](systems/rendering.md) | Target radiance-field cell spacing in meters | Before renderer initialization |
 | [Windowing](systems/windowing.md) | [Irradiance volumes](systems/irradiance.md) | Active camera position used to snap authored irradiance clipmap bounds | Each redraw |

@@ -1,5 +1,7 @@
 # Profiling
 
+The Labyrinth Engine MCP exposes the existing renderer metrics through `get_performance_stats` for a one-frame snapshot and `profile_frames` for a bounded sequence of 1–120 upcoming frames. The frame profile reports per-frame CPU phase timings and work counters plus mean, p50, p95, p99, and maximum CPU frame time. GPU timestamps are omitted by default; enabling them requests synchronous readback on every sampled frame and can perturb frame pacing. See [Debug MCP](debug-mcp.md) for the tool contract and lifecycle.
+
 The renderer exposes CPU phase timings through `RendererPerformanceStats`. The debug panel displays overall frame CPU time, light and instance updates, probe updates, SDF update scheduling and enqueue times, rebuilt SDF voxel count, radiance-field availability, and the latest reported GPU timings. The GI radiance inspector can request a one-shot scene-pass GPU timing sample to inspect whole-scene GPU time. `frame_cpu_ms` measures the engine-side redraw path through submission; it does not include asynchronous GPU completion or display presentation time. When the adapter supports timestamp queries, reports include separate GPU timings for shadow, scene, world-space radiance-field update, dirty-region SDF compute, gizmo, and UI passes plus their total.
 
 Rhai capture scripts can write a report beside screenshots:

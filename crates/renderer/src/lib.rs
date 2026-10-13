@@ -656,6 +656,36 @@ pub struct RendererRadianceFieldGrid {
     pub resolution: [u32; 3],
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererSdfGrid {
+    pub minimum: [f32; 3],
+    pub maximum: [f32; 3],
+    pub resolution: [u32; 3],
+    pub voxel_size: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererViewportPick {
+    pub world_position: [f32; 3],
+    pub world_normal: [f32; 3],
+    pub distance: f32,
+    pub instance_index: u32,
+    pub triangle_index: u32,
+    pub barycentric: [f32; 3],
+    pub sdf_voxel: Option<[u32; 3]>,
+    pub radiance_cell: Option<[u32; 3]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RendererSdfVoxelDebug {
+    pub coordinate: [u32; 3],
+    pub world_position: [f32; 3],
+    pub signed_distance: f32,
+    pub albedo: [f32; 3],
+    pub emission: [f32; 3],
+    pub clearance: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RendererSkyLighting {
     pub color: Color,
@@ -749,6 +779,19 @@ pub struct RendererRadianceAngularSegment {
     pub sample_count: u32,
     pub attempt_count: u32,
     pub age_frames: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RendererRadianceProbeDebug {
+    pub coordinate: [u32; 3],
+    pub cell_center: [f32; 3],
+    pub probe_position: [f32; 3],
+    pub relocation_valid: bool,
+    pub relocation_succeeded: bool,
+    pub covered_once: u32,
+    pub covered_twice: u32,
+    pub attempted_regions: u32,
+    pub angular_segments: Vec<RendererRadianceAngularSegment>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -875,6 +918,7 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
+    pub surface_normals: Vec<[u8; 4]>,
     pub scene_depth: CapturedDepthBuffer,
     pub directional_shadow: CapturedDepthBuffer,
     pub spot_shadow: CapturedDepthBuffer,
@@ -1370,7 +1414,7 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::STORAGE_BINDING,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let sdf_emission_view = sdf_emission_texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D3), ..Default::default() });
@@ -1438,7 +1482,7 @@ impl Renderer {
         let radiance_field_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field probe relocation state"),
             contents: bytemuck::cast_slice(&radiance_field_probe_values),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
         let radiance_field_coverage_values = vec![[0_u32; 4]; radiance_field_grid_resolution.iter().product::<u32>() as usize];
         let radiance_field_coverage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2823,6 +2867,10 @@ impl Renderer {
         self.performance_stats.gi_cells_updated = 0;
         self.performance_stats.gi_rays_scheduled = 0;
         self.performance_stats.gi_angular_regions = self.radiance_angular_resolution.segment_count();
+        if self.surface_inspection_meshes_dirty {
+            self.surface_inspection_meshes = surface_inspection_meshes(instances);
+            self.surface_inspection_meshes_dirty = false;
+        }
         if !sdf_gi_enabled && (!self.render_settings.irradiance_enabled || volumes.is_empty()) {
             self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(false, self.sky_lighting)));
             self.performance_stats.probe_update_ms = 0.0;
@@ -2835,10 +2883,6 @@ impl Renderer {
             if self.sdf_geometry_cache_dirty {
                 self.sdf_geometry_cache = sdf_geometries(instances);
                 self.sdf_geometry_cache_dirty = false;
-            }
-            if self.surface_inspection_meshes_dirty {
-                self.surface_inspection_meshes = surface_inspection_meshes(instances);
-                self.surface_inspection_meshes_dirty = false;
             }
             if (self.render_settings.triangle_probe_occlusion_enabled || sdf_gi_enabled) && self.triangle_bvh_dirty {
                 if self.triangle_bvh_topology_dirty || !self.refit_triangle_bvh() {
@@ -3071,6 +3115,10 @@ impl Renderer {
         self.performance_stats
     }
 
+    pub fn gpu_timing_available(&self) -> bool {
+        self.gpu_timestamps.is_some()
+    }
+
     fn reset_radiance_field_coverage_stats(&mut self) {
         self.performance_stats.gi_region_coverage_percent = 0.0;
         self.performance_stats.gi_regions_covered_twice_percent = 0.0;
@@ -3131,6 +3179,178 @@ impl Renderer {
 
     pub fn radiance_field_grid(&self) -> RendererRadianceFieldGrid {
         self.radiance_field.grid()
+    }
+
+    pub fn viewport_size(&self) -> [u32; 2] {
+        [self.config.width, self.config.height]
+    }
+
+    pub fn sdf_grid(&self) -> RendererSdfGrid {
+        RendererSdfGrid {
+            minimum: self.sdf_clipmap.minimum.to_array(),
+            maximum: self.sdf_clipmap.maximum.to_array(),
+            resolution: self.sdf_clipmap.resolution,
+            voxel_size: self.sdf_clipmap.voxel_size.to_array(),
+        }
+    }
+
+    pub fn inspect_radiance_probe(&self, coordinate: [u32; 3]) -> Result<Option<RendererRadianceProbeDebug>, String> {
+        let resolution = self.radiance_field.resolution;
+        if coordinate.iter().zip(resolution).any(|(coordinate, count)| *coordinate >= count) {
+            return Ok(None);
+        }
+        let cell_index = self.radiance_field.index(coordinate) as u64;
+        let segment_count = self.radiance_angular_resolution.segment_count() as usize;
+        let samples_size = mem::size_of::<RadianceFieldAngularSample>() as u64 * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS as u64;
+        let probe_offset = samples_size;
+        let coverage_offset = probe_offset + mem::size_of::<[f32; 4]>() as u64;
+        let readback_size = coverage_offset + mem::size_of::<[u32; 4]>() as u64;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("radiance probe MCP readback"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("radiance probe MCP readback") });
+        encoder.copy_buffer_to_buffer(&self._radiance_field_buffer, cell_index * samples_size, &readback, 0, samples_size);
+        encoder.copy_buffer_to_buffer(&self._radiance_field_probe_buffer, cell_index * mem::size_of::<[f32; 4]>() as u64, &readback, probe_offset, mem::size_of::<[f32; 4]>() as u64);
+        encoder.copy_buffer_to_buffer(&self._radiance_field_coverage_buffer, cell_index * mem::size_of::<[u32; 4]>() as u64, &readback, coverage_offset, mem::size_of::<[u32; 4]>() as u64);
+        self.queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|error| error.to_string())?;
+        receiver.recv().map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+        let mapped = slice.get_mapped_range().map_err(|error| error.to_string())?;
+        let samples = bytemuck::cast_slice::<u8, RadianceFieldAngularSample>(&mapped[..samples_size as usize]);
+        let probe_position = bytemuck::from_bytes::<[f32; 4]>(&mapped[probe_offset as usize..coverage_offset as usize]);
+        let coverage = bytemuck::from_bytes::<[u32; 4]>(&mapped[coverage_offset as usize..readback_size as usize]);
+        let (bands, sectors) = self.radiance_angular_resolution.bands_and_sectors();
+        let angular_segments = samples
+            .iter()
+            .take(segment_count)
+            .enumerate()
+            .map(|(index, sample)| {
+                let band = index as u32 / sectors;
+                let sector = index as u32 % sectors;
+                let height = 1.0 - 2.0 * (band as f32 + 0.5) / bands as f32;
+                let azimuth = std::f32::consts::TAU * (sector as f32 + 0.5) / sectors as f32;
+                let radius = (1.0 - height * height).max(0.0).sqrt();
+                RendererRadianceAngularSegment {
+                    sampled: sample.sampling[0] > 0,
+                    direction: [radius * azimuth.cos(), height, radius * azimuth.sin()],
+                    radiance: [sample.radiance[0], sample.radiance[1], sample.radiance[2]],
+                    sample_count: sample.sampling[0],
+                    attempt_count: sample.sampling[1],
+                    age_frames: if sample.sampling[0] > 0 { self.radiance_field.frame_index.wrapping_sub(sample.sampling[2]) } else { u32::MAX },
+                }
+            })
+            .collect();
+        let center = self.radiance_field.minimum + (Vec3::from_array(coordinate.map(|value| value as f32)) + Vec3::splat(0.5)) * self.radiance_field.cell_size;
+        let result = RendererRadianceProbeDebug {
+            coordinate,
+            cell_center: center.to_array(),
+            probe_position: [probe_position[0], probe_position[1], probe_position[2]],
+            relocation_valid: coverage[3] > 0,
+            relocation_succeeded: probe_position[3] > 0.0,
+            covered_once: coverage[0],
+            covered_twice: coverage[1],
+            attempted_regions: coverage[2],
+            angular_segments,
+        };
+        drop(mapped);
+        readback.unmap();
+        Ok(Some(result))
+    }
+
+    pub fn inspect_sdf_voxel(&self, coordinate: [u32; 3]) -> Result<Option<RendererSdfVoxelDebug>, String> {
+        if coordinate.iter().zip(self.sdf_clipmap.resolution).any(|(coordinate, count)| *coordinate >= count) {
+            return Ok(None);
+        }
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("SDF voxel MCP readback"),
+            size: 768,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let origin = wgpu::Origin3d { x: coordinate[0], y: coordinate[1], z: coordinate[2] };
+        let extent = wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
+        let layout = |offset| wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(256), rows_per_image: Some(1) };
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("SDF voxel MCP readback") });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_texture, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &readback, layout: layout(0) },
+            extent,
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_emission_texture, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &readback, layout: layout(256) },
+            extent,
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self._sdf_clearance_texture, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &readback, layout: layout(512) },
+            extent,
+        );
+        self.queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|error| error.to_string())?;
+        receiver.recv().map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+        let mapped = slice.get_mapped_range().map_err(|error| error.to_string())?;
+        let sdf = bytemuck::from_bytes::<[f32; 4]>(&mapped[0..16]);
+        let emission = bytemuck::from_bytes::<[f32; 4]>(&mapped[256..272]);
+        let clearance = bytemuck::from_bytes::<f32>(&mapped[512..516]);
+        let world_position = self.sdf_clipmap.minimum + (Vec3::from_array(coordinate.map(|value| value as f32)) + Vec3::splat(0.5)) * self.sdf_clipmap.voxel_size;
+        let result = RendererSdfVoxelDebug {
+            coordinate,
+            world_position: world_position.to_array(),
+            signed_distance: sdf[0],
+            albedo: [sdf[1], sdf[2], sdf[3]],
+            emission: [emission[0], emission[1], emission[2]],
+            clearance: *clearance,
+        };
+        drop(mapped);
+        readback.unmap();
+        Ok(Some(result))
+    }
+
+    pub fn pick_viewport_pixel(&self, camera: &Camera, x: u32, y: u32, width: u32, height: u32) -> Option<RendererViewportPick> {
+        let width = if width == 0 { self.config.width } else { width };
+        let height = if height == 0 { self.config.height } else { height };
+        if width == 0 || height == 0 || x >= width || y >= height {
+            return None;
+        }
+        let normalized = Vec3::new(2.0 * (x as f32 + 0.5) / width as f32 - 1.0, 1.0 - 2.0 * (y as f32 + 0.5) / height as f32, -1.0);
+        let aspect = width as f32 / height as f32;
+        let tangent = (camera.field_of_view_y.to_radians() * 0.5).tan();
+        let local_direction = Vec3::new(normalized.x * aspect * tangent, normalized.y * tangent, -1.0).normalize();
+        let ray_origin = camera.transform.position;
+        let ray_direction = (camera.transform.rotation * local_direction).normalize();
+        let hit = closest_surface_triangle_hit(ray_origin, ray_origin + ray_direction * camera.far_clip, &self.surface_inspection_meshes)?;
+        let position = hit.position;
+        let sdf_minimum = self.sdf_clipmap.minimum;
+        let sdf_maximum = self.sdf_clipmap.maximum;
+        let sdf_voxel =
+            if position.cmpge(sdf_minimum).all() && position.cmplt(sdf_maximum).all() { Some(((position - sdf_minimum) / self.sdf_clipmap.voxel_size).floor().as_uvec3().to_array()) } else { None };
+        let radiance_minimum = self.radiance_field.minimum;
+        let radiance_maximum = self.radiance_field.maximum;
+        let radiance_cell = if position.cmpge(radiance_minimum).all() && position.cmplt(radiance_maximum).all() { Some(self.radiance_field.cell_coordinate(position)) } else { None };
+        Some(RendererViewportPick {
+            world_position: position.to_array(),
+            world_normal: hit.normal.to_array(),
+            distance: hit.distance,
+            instance_index: hit.instance_index,
+            triangle_index: hit.triangle_index,
+            barycentric: hit.barycentric.to_array(),
+            sdf_voxel,
+            radiance_cell,
+        })
     }
 
     pub fn shadow_requests(&self) -> &[ShadowRequest] {
@@ -3584,6 +3804,38 @@ impl Renderer {
     }
 
     pub fn capture(&mut self, camera: &Camera, width: u32, height: u32) -> Result<CapturedFrame, String> {
+        self.capture_with_debug_mode(camera, width, height, self.render_debug_mode)
+    }
+
+    pub fn capture_current_with_debug_mode(&mut self, camera: &Camera, debug_mode: RenderDebugMode) -> Result<CapturedFrame, String> {
+        self.capture_with_debug_mode(camera, self.config.width, self.config.height, debug_mode)
+    }
+
+    pub fn capture_current(&mut self, camera: &Camera) -> Result<CapturedFrame, String> {
+        self.capture(camera, self.config.width, self.config.height)
+    }
+
+    pub fn capture_with_debug_mode(&mut self, camera: &Camera, width: u32, height: u32, debug_mode: RenderDebugMode) -> Result<CapturedFrame, String> {
+        self.capture_inner(camera, width, height, debug_mode, true)
+    }
+
+    pub fn capture_current_read_only(&mut self, camera: &Camera) -> Result<CapturedFrame, String> {
+        self.capture_read_only_with_debug_mode(camera, self.config.width, self.config.height, self.render_debug_mode)
+    }
+
+    pub fn capture_read_only(&mut self, camera: &Camera, width: u32, height: u32) -> Result<CapturedFrame, String> {
+        self.capture_read_only_with_debug_mode(camera, width, height, self.render_debug_mode)
+    }
+
+    pub fn capture_current_read_only_with_debug_mode(&mut self, camera: &Camera, debug_mode: RenderDebugMode) -> Result<CapturedFrame, String> {
+        self.capture_read_only_with_debug_mode(camera, self.config.width, self.config.height, debug_mode)
+    }
+
+    pub fn capture_read_only_with_debug_mode(&mut self, camera: &Camera, width: u32, height: u32, debug_mode: RenderDebugMode) -> Result<CapturedFrame, String> {
+        self.capture_inner(camera, width, height, debug_mode, false)
+    }
+
+    fn capture_inner(&mut self, camera: &Camera, width: u32, height: u32, debug_mode: RenderDebugMode, update_gi: bool) -> Result<CapturedFrame, String> {
         let width = width.max(1);
         let height = height.max(1);
         let format = self.config.format;
@@ -3604,7 +3856,7 @@ impl Renderer {
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (depth_texture, depth_view) = create_depth_texture(&self.device, width, height);
         let (depth_sample_texture, depth_sample_view) = create_depth_sample_texture(&self.device, width, height);
-        let (_surface_normal_texture, surface_normal_view) = create_surface_normal_texture(&self.device, width, height);
+        let (surface_normal_texture, surface_normal_view) = create_surface_normal_texture(&self.device, width, height);
         let (_surface_id_texture, surface_id_view) = create_surface_id_texture(&self.device, width, height);
         let capture_depth_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("capture depth bind group"),
@@ -3620,7 +3872,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 7, resource: self.triangle_bvh_diagnostics_buffer.as_entire_binding() },
             ],
         });
-        let capture_uniform = camera_uniform(width, height, camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
+        let capture_uniform = camera_uniform(width, height, camera, &self.lights, debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&capture_uniform));
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
         let bytes_per_pixel = 4_u32;
@@ -3630,6 +3882,14 @@ impl Renderer {
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("capture readback"),
             size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let normal_unpadded_bytes_per_row = width * 8;
+        let normal_padded_bytes_per_row = normal_unpadded_bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let normal_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture surface normal readback"),
+            size: u64::from(normal_padded_bytes_per_row) * u64::from(height),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -3660,10 +3920,10 @@ impl Renderer {
             wgpu::TexelCopyTextureInfo { texture: &depth_sample_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
-        if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
+        if update_gi && self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
             self.render_world_radiance_field_pass(&mut encoder, &capture_depth_bind_group);
         }
-        self.render_scene_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group);
+        self.render_scene_pass(&mut encoder, &color_view, &depth_view, &capture_depth_bind_group, debug_mode);
         encoder.pop_debug_group();
         if self.gizmo_vertex_count > 0 {
             self.render_gizmo_pass(&mut encoder, &color_view, &depth_view);
@@ -3679,6 +3939,11 @@ impl Renderer {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: &depth_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::DepthOnly },
             wgpu::TexelCopyBufferInfo { buffer: &scene_depth_readback, layout: depth_copy_layout(width, height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &surface_normal_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &normal_readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(normal_padded_bytes_per_row), rows_per_image: Some(height) } },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         if let Some(readbacks) = &directional_depth_readbacks {
@@ -3728,6 +3993,29 @@ impl Renderer {
         drop(mapped);
         readback.unmap();
 
+        let normal_slice = normal_readback.slice(..);
+        let (normal_sender, normal_receiver) = mpsc::channel();
+        normal_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = normal_sender.send(result);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|error| error.to_string())?;
+        normal_receiver.recv().map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+        let normal_mapped = normal_slice.get_mapped_range().map_err(|error| error.to_string())?;
+        let mut surface_normals = Vec::with_capacity((width * height) as usize);
+        for row in normal_mapped.chunks_exact(normal_padded_bytes_per_row as usize).take(height as usize) {
+            for pixel in row[..normal_unpadded_bytes_per_row as usize].as_chunks::<2>().0.chunks_exact(4) {
+                let normal = Vec3::new(f16_to_f32(u16::from_le_bytes(pixel[0])), f16_to_f32(u16::from_le_bytes(pixel[1])), f16_to_f32(u16::from_le_bytes(pixel[2])));
+                surface_normals.push([
+                    ((normal.x * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ((normal.y * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ((normal.z * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    255,
+                ]);
+            }
+        }
+        drop(normal_mapped);
+        normal_readback.unmap();
+
         let scene_depth = CapturedDepthBuffer { width, height, layers: vec![read_depth_buffer(&self.device, &scene_depth_readback, width, height)?] };
         let directional_shadow = CapturedDepthBuffer {
             width: SHADOW_MAP_SIZE,
@@ -3756,7 +4044,7 @@ impl Renderer {
         let current_camera_uniform = camera_uniform(self.config.width, self.config.height, &self.camera, &self.lights, self.render_debug_mode, self.render_settings, self.shadow_bounds);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&current_camera_uniform));
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
-        Ok(CapturedFrame { width, height, rgba8, scene_depth, directional_shadow, spot_shadow, point_shadow })
+        Ok(CapturedFrame { width, height, rgba8, surface_normals, scene_depth, directional_shadow, spot_shadow, point_shadow })
     }
 
     fn update_sdf_gpu(&mut self, update: &SdfClipmapUpdate) {
@@ -3969,7 +4257,7 @@ impl Renderer {
                 encoder.copy_buffer_to_buffer(&self.radiance_surface_inspection_values_buffer, 0, &self.radiance_surface_inspection_readback_buffer, 0, RADIANCE_SURFACE_INSPECTION_SIZE);
             }
         }
-        self.render_scene_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group);
+        self.render_scene_pass(&mut encoder, &color_view, &self.depth_view, &self.depth_bind_group, self.render_debug_mode);
         encoder.pop_debug_group();
         if self.gizmo_vertex_count > 0 {
             self.render_gizmo_pass(&mut encoder, &color_view, &self.depth_view);
@@ -4061,7 +4349,7 @@ impl Renderer {
         }
     }
 
-    fn render_scene_pass(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, depth_view: &wgpu::TextureView, depth_bind_group: &wgpu::BindGroup) {
+    fn render_scene_pass(&self, encoder: &mut wgpu::CommandEncoder, color_view: &wgpu::TextureView, depth_view: &wgpu::TextureView, depth_bind_group: &wgpu::BindGroup, debug_mode: RenderDebugMode) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4095,7 +4383,7 @@ impl Renderer {
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_bind_group(1, depth_bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        if self.render_debug_mode == RenderDebugMode::Wireframe {
+        if debug_mode == RenderDebugMode::Wireframe {
             pass.set_pipeline(&self.wireframe_pipeline);
             pass.set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             for batch in &self.mesh_draw_batches {
@@ -4959,6 +5247,19 @@ fn read_depth_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer, width: u32, h
     Ok(values)
 }
 
+fn f16_to_f32(value: u16) -> f32 {
+    let sign = if value & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = (value >> 10) & 0x1f;
+    let fraction = value & 0x03ff;
+    match exponent {
+        0 if fraction == 0 => 0.0,
+        0 => sign * (f32::from(fraction) / 1024.0) * 2.0_f32.powi(-14),
+        0x1f if fraction == 0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => sign * (1.0 + f32::from(fraction) / 1024.0) * 2.0_f32.powi(i32::from(exponent) - 15),
+    }
+}
+
 fn create_depth_sample_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth sample texture"),
@@ -4982,7 +5283,7 @@ fn create_surface_normal_texture(device: &wgpu::Device, width: u32, height: u32)
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -5658,6 +5959,16 @@ impl WorldRadianceField {
 
     fn cell_count(&self) -> usize {
         self.resolution.iter().product::<u32>() as usize
+    }
+
+    fn index(&self, coordinate: [u32; 3]) -> usize {
+        coordinate[0] as usize + coordinate[1] as usize * self.resolution[0] as usize + coordinate[2] as usize * self.resolution[0] as usize * self.resolution[1] as usize
+    }
+
+    fn cell_coordinate(&self, position: Vec3) -> [u32; 3] {
+        let coordinate =
+            ((position - self.minimum) / self.cell_size).floor().clamp(Vec3::ZERO, Vec3::new(self.resolution[0] as f32 - 1.0, self.resolution[1] as f32 - 1.0, self.resolution[2] as f32 - 1.0));
+        [coordinate.x as u32, coordinate.y as u32, coordinate.z as u32]
     }
 
     fn new(scene_bounds: GeometryBounds, cell_size: f32) -> Self {

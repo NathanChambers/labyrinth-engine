@@ -17,5 +17,6 @@ Each implemented engine system gets one page named for its responsibility. Use [
 | [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Two-bounce authored volumes and experimental single-bounce triangle-surface SDF with a scene-bounded radiance field, a dynamic-scene scheduler, measured coverage, and probe relocation enabled by default |
 | [Scripting](scripting.md) | `crates/scripting` | Implemented for debug capture |
 | [Debug Capture](capture.md) | `crates/engine`, `crates/renderer` | Implemented |
+| [Debug MCP](debug-mcp.md) | `crates/engine`, `crates/renderer`, `tools/labyrinth_mcp` | Implemented for frame pause/resume, render capture, scene-grid inspection, performance snapshots, and bounded frame profiling |
 
 System pages describe observed behavior and link to source paths. When a change alters ownership, a public contract, lifecycle, or cross-system flow, update the affected page and map together. World, broader gameplay scripting, runtime coordination, editor tooling, and project tools remain proposals in [project-layout.md](../project-layout.md).

@@ -7,6 +7,7 @@ mod gi;
 mod gizmo;
 mod input;
 pub mod logging;
+mod mcp_debug;
 pub mod primitives;
 mod scene;
 mod time;
@@ -36,7 +37,7 @@ pub use mesh::{Material, Mesh, MeshInstance, MeshVertex, Texture};
 pub use renderer::{
     GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldCellSize, RenderDebugMode, RenderSettings,
     RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceAngularSegment, RendererRadianceFieldGrid,
-    RendererRadianceSurfaceCandidate, RendererRadianceSurfaceInspection, RendererSkyLighting, ShadowQuality,
+    RendererRadianceProbeDebug, RendererRadianceSurfaceCandidate, RendererRadianceSurfaceInspection, RendererSdfGrid, RendererSdfVoxelDebug, RendererSkyLighting, RendererViewportPick, ShadowQuality,
 };
 pub use scene::{CameraId, LightId, MeshId, Scene};
 pub use time::{Time, TimeScaleId};
@@ -265,7 +266,21 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         let source = std::fs::read_to_string(path).map_err(|error| format!("failed to read debug script: {error}"))?;
         context.debug_capture = Some(DebugCapture::from_script(&source, settings.debug_capture_root.clone())?);
     }
-    let mut runner = Runner { settings, application, context, fallback_camera: Camera::default(), last_frame: Instant::now(), window: None, renderer: None, failure: None };
+    let mcp_requests = mcp_debug::start_from_env()?;
+    let mut runner = Runner {
+        settings,
+        application,
+        context,
+        fallback_camera: Camera::default(),
+        last_frame: Instant::now(),
+        window: None,
+        renderer: None,
+        mcp_requests,
+        mcp_profiler: mcp_debug::McpProfiler::default(),
+        mcp_paused: false,
+        completed_frame_id: 0,
+        failure: None,
+    };
     let event_loop_result = event_loop.run_app(&mut runner).map_err(|error| error.to_string());
     runner.release_cursor();
     runner.application.cleanup(&mut runner.context);
@@ -284,6 +299,10 @@ struct Runner<A> {
     last_frame: Instant,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    mcp_requests: Option<std::sync::mpsc::Receiver<mcp_debug::McpDebugRequest>>,
+    mcp_profiler: mcp_debug::McpProfiler,
+    mcp_paused: bool,
+    completed_frame_id: u64,
     failure: Option<String>,
 }
 
@@ -335,12 +354,35 @@ impl<A> Runner<A> {
     }
 
     fn apply_cursor_mode(&self, window: &Window) {
-        if self.context.input.cursor_captured() {
-            let _ = window.set_cursor_grab(CursorGrabMode::Confined).or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
-            window.set_cursor_visible(false);
-        } else {
-            let _ = window.set_cursor_grab(CursorGrabMode::None);
-            window.set_cursor_visible(true);
+        apply_cursor_mode(&self.context.input, window);
+    }
+
+    fn service_paused_mcp_requests(&mut self) {
+        let Some(requests) = &self.mcp_requests else {
+            return;
+        };
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        let camera = match self.context.active_camera {
+            Some(id) => match self.context.scene.get_camera(id) {
+                Some(camera) => camera,
+                None => return,
+            },
+            None => &self.fallback_camera,
+        };
+        let was_paused = self.mcp_paused;
+        mcp_debug::process_requests(requests, renderer, camera, &self.settings.debug_capture_root, &mut self.mcp_paused, self.completed_frame_id, &mut self.mcp_profiler);
+        if !was_paused && self.mcp_paused {
+            self.context.input.clear_keys();
+            self.context.input.set_left_mouse_down(false);
+            self.release_cursor();
+        }
+        if was_paused && !self.mcp_paused {
+            self.last_frame = Instant::now();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 }
@@ -392,8 +434,16 @@ where
         self.renderer = Some(renderer);
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.mcp_paused {
+            self.service_paused_mcp_requests();
+            if self.mcp_paused {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + std::time::Duration::from_millis(20)));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+        } else if let Some(window) = &self.window {
+            event_loop.set_control_flow(ControlFlow::Poll);
             window.request_redraw();
         }
     }
@@ -405,7 +455,8 @@ where
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: winit::event::DeviceId, event: DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta } = event
+        if !self.mcp_paused
+            && let DeviceEvent::MouseMotion { delta } = event
             && self.context.input.cursor_captured()
         {
             self.context.input.add_mouse_delta(Vec2::new(delta.0 as f32, delta.1 as f32));
@@ -417,6 +468,9 @@ where
             return;
         };
         if window.id() != window_id {
+            return;
+        }
+        if self.mcp_paused && !matches!(&event, WindowEvent::CloseRequested | WindowEvent::Focused(false) | WindowEvent::Resized(_) | WindowEvent::RedrawRequested) {
             return;
         }
 
@@ -475,6 +529,10 @@ where
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                if self.mcp_paused {
+                    self.service_paused_mcp_requests();
+                    return;
+                }
                 let frame_start = Instant::now();
                 let delta_seconds = self.last_frame.elapsed().as_secs_f32();
                 self.last_frame = Instant::now();
@@ -597,6 +655,7 @@ where
                         renderer.update_gizmos(&gizmo_vertices);
                         renderer.update_ui(&ui_vertices);
                         renderer.render()?;
+                        self.completed_frame_id = self.completed_frame_id.wrapping_add(1);
                         self.context.gi_trace_diagnostics = renderer.gi_trace_diagnostics();
                         self.context.gi_angular_segments = renderer.radiance_angular_segments();
                         self.context.gi_angular_segments_cell = renderer.radiance_angular_segments_cell();
@@ -628,6 +687,20 @@ where
                             capture.capture_pending(renderer, camera)?;
                             capture.report_pending(renderer)?;
                         }
+                        if let Some(requests) = &self.mcp_requests {
+                            let camera = match self.context.active_camera {
+                                Some(id) => self.context.scene.get_camera(id).ok_or("active camera was removed before MCP capture")?,
+                                None => &self.fallback_camera,
+                            };
+                            let was_paused = self.mcp_paused;
+                            mcp_debug::process_requests(requests, renderer, camera, &self.settings.debug_capture_root, &mut self.mcp_paused, self.completed_frame_id, &mut self.mcp_profiler);
+                            if !was_paused && self.mcp_paused {
+                                self.context.input.clear_keys();
+                                self.context.input.set_left_mouse_down(false);
+                                self.context.input.set_cursor_captured(false);
+                                apply_cursor_mode(&self.context.input, window);
+                            }
+                        }
                         Ok(())
                     });
                     if let Err(error) = result {
@@ -636,7 +709,9 @@ where
                         event_loop.exit();
                     } else {
                         self.context.input.clear_frame();
-                        window.request_redraw();
+                        if !self.mcp_paused {
+                            window.request_redraw();
+                        }
                     }
                 }
             }
@@ -669,6 +744,16 @@ fn apply_window_mode(window: &Window, mode: WindowMode) {
         }
     };
     window.set_fullscreen(fullscreen);
+}
+
+fn apply_cursor_mode(input: &InputState, window: &Window) {
+    if input.cursor_captured() {
+        let _ = window.set_cursor_grab(CursorGrabMode::Confined).or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked));
+        window.set_cursor_visible(false);
+    } else {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
+    }
 }
 
 #[cfg(windows)]
