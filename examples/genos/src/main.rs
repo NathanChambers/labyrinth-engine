@@ -151,7 +151,7 @@ impl GenosDemo {
 
         let moving_count = ((self.light_count as f32 * self.dynamic_percent as f32 / 100.0).round() as usize).min(self.light_count);
         let moving_set = moving_set(self.light_count, moving_count);
-        let intensity = LAMP_TOTAL / self.light_count as f32;
+        let intensity = if self.light_count == 0 { 0.0 } else { LAMP_TOTAL / self.light_count as f32 };
         for (index, slot) in lamp_slots.into_iter().enumerate() {
             let range = lamp_range(intensity);
             let light = PointLight { position: slot.home, color: slot.tint, intensity, range };
@@ -229,7 +229,7 @@ impl GenosDemo {
         if let Some(sun_id) = self.sun
             && let Some(sun) = context.scene.get_directional_light_mut(sun_id)
         {
-            sun.direction = -Vec3::new(angle.cos(), elevation, -0.45).normalize();
+            sun.direction = Vec3::new(angle.cos(), elevation, -0.45).normalize();
             sun.color = Color::rgb(2.0, 1.9, 1.7);
             sun.intensity = fade;
         }
@@ -413,6 +413,8 @@ fn main() -> Result<(), String> {
     let mut light_count = 5;
     let mut dynamic_percent = 50;
     let mut sun_speed = 1.0;
+    let mut start_time = clock_hours(0.12);
+    let mut sky_on = true;
     let mut seed = 1;
     let mut boxes_still = false;
     let mut debug_script = None;
@@ -423,20 +425,22 @@ fn main() -> Result<(), String> {
             "--lights" => light_count = args.next().ok_or("--lights needs a value")?.parse().map_err(|_| "invalid --lights value")?,
             "--dynamic" => dynamic_percent = args.next().ok_or("--dynamic needs a value")?.parse().map_err(|_| "invalid --dynamic value")?,
             "--sun-speed" => sun_speed = args.next().ok_or("--sun-speed needs a value")?.parse().map_err(|_| "invalid --sun-speed value")?,
+            "--time" => start_time = args.next().ok_or("--time needs a value")?.parse().map_err(|_| "invalid --time value")?,
+            "--no-sky" => sky_on = false,
             "--seed" => seed = args.next().ok_or("--seed needs a value")?.parse().map_err(|_| "invalid --seed value")?,
             "--boxes-still" => boxes_still = true,
             argument if argument.starts_with("--capture-script=") => debug_script = Some(argument.trim_start_matches("--capture-script=").into()),
             "--help" | "-h" => {
                 println!(
-                    "genos [--scale small|big|N|NxM] [--lights 1..7] [--dynamic 0..100] [--sun-speed 0|1|4|16] [--seed N] [--boxes-still] [--capture-script=PATH]\nClick to capture mouse; WASD + mouse to fly, Space/C to rise or descend, Shift to move faster. Escape releases the mouse."
+                    "genos [--scale small|big|N|NxM] [--lights 0..7] [--dynamic 0..100] [--sun-speed 0|1|4|16] [--time 0..24] [--no-sky] [--seed N] [--boxes-still] [--capture-script=PATH]\nClick to capture mouse; WASD + mouse to fly, Space/C to rise or descend, Shift to move faster. Escape releases the mouse."
                 );
                 return Ok(());
             }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
-    if !(1..=MAX_POINT_LIGHTS).contains(&light_count) {
-        return Err(format!("--lights must be between 1 and {MAX_POINT_LIGHTS}; the renderer supports eight active lights including the sun"));
+    if light_count > MAX_POINT_LIGHTS {
+        return Err(format!("--lights must be between 0 and {MAX_POINT_LIGHTS}; the renderer supports eight active lights including the sun"));
     }
     if dynamic_percent > 100 {
         return Err("--dynamic must be from 0 to 100".into());
@@ -444,6 +448,10 @@ fn main() -> Result<(), String> {
     if !SUN_SPEEDS.contains(&sun_speed) {
         return Err("--sun-speed must be one of 0, 1, 4, or 16".into());
     }
+    if !start_time.is_finite() || !(0.0..24.0).contains(&start_time) {
+        return Err("--time must be from 0 inclusive to 24 exclusive".into());
+    }
+    let start_day = ((start_time - 6.0) / 24.0).rem_euclid(1.0);
 
     let mut settings = WindowSettings::default();
     settings.title = "Genos lighting stress scene".into();
@@ -458,12 +466,12 @@ fn main() -> Result<(), String> {
             layout: LampLayout::Spread,
             sun_speed,
             sun_frozen: false,
-            sky_on: true,
+            sky_on,
             boxes_still,
             seed,
             time: 0.0,
             box_time: 0.0,
-            day: 0.12,
+            day: start_day,
             free_camera: FreeCamera::default(),
             camera: None,
             sun: None,

@@ -30,6 +30,7 @@ pub struct RadianceInspector {
     cell_label: UiLabelId,
     grid_metrics_label: UiLabelId,
     cell_world_position_label: UiLabelId,
+    coverage_label: UiLabelId,
     cell_drawer: Drawer,
     rays_drawer: Drawer,
     ray_buttons: [UiButtonId; RAY_COUNT],
@@ -108,6 +109,7 @@ impl RadianceInspector {
         let cell_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Radiance field · cell (4, 1, 4) / (16, 4, 16)", 11.0, Color::rgb(0.72, 0.76, 0.82));
         let grid_metrics_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Field size: -- · Cell size: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let cell_world_position_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Cell center: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let coverage_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Coverage: waiting for GPU readback", 10.0, Color::rgb(0.72, 0.76, 0.82));
 
         let cell_drawer = add_drawer(context, content, "RADIANCE CELL", true, 250.0);
         let cell_content = cell_drawer.content.expect("radiance cell content exists");
@@ -137,11 +139,11 @@ impl RadianceInspector {
 
         let rays_drawer = add_drawer(context, content, "RAY INSPECTOR", false, 475.0);
         let ray_content = rays_drawer.content.expect("ray inspector content exists");
-        let ray_row = context.ui.add_container(Some(ray_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 5.0));
-        context.ui.add_label_layout(Some(ray_row), UiLayout::new(Vec2::new(125.0, 18.0)), "Latest rays (both shown)", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let ray_row = context.ui.add_container(Some(ray_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 3.0));
+        context.ui.add_label_layout(Some(ray_row), UiLayout::new(Vec2::new(76.0, 18.0)), "Latest rays", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let mut ray_buttons = [None; RAY_COUNT];
         for (ray_index, ray_button) in ray_buttons.iter_mut().enumerate() {
-            let button = context.ui.add_toggle_button_layout(Some(ray_row), UiLayout::new(Vec2::new(44.0, 22.0)), ray_index as u32 == context.gi_trace_selected_ray);
+            let button = context.ui.add_toggle_button_layout(Some(ray_row), UiLayout::new(Vec2::new(34.0, 22.0)), ray_index as u32 == context.gi_trace_selected_ray);
             context.ui.set_button_text(button, format!("R{ray_index}"), 10.0, Color::WHITE);
             context.ui.set_button_toggled_colors(button, Color::rgb(0.2, 0.48, 0.62), Color::rgb(0.15, 0.2, 0.28));
             *ray_button = Some(button);
@@ -180,6 +182,7 @@ impl RadianceInspector {
             cell_label,
             grid_metrics_label,
             cell_world_position_label,
+            coverage_label,
             cell_drawer,
             rays_drawer,
             ray_buttons: ray_buttons.map(Option::unwrap),
@@ -279,6 +282,20 @@ impl RadianceInspector {
             context.ui.set_button_toggled(self.gpu_timing_button, false);
         }
         context.ui.set_label_text(self.gpu_timing_label, format!("Scene pass GPU: {:.2} ms", context.performance_stats.gpu_scene_ms));
+        let coverage_text = if context.performance_stats.gi_coverage_available {
+            format!(
+                "Coverage {:.1}% / ≥2 {:.1}% · tried {:.1}% · valid {:.1}% · pending {} · rays {}",
+                context.performance_stats.gi_region_coverage_percent,
+                context.performance_stats.gi_regions_covered_twice_percent,
+                context.performance_stats.gi_regions_attempted_percent,
+                context.performance_stats.gi_valid_cells_percent,
+                context.performance_stats.gi_pending_cells,
+                context.performance_stats.gi_rays_scheduled,
+            )
+        } else {
+            "Coverage: waiting for GPU readback".to_owned()
+        };
+        context.ui.set_label_text(self.coverage_label, coverage_text);
         self.update_ray_selection(context);
         self.update_trace_display(context);
         self.movement_keys_active = move_enabled && inspector_open;

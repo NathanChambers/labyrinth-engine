@@ -34,13 +34,20 @@ const SDF_MAX_DISTANCE: f32 = 16.0;
 const SDF_CLEARANCE_RADIUS_VOXELS: u16 = 4;
 const RADIANCE_FIELD_TARGET_CELL_SIZE: f32 = 1.5;
 const RADIANCE_FIELD_PADDING: Vec3 = Vec3::new(8.0, 4.0, 8.0);
-pub const RADIANCE_FIELD_RAY_COUNT: usize = 2;
+const RADIANCE_FIELD_MAX_CELL_COUNT: u32 = 16_384;
+pub const RADIANCE_FIELD_RAY_COUNT: usize = 8;
+const RADIANCE_FIELD_MAX_RAYS_PER_CELL: usize = 64;
 pub const RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS: usize = 64;
 pub const RADIANCE_SURFACE_CANDIDATE_COUNT: usize = 8;
 const RADIANCE_SURFACE_INSPECTION_VEC4_COUNT: usize = 4 + RADIANCE_SURFACE_CANDIDATE_COUNT * 9;
 const RADIANCE_SURFACE_INSPECTION_SIZE: u64 = (RADIANCE_SURFACE_INSPECTION_VEC4_COUNT * mem::size_of::<[f32; 4]>()) as u64;
-const RADIANCE_FIELD_REFRESH_COOLDOWN_FRAMES: u32 = 60;
-const RADIANCE_FIELD_DIRTY_CELL_BUDGET: usize = 16;
+const RADIANCE_FIELD_DIRTY_CELL_BUDGET: usize = 32;
+const RADIANCE_FIELD_RAY_WORK_BUDGET: usize = 1024;
+const RADIANCE_FIELD_BOOTSTRAP_RAYS_PER_CELL: usize = 32;
+const RADIANCE_FIELD_RAY_COUNT_SHIFT: u32 = 24;
+const RADIANCE_FIELD_CELL_INDEX_MASK: u32 = 0x00ff_ffff;
+const RADIANCE_FIELD_COVERAGE_READBACK_INTERVAL: u32 = 30;
+const RADIANCE_FIELD_RESET_CELL_FLAG: u32 = 1 << 31;
 const RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT: usize = 13;
 const RADIANCE_FIELD_TRACE_DEBUG_RECORD_SIZE: u64 = (RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT * mem::size_of::<[f32; 4]>()) as u64;
 
@@ -437,6 +444,14 @@ struct SdfGpuUpdateSettings {
     voxel_size: [f32; 4],
     counts: [u32; 4],
     update: [u32; 4],
+    region_counts: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SdfGpuUpdateRegion {
+    origin: [u32; 4],
+    size: [u32; 4],
 }
 
 #[repr(C)]
@@ -446,7 +461,7 @@ struct RadianceFieldUniform {
     maximum: [f32; 4],
     resolution: [u32; 4],
     settings: [u32; 4],
-    scheduled_cells: [[u32; 4]; 4],
+    scheduled_cells: [[u32; 4]; 8],
     schedule_metadata: [u32; 4],
 }
 
@@ -564,13 +579,17 @@ struct WorldRadianceField {
     maximum: Vec3,
     cell_size: Vec3,
     frame_index: u32,
-    refresh_cooldown_frames: u32,
-    refresh_pending: bool,
     needs_full_refresh: bool,
+    queued_reset_cells: VecDeque<u32>,
+    queued_reset_cell_mask: Vec<bool>,
     queued_priority_cells: VecDeque<u32>,
     queued_priority_cell_mask: Vec<bool>,
+    queued_camera_cells: VecDeque<u32>,
+    queued_camera_cell_mask: Vec<bool>,
     queued_dirty_cells: VecDeque<u32>,
     queued_dirty_cell_mask: Vec<bool>,
+    refinement_cursor: u32,
+    camera_focus_cell: Option<[i32; 3]>,
 }
 
 #[derive(Clone, Copy)]
@@ -654,7 +673,16 @@ pub struct RendererPerformanceStats {
     pub sdf_clearance_build_ms: f32,
     pub sdf_upload_ms: f32,
     pub sdf_voxels_updated: u32,
-    pub gi_history_valid_percent: f32,
+    pub gi_region_coverage_percent: f32,
+    pub gi_regions_covered_twice_percent: f32,
+    pub gi_cells_with_coverage_percent: f32,
+    pub gi_valid_cells_percent: f32,
+    pub gi_regions_attempted_percent: f32,
+    pub gi_coverage_available: bool,
+    pub gi_pending_cells: u32,
+    pub gi_cells_updated: u32,
+    pub gi_rays_scheduled: u32,
+    pub gi_angular_regions: u32,
     pub probe_update_ms: f32,
     pub irradiance_upload_ms: f32,
     pub visibility_rebuild_ms: f32,
@@ -869,6 +897,8 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     radiance_field_pipeline: wgpu::ComputePipeline,
+    radiance_field_bounce_pipeline: wgpu::ComputePipeline,
+    radiance_field_bounce_bind_group: wgpu::BindGroup,
     radiance_surface_inspection_pipeline: wgpu::ComputePipeline,
     depth_prepass_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
@@ -919,11 +949,18 @@ pub struct Renderer {
     sdf_update_pipeline: wgpu::ComputePipeline,
     sdf_clearance_pipeline: wgpu::ComputePipeline,
     sdf_update_bind_group_layout: wgpu::BindGroupLayout,
+    sdf_update_settings_buffer: wgpu::Buffer,
+    sdf_update_dirty_buffer: Option<wgpu::Buffer>,
+    sdf_update_dirty_capacity: u64,
     radiance_field: WorldRadianceField,
     radiance_field_uniform_buffer: wgpu::Buffer,
     _radiance_field_buffer: wgpu::Buffer,
+    _radiance_field_bounce_buffer: wgpu::Buffer,
     _radiance_field_probe_buffer: wgpu::Buffer,
     _radiance_field_trace_debug_buffer: wgpu::Buffer,
+    _radiance_field_coverage_buffer: wgpu::Buffer,
+    radiance_field_coverage_readback_buffer: wgpu::Buffer,
+    radiance_field_coverage_readback_receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     gi_trace_readback_buffer: wgpu::Buffer,
     gi_trace_readback_receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     gi_trace_readback_cell: [u32; 3],
@@ -1156,7 +1193,7 @@ impl Renderer {
                     Some(wgpu::VertexBufferLayout {
                         array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
                     }),
                     Some(wgpu::VertexBufferLayout {
                         array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
@@ -1254,7 +1291,7 @@ impl Renderer {
                     Some(wgpu::VertexBufferLayout {
                         array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
                     }),
                     Some(wgpu::VertexBufferLayout {
                         array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
@@ -1391,11 +1428,29 @@ impl Renderer {
             contents: bytemuck::cast_slice(&radiance_field_values),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
+        let radiance_field_bounce_values = vec![[0.0_f32; 4]; radiance_field_values.len()];
+        let radiance_field_bounce_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world radiance field second bounce radiance"),
+            contents: bytemuck::cast_slice(&radiance_field_bounce_values),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let radiance_field_probe_values = vec![[0.0_f32; 4]; radiance_field_grid_resolution.iter().product::<u32>() as usize];
         let radiance_field_probe_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world radiance field probe relocation state"),
             contents: bytemuck::cast_slice(&radiance_field_probe_values),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let radiance_field_coverage_values = vec![[0_u32; 4]; radiance_field_grid_resolution.iter().product::<u32>() as usize];
+        let radiance_field_coverage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world radiance field coverage summaries"),
+            contents: bytemuck::cast_slice(&radiance_field_coverage_values),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+        let radiance_field_coverage_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("world radiance field coverage readback"),
+            size: (radiance_field_coverage_values.len() * mem::size_of::<[u32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let radiance_field_trace_debug_count = radiance_field_grid_resolution.iter().product::<u32>() as usize;
         let radiance_field_trace_debug_values = vec![[[0.0_f32; 4]; RADIANCE_FIELD_TRACE_DEBUG_VEC4_COUNT]; radiance_field_trace_debug_count * RADIANCE_FIELD_RAY_COUNT];
@@ -1624,6 +1679,18 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 26,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 27,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1648,6 +1715,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 23, resource: radiance_surface_inspection_settings_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 24, resource: radiance_surface_inspection_values_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(&sdf_clearance_view) },
+                wgpu::BindGroupEntry { binding: 26, resource: radiance_field_coverage_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 27, resource: radiance_field_bounce_buffer.as_entire_binding() },
             ],
         });
         let gi_gizmo_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1695,6 +1764,12 @@ impl Renderer {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 27,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let gi_gizmo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1708,6 +1783,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 12, resource: radiance_field_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 20, resource: radiance_field_trace_debug_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 21, resource: gi_gizmo_selection_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 27, resource: radiance_field_bounce_buffer.as_entire_binding() },
             ],
         });
 
@@ -1779,6 +1855,12 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        let sdf_update_settings_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("incremental SDF update settings"),
+            size: mem::size_of::<SdfGpuUpdateSettings>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let sdf_clearance_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("incremental SDF clearance update"),
             layout: Some(&sdf_update_layout),
@@ -1841,6 +1923,11 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 14 => Float32x2],
         };
+        let depth_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<RendererMeshVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+        };
         let instance_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -1849,6 +1936,21 @@ impl Renderer {
                 7 => Float32x4, 8 => Float32x4, 9 => Float32x4,
                 10 => Float32x4, 11 => Float32x4, 12 => Float32x4, 13 => Uint32
             ],
+        };
+        let depth_instance_vertex_attributes = [
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 3 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 4 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 5 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 6 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 7 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 80, shader_location: 8 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 96, shader_location: 9 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 160, shader_location: 13 },
+        ];
+        let depth_instance_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<RendererInstanceData>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &depth_instance_vertex_attributes,
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene pipeline"),
@@ -1877,9 +1979,109 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let radiance_field_bounce_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("world radiance field second bounce layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 22,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 23,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 24,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 25,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 26,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 27,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let radiance_field_bounce_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("world radiance field second bounce resources"),
+            layout: &radiance_field_bounce_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&sdf_view) },
+                wgpu::BindGroupEntry { binding: 9, resource: sdf_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&sdf_emission_view) },
+                wgpu::BindGroupEntry { binding: 11, resource: radiance_field_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: radiance_field_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 22, resource: radiance_field_probe_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 23, resource: radiance_surface_inspection_settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 24, resource: radiance_surface_inspection_values_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(&sdf_clearance_view) },
+                wgpu::BindGroupEntry { binding: 26, resource: radiance_field_coverage_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 27, resource: radiance_field_bounce_buffer.as_entire_binding() },
+            ],
+        });
         let radiance_field_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world radiance field compute pipeline layout"),
             bind_group_layouts: &[Some(&bind_group_layout), Some(&depth_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let radiance_field_bounce_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("world radiance field second bounce pipeline layout"),
+            bind_group_layouts: &[Some(&radiance_field_bounce_bind_group_layout), Some(&depth_bind_group_layout)],
             immediate_size: 0,
         });
         let radiance_field_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1890,9 +2092,17 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        let radiance_field_bounce_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("world radiance field second bounce pipeline"),
+            layout: Some(&radiance_field_bounce_pipeline_layout),
+            module: &shader,
+            entry_point: Some("update_world_radiance_field_bounces"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let radiance_surface_inspection_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("GI surface contribution inspection pipeline"),
-            layout: Some(&radiance_field_pipeline_layout),
+            layout: Some(&radiance_field_bounce_pipeline_layout),
             module: &shader,
             entry_point: Some("inspect_radiance_surface"),
             compilation_options: Default::default(),
@@ -1935,7 +2145,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &depth_shader,
                 entry_point: Some("vertex_main"),
-                buffers: &[Some(vertex_layout.clone()), Some(instance_vertex_layout.clone())],
+                buffers: &[Some(depth_vertex_layout), Some(depth_instance_vertex_layout)],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
@@ -2149,12 +2359,14 @@ impl Renderer {
             config,
             pipeline,
             radiance_field_pipeline,
+            radiance_field_bounce_pipeline,
             radiance_surface_inspection_pipeline,
             depth_prepass_pipeline,
             wireframe_pipeline,
             gi_gizmo_pipeline,
             angular_segment_pipeline,
             sdf_occupancy_gizmo_pipeline,
+            radiance_field_bounce_bind_group,
             vertex_buffer,
             instance_buffer,
             index_buffer,
@@ -2197,11 +2409,18 @@ impl Renderer {
             sdf_update_pipeline,
             sdf_clearance_pipeline,
             sdf_update_bind_group_layout,
+            sdf_update_settings_buffer,
+            sdf_update_dirty_buffer: None,
+            sdf_update_dirty_capacity: 0,
             radiance_field,
             radiance_field_uniform_buffer,
             _radiance_field_buffer: radiance_field_buffer,
+            _radiance_field_bounce_buffer: radiance_field_bounce_buffer,
             _radiance_field_probe_buffer: radiance_field_probe_buffer,
             _radiance_field_trace_debug_buffer: radiance_field_trace_debug_buffer,
+            _radiance_field_coverage_buffer: radiance_field_coverage_buffer,
+            radiance_field_coverage_readback_buffer,
+            radiance_field_coverage_readback_receiver: None,
             gi_trace_readback_buffer,
             gi_trace_readback_receiver: None,
             gi_trace_readback_cell: [4, 1, 4],
@@ -2218,7 +2437,7 @@ impl Renderer {
             sdf_gi_enabled: false,
             gi_radiance_frozen: false,
             gi_radiance_temporal_accumulation_enabled: true,
-            gi_radiance_probe_relocation_enabled: false,
+            gi_radiance_probe_relocation_enabled: true,
             irradiance_probe_ages: [0; MAX_IRRADIANCE_PROBES],
             irradiance_update_budget: 8,
             sky_lighting,
@@ -2547,7 +2766,7 @@ impl Renderer {
         let previous_lights = self.lights.clone();
         if previous_lights != lights && self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
             let priority = changed_light_priority(&previous_lights, lights);
-            self.radiance_field.refresh_for_lighting_change(priority, self.gi_radiance_temporal_accumulation_enabled);
+            self.radiance_field.refresh_for_lighting_change(priority);
         }
         self.lights.clear();
         self.lights.extend_from_slice(lights);
@@ -2592,6 +2811,7 @@ impl Renderer {
         if sdf_gi_enabled != self.sdf_gi_enabled {
             self.sdf_gi_enabled = sdf_gi_enabled;
             self.radiance_field.invalidate();
+            self.reset_radiance_field_coverage_stats();
         }
         self.performance_stats.sdf_build_cpu_ms = 0.0;
         self.performance_stats.sdf_geometry_bvh_build_ms = 0.0;
@@ -2599,7 +2819,10 @@ impl Renderer {
         self.performance_stats.sdf_clearance_build_ms = 0.0;
         self.performance_stats.sdf_upload_ms = 0.0;
         self.performance_stats.sdf_voxels_updated = 0;
-        self.performance_stats.gi_history_valid_percent = 0.0;
+        self.performance_stats.gi_pending_cells = self.radiance_field.pending_cell_count() as u32;
+        self.performance_stats.gi_cells_updated = 0;
+        self.performance_stats.gi_rays_scheduled = 0;
+        self.performance_stats.gi_angular_regions = self.radiance_angular_resolution.segment_count();
         if !sdf_gi_enabled && (!self.render_settings.irradiance_enabled || volumes.is_empty()) {
             self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(false, self.sky_lighting)));
             self.performance_stats.probe_update_ms = 0.0;
@@ -2650,19 +2873,19 @@ impl Renderer {
             let sdf_update = self.sdf_clipmap.update_gpu(scene_bounds, &self.sdf_geometry_cache);
             let field_reanchored = self.radiance_field.reanchor(scene_bounds);
             if field_reanchored {
+                self.reset_radiance_field_coverage_stats();
                 self.queue.write_buffer(
                     &self._radiance_field_buffer,
                     0,
                     bytemuck::cast_slice(&vec![RadianceFieldAngularSample::zeroed(); self.radiance_field.cell_count() * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS]),
                 );
+                self.queue.write_buffer(&self._radiance_field_bounce_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count() * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS]));
                 self.queue.write_buffer(&self._radiance_field_probe_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count()]));
+                self.queue.write_buffer(&self._radiance_field_coverage_buffer, 0, bytemuck::cast_slice(&vec![[0_u32; 4]; self.radiance_field.cell_count()]));
             }
             self.performance_stats.sdf_build_cpu_ms = sdf_build_start.elapsed().as_secs_f32() * 1000.0;
             if geometry_changed {
-                if !field_reanchored {
-                    self.queue.write_buffer(&self._radiance_field_probe_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count()]));
-                }
-                self.radiance_field.refresh_temporally(self.gi_radiance_temporal_accumulation_enabled);
+                self.radiance_field.refresh_temporally();
             }
             if let Some(sdf_update) = sdf_update {
                 self.performance_stats.sdf_voxels_updated = sdf_update.voxels_updated;
@@ -2674,8 +2897,16 @@ impl Renderer {
                 self.sdf_gpu_updated_this_frame = true;
                 self.performance_stats.sdf_upload_ms = sdf_upload_start.elapsed().as_secs_f32() * 1000.0;
             }
-            let radiance_field_uniform =
-                self.radiance_field.uniform(self.gi_radiance_temporal_accumulation_enabled, self.radiance_angular_resolution.segment_count(), self.gi_radiance_probe_relocation_enabled);
+            let radiance_field_uniform = self.radiance_field.uniform(
+                self.gi_radiance_temporal_accumulation_enabled,
+                self.radiance_angular_resolution.segment_count(),
+                self.gi_radiance_probe_relocation_enabled,
+                self.gi_radiance_frozen,
+                self.camera.transform.position,
+            );
+            self.performance_stats.gi_cells_updated = radiance_field_uniform.schedule_metadata[0];
+            self.performance_stats.gi_rays_scheduled = radiance_field_uniform.schedule_metadata[1];
+            self.performance_stats.gi_pending_cells = self.radiance_field.pending_cell_count() as u32;
             self.queue.write_buffer(&self.radiance_field_uniform_buffer, 0, bytemuck::bytes_of(&radiance_field_uniform));
             self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(true, self.sky_lighting)));
             self.performance_stats.probe_update_ms = 0.0;
@@ -2792,7 +3023,16 @@ impl Renderer {
             sdf_clearance_build_ms: self.performance_stats.sdf_clearance_build_ms,
             sdf_upload_ms: self.performance_stats.sdf_upload_ms,
             sdf_voxels_updated: self.performance_stats.sdf_voxels_updated,
-            gi_history_valid_percent: self.performance_stats.gi_history_valid_percent,
+            gi_region_coverage_percent: self.performance_stats.gi_region_coverage_percent,
+            gi_regions_covered_twice_percent: self.performance_stats.gi_regions_covered_twice_percent,
+            gi_cells_with_coverage_percent: self.performance_stats.gi_cells_with_coverage_percent,
+            gi_valid_cells_percent: self.performance_stats.gi_valid_cells_percent,
+            gi_regions_attempted_percent: self.performance_stats.gi_regions_attempted_percent,
+            gi_coverage_available: self.performance_stats.gi_coverage_available,
+            gi_pending_cells: self.performance_stats.gi_pending_cells,
+            gi_cells_updated: self.performance_stats.gi_cells_updated,
+            gi_rays_scheduled: self.performance_stats.gi_rays_scheduled,
+            gi_angular_regions: self.performance_stats.gi_angular_regions,
             gpu_shadow_ms: self.performance_stats.gpu_shadow_ms,
             gpu_scene_ms: self.performance_stats.gpu_scene_ms,
             gpu_sdf_gi_ms: self.performance_stats.gpu_sdf_gi_ms,
@@ -2829,6 +3069,15 @@ impl Renderer {
 
     pub fn performance_stats(&self) -> RendererPerformanceStats {
         self.performance_stats
+    }
+
+    fn reset_radiance_field_coverage_stats(&mut self) {
+        self.performance_stats.gi_region_coverage_percent = 0.0;
+        self.performance_stats.gi_regions_covered_twice_percent = 0.0;
+        self.performance_stats.gi_cells_with_coverage_percent = 0.0;
+        self.performance_stats.gi_valid_cells_percent = 0.0;
+        self.performance_stats.gi_regions_attempted_percent = 0.0;
+        self.performance_stats.gi_coverage_available = false;
     }
 
     pub fn set_triangle_bvh_diagnostics_enabled(&mut self, enabled: bool) {
@@ -2914,7 +3163,7 @@ impl Renderer {
             if values[end] < values[start] { 0.0 } else { (values[end] - values[start]) as f32 * timestamps.timestamp_period / 1_000_000.0 }
         };
         let scene_ms = to_ms(6, 7);
-        let sdf_gi_ms = if self.sdf_gi_enabled && self.render_settings.irradiance_enabled { to_ms(4, 5) } else { 0.0 };
+        let sdf_gi_ms = if self.sdf_gi_enabled && self.render_settings.irradiance_enabled && !self.gi_radiance_frozen { to_ms(4, 5) } else { 0.0 };
         let sdf_update_ms = if self.sdf_gpu_updated_this_frame { to_ms(12, 13) } else { 0.0 };
         let gizmo_ms = if self.gizmo_vertex_count > 0 { to_ms(8, 9) } else { 0.0 };
         let ui_ms = if self.ui_vertex_count > 0 { to_ms(10, 11) } else { 0.0 };
@@ -2950,7 +3199,7 @@ impl Renderer {
         }
         self.sky_lighting = sky_lighting;
         self.irradiance_probe_ages.fill(u32::MAX);
-        self.radiance_field.refresh_temporally(self.gi_radiance_temporal_accumulation_enabled);
+        self.radiance_field.refresh_temporally();
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, sky_lighting)));
     }
 
@@ -3060,11 +3309,14 @@ impl Renderer {
         self.radiance_angular_segments = [RendererRadianceAngularSegment::default(); RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS];
         self.radiance_angular_segments_cell = [u32::MAX; 3];
         self.gi_trace_diagnostics = [RendererGiRayDiagnostic::default(); RADIANCE_FIELD_RAY_COUNT];
+        self.reset_radiance_field_coverage_stats();
         self.queue.write_buffer(
             &self._radiance_field_buffer,
             0,
             bytemuck::cast_slice(&vec![RadianceFieldAngularSample::zeroed(); self.radiance_field.cell_count() * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS]),
         );
+        self.queue.write_buffer(&self._radiance_field_bounce_buffer, 0, bytemuck::cast_slice(&vec![[0.0_f32; 4]; self.radiance_field.cell_count() * RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS]));
+        self.queue.write_buffer(&self._radiance_field_coverage_buffer, 0, bytemuck::cast_slice(&vec![[0_u32; 4]; self.radiance_field.cell_count()]));
         self.radiance_field.invalidate();
     }
 
@@ -3219,6 +3471,39 @@ impl Renderer {
         }
         drop(mapped);
         self.gi_trace_readback_buffer.unmap();
+        Ok(())
+    }
+
+    fn poll_radiance_field_coverage_readback(&mut self) -> Result<(), String> {
+        if self.radiance_field_coverage_readback_receiver.is_none() {
+            return Ok(());
+        }
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| error.to_string())?;
+        let result = match self.radiance_field_coverage_readback_receiver.as_ref().unwrap().try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.radiance_field_coverage_readback_receiver = None;
+                return Ok(());
+            }
+        };
+        self.radiance_field_coverage_readback_receiver = None;
+        if result.is_err() {
+            return Ok(());
+        }
+        let mapped = self.radiance_field_coverage_readback_buffer.slice(..).get_mapped_range().map_err(|error| error.to_string())?;
+        let summaries = bytemuck::cast_slice::<u8, [u32; 4]>(&mapped);
+        if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
+            let [covered_once, covered_twice, covered_cells, attempted_regions, valid_cells] = radiance_field_coverage_percentages(summaries, self.radiance_angular_resolution.segment_count());
+            self.performance_stats.gi_region_coverage_percent = covered_once;
+            self.performance_stats.gi_regions_covered_twice_percent = covered_twice;
+            self.performance_stats.gi_cells_with_coverage_percent = covered_cells;
+            self.performance_stats.gi_regions_attempted_percent = attempted_regions;
+            self.performance_stats.gi_valid_cells_percent = valid_cells;
+            self.performance_stats.gi_coverage_available = true;
+        }
+        drop(mapped);
+        self.radiance_field_coverage_readback_buffer.unmap();
         Ok(())
     }
 
@@ -3474,32 +3759,44 @@ impl Renderer {
         Ok(CapturedFrame { width, height, rgba8, scene_depth, directional_shadow, spot_shadow, point_shadow })
     }
 
-    fn update_sdf_gpu(&self, update: &SdfClipmapUpdate) {
+    fn update_sdf_gpu(&mut self, update: &SdfClipmapUpdate) {
         let resolution = self.sdf_clipmap.resolution;
-        let mut voxel_indices = sdf_region_indices(&update.texture_regions, resolution).into_iter().map(|index| index as u32).collect::<Vec<_>>();
-        let clearance_indices = sdf_region_indices(&update.clearance_regions, resolution).into_iter().map(|index| index as u32).collect::<Vec<_>>();
-        let clearance_offset = voxel_indices.len() as u32;
-        voxel_indices.extend(clearance_indices);
-        if voxel_indices.is_empty() {
+        let texture_voxel_count = update.texture_regions.iter().map(|region| region.size.iter().product::<u32>()).sum::<u32>();
+        let clearance_voxel_count = update.clearance_regions.iter().map(|region| region.size.iter().product::<u32>()).sum::<u32>();
+        if texture_voxel_count == 0 && clearance_voxel_count == 0 {
             return;
         }
+        let dirty_regions = update
+            .texture_regions
+            .iter()
+            .chain(&update.clearance_regions)
+            .map(|region| SdfGpuUpdateRegion { origin: [region.origin[0], region.origin[1], region.origin[2], 0], size: [region.size[0], region.size[1], region.size[2], 0] })
+            .collect::<Vec<_>>();
+        let dirty_buffer_size = (dirty_regions.len() * mem::size_of::<SdfGpuUpdateRegion>()) as u64;
+        if dirty_buffer_size > self.sdf_update_dirty_capacity {
+            self.sdf_update_dirty_capacity = dirty_buffer_size.next_power_of_two();
+            self.sdf_update_dirty_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("incremental SDF dirty regions"),
+                size: self.sdf_update_dirty_capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let dirty_buffer = self.sdf_update_dirty_buffer.as_ref().expect("dirty region buffer is allocated for a non-empty update");
+        self.queue.write_buffer(dirty_buffer, 0, bytemuck::cast_slice(&dirty_regions));
         let settings = SdfGpuUpdateSettings {
             minimum: self.sdf_clipmap.minimum.extend(0.0).to_array(),
             voxel_size: self.sdf_clipmap.voxel_size.extend(0.0).to_array(),
             counts: [resolution[0], resolution[1], resolution[2], self.triangle_bvh_nodes.len() as u32],
-            update: [clearance_offset, (voxel_indices.len() as u32).saturating_sub(clearance_offset), clearance_offset, self.triangle_bvh_triangles.len() as u32],
+            update: [texture_voxel_count, clearance_voxel_count, update.texture_regions.len() as u32, self.triangle_bvh_triangles.len() as u32],
+            region_counts: [update.clearance_regions.len() as u32, 0, 0, 0],
         };
-        let settings_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("incremental SDF update settings"),
-            contents: bytemuck::bytes_of(&settings),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let dirty_buffer = storage_buffer_or_dummy(&self.device, "incremental SDF dirty voxels", &voxel_indices);
+        self.queue.write_buffer(&self.sdf_update_settings_buffer, 0, bytemuck::bytes_of(&settings));
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("incremental SDF update resources"),
             layout: &self.sdf_update_bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: settings_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: self.sdf_update_settings_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.triangle_bvh_node_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.triangle_bvh_triangle_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: dirty_buffer.as_entire_binding() },
@@ -3516,7 +3813,7 @@ impl Renderer {
             wgpu::Extent3d { width: resolution[0], height: resolution[1], depth_or_array_layers: resolution[2] },
         );
         let clearance_count = settings.update[1];
-        if clearance_offset > 0 {
+        if texture_voxel_count > 0 {
             let timestamp_writes = self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
                 query_set: &timestamps.query_set,
                 beginning_of_pass_write_index: Some(12),
@@ -3525,7 +3822,7 @@ impl Renderer {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("incremental SDF voxel and emission update"), timestamp_writes });
             pass.set_pipeline(&self.sdf_update_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(clearance_offset.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(texture_voxel_count.div_ceil(64), 1, 1);
         }
         if clearance_count > 0 {
             encoder.copy_texture_to_texture(
@@ -3535,7 +3832,7 @@ impl Renderer {
             );
             let timestamp_writes = self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
                 query_set: &timestamps.query_set,
-                beginning_of_pass_write_index: if clearance_offset == 0 { Some(12) } else { None },
+                beginning_of_pass_write_index: if texture_voxel_count == 0 { Some(12) } else { None },
                 end_of_pass_write_index: Some(13),
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("incremental SDF clearance update"), timestamp_writes });
@@ -3553,6 +3850,7 @@ impl Renderer {
 
     pub fn render(&mut self) -> Result<(), String> {
         self.poll_gi_trace_readback()?;
+        self.poll_radiance_field_coverage_readback()?;
         self.poll_radiance_surface_inspection()?;
         self.update_angular_segment_vertices();
         let frame = match self.surface.get_current_texture() {
@@ -3620,6 +3918,10 @@ impl Renderer {
         self.frame_index = self.frame_index.wrapping_add(1);
         self.queue.write_buffer(&self.sdf_uniform_buffer, 0, bytemuck::bytes_of(&self.sdf_clipmap.uniform(self.sdf_gi_enabled, self.sky_lighting)));
         let trace_readback_copied = self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.gi_trace_readback_receiver.is_none();
+        let coverage_readback_copied = self.sdf_gi_enabled
+            && self.render_settings.irradiance_enabled
+            && self.radiance_field_coverage_readback_receiver.is_none()
+            && self.frame_index % RADIANCE_FIELD_COVERAGE_READBACK_INTERVAL == 0;
         let surface_inspection_copied =
             self.sdf_gi_enabled && self.render_settings.irradiance_enabled && self.radiance_surface_inspection_request.is_some() && self.radiance_surface_inspection_readback_receiver.is_none();
         if surface_inspection_copied {
@@ -3648,10 +3950,19 @@ impl Renderer {
             if trace_readback_copied {
                 self.copy_selected_gi_trace_debug(&mut encoder);
             }
+            if coverage_readback_copied {
+                encoder.copy_buffer_to_buffer(
+                    &self._radiance_field_coverage_buffer,
+                    0,
+                    &self.radiance_field_coverage_readback_buffer,
+                    0,
+                    (self.radiance_field.cell_count() * mem::size_of::<[u32; 4]>()) as u64,
+                );
+            }
             if surface_inspection_copied {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("GI surface contribution inspection"), timestamp_writes: None });
                 pass.set_pipeline(&self.radiance_surface_inspection_pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(0, &self.radiance_field_bounce_bind_group, &[]);
                 pass.set_bind_group(1, &self.depth_bind_group, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
                 drop(pass);
@@ -3681,6 +3992,13 @@ impl Renderer {
             });
             self.gi_trace_readback_receiver = Some(receiver);
         }
+        if coverage_readback_copied {
+            let (sender, receiver) = mpsc::channel();
+            self.radiance_field_coverage_readback_buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            self.radiance_field_coverage_readback_receiver = Some(receiver);
+        }
         if surface_inspection_copied {
             self.radiance_surface_inspection_request = None;
             let (sender, receiver) = mpsc::channel();
@@ -3688,9 +4006,6 @@ impl Renderer {
                 let _ = sender.send(result);
             });
             self.radiance_surface_inspection_readback_receiver = Some(receiver);
-        }
-        if self.sdf_gi_enabled && self.render_settings.irradiance_enabled {
-            self.performance_stats.gi_history_valid_percent = 100.0;
         }
         self.queue.present(frame);
         if !self.has_presented {
@@ -3805,19 +4120,36 @@ impl Renderer {
     }
 
     fn render_world_radiance_field_pass(&self, encoder: &mut wgpu::CommandEncoder, depth_bind_group: &wgpu::BindGroup) {
+        if self.gi_radiance_frozen {
+            return;
+        }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("world radiance field update"),
             timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
                 query_set: &timestamps.query_set,
                 beginning_of_pass_write_index: Some(4),
-                end_of_pass_write_index: Some(5),
+                end_of_pass_write_index: None,
             }),
         });
         pass.set_pipeline(&self.radiance_field_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_bind_group(1, depth_bind_group, &[]);
-        let resolution = self.radiance_field.resolution;
-        pass.dispatch_workgroups(resolution[0].div_ceil(4), resolution[1].div_ceil(4), resolution[2].div_ceil(4));
+        pass.dispatch_workgroups(RADIANCE_FIELD_DIRTY_CELL_BUDGET.div_ceil(4) as u32, 1, 1);
+        drop(pass);
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("world radiance field second bounce"),
+            timestamp_writes: self.gpu_timestamps.as_ref().map(|timestamps| wgpu::ComputePassTimestampWrites {
+                query_set: &timestamps.query_set,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(5),
+            }),
+        });
+        pass.set_pipeline(&self.radiance_field_bounce_pipeline);
+        pass.set_bind_group(0, &self.radiance_field_bounce_bind_group, &[]);
+        pass.set_bind_group(1, depth_bind_group, &[]);
+        pass.dispatch_workgroups(RADIANCE_FIELD_DIRTY_CELL_BUDGET.div_ceil(4) as u32, 1, 1);
+        drop(pass);
     }
 
     fn render_shadow_pass(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -5047,7 +5379,7 @@ impl SdfClipmap {
         let clearance_regions = merge_sdf_texture_regions(clearance_regions);
         self.geometry_bounds.clear();
         self.geometry_bounds.extend_from_slice(geometry_bounds);
-        self.geometry_bvh = SdfGeometryBvh::new(&[]);
+        self.geometry_bvh = if compute_cpu_fields { SdfGeometryBvh::new(geometry_bounds) } else { SdfGeometryBvh::new(&[]) };
         let geometry_bvh_build_ms = 0.0;
         let (voxel_build_ms, clearance_build_ms) = if compute_cpu_fields {
             let voxel_build_start = Instant::now();
@@ -5134,12 +5466,13 @@ impl SdfClipmap {
                 let indices = &dirty_indices[worker_index * indices_per_worker..worker_index * indices_per_worker + updates.len()];
                 scope.spawn(move || {
                     for ((index, value, emission_value), voxel_index) in updates.iter_mut().zip(indices) {
-                        let x = *voxel_index % resolution[0] as usize;
-                        let y = (*voxel_index / resolution[0] as usize) % resolution[1] as usize;
-                        let z = *voxel_index / (resolution[0] * resolution[1]) as usize;
+                        let voxel_index = *voxel_index as usize;
+                        let x = voxel_index % resolution[0] as usize;
+                        let y = (voxel_index / resolution[0] as usize) % resolution[1] as usize;
+                        let z = voxel_index / (resolution[0] * resolution[1]) as usize;
                         let position = minimum + (Vec3::new(x as f32, y as f32, z as f32) + Vec3::splat(0.5)) * voxel_size;
                         let (distance, albedo, emission) = geometry_bvh.nearest(position, voxel_padding);
-                        *index = *voxel_index;
+                        *index = voxel_index;
                         *value = [distance.clamp(-SDF_MAX_DISTANCE, SDF_MAX_DISTANCE), albedo.x, albedo.y, albedo.z];
                         *emission_value = emission.to_array();
                     }
@@ -5171,9 +5504,10 @@ impl SdfClipmap {
                 let indices = &dirty_indices[worker_index * indices_per_worker..worker_index * indices_per_worker + updates.len()];
                 scope.spawn(move || {
                     for ((index, safe_distance), voxel_index) in updates.iter_mut().zip(indices) {
-                        let x = *voxel_index % resolution[0] as usize;
-                        let y = (*voxel_index / resolution[0] as usize) % resolution[1] as usize;
-                        let z = *voxel_index / (resolution[0] * resolution[1]) as usize;
+                        let voxel_index = *voxel_index as usize;
+                        let x = voxel_index % resolution[0] as usize;
+                        let y = (voxel_index / resolution[0] as usize) % resolution[1] as usize;
+                        let z = voxel_index / (resolution[0] * resolution[1]) as usize;
                         let mut distance = SDF_CLEARANCE_RADIUS_VOXELS;
                         'neighborhood: for offset_z in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
                             for offset_y in -(SDF_CLEARANCE_RADIUS_VOXELS as i32)..=SDF_CLEARANCE_RADIUS_VOXELS as i32 {
@@ -5200,7 +5534,7 @@ impl SdfClipmap {
                                 }
                             }
                         }
-                        *index = *voxel_index;
+                        *index = voxel_index;
                         *safe_distance = (distance as f32 * minimum_voxel_size - half_voxel_diagonal).max(0.0);
                     }
                 });
@@ -5327,8 +5661,8 @@ impl WorldRadianceField {
     }
 
     fn new(scene_bounds: GeometryBounds, cell_size: f32) -> Self {
-        let (resolution, extent) = padded_grid_shape(scene_bounds, RADIANCE_FIELD_PADDING, cell_size);
-        let cell_size = Vec3::splat(cell_size);
+        let (resolution, extent, effective_cell_size) = radiance_field_grid_shape(scene_bounds, cell_size);
+        let cell_size = Vec3::splat(effective_cell_size);
         let minimum = static_grid_minimum(bounds_center(scene_bounds), extent);
         Self {
             resolution,
@@ -5336,13 +5670,17 @@ impl WorldRadianceField {
             maximum: minimum + extent,
             cell_size,
             frame_index: 0,
-            refresh_cooldown_frames: 0,
-            refresh_pending: false,
             needs_full_refresh: true,
+            queued_reset_cells: VecDeque::new(),
+            queued_reset_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
             queued_priority_cells: VecDeque::new(),
             queued_priority_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
+            queued_camera_cells: VecDeque::new(),
+            queued_camera_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
             queued_dirty_cells: VecDeque::new(),
             queued_dirty_cell_mask: vec![false; resolution.iter().product::<u32>() as usize],
+            refinement_cursor: 0,
+            camera_focus_cell: None,
         }
     }
 
@@ -5363,28 +5701,19 @@ impl WorldRadianceField {
         true
     }
 
-    fn uniform(&mut self, temporal_accumulation_enabled: bool, angular_region_count: u32, probe_relocation_enabled: bool) -> RadianceFieldUniform {
-        let full_refresh = self.needs_full_refresh;
-        if full_refresh {
-            self.needs_full_refresh = false;
+    fn uniform(&mut self, temporal_accumulation_enabled: bool, angular_region_count: u32, probe_relocation_enabled: bool, frozen: bool, camera_position: Vec3) -> RadianceFieldUniform {
+        if self.needs_full_refresh {
             self.clear_pending_cells();
+            for index in self.cells_nearest_to(camera_position) {
+                self.enqueue_reset_cell(index);
+            }
+            self.needs_full_refresh = false;
         }
         self.frame_index = self.frame_index.wrapping_add(1);
-        self.refresh_cooldown_frames = self.refresh_cooldown_frames.saturating_sub(1);
-        let dirty_refresh = !full_refresh && self.refresh_pending && self.refresh_cooldown_frames == 0;
-        if full_refresh {
-            self.refresh_pending = false;
-        } else if dirty_refresh {
-            self.refresh_pending = false;
-            self.refresh_cooldown_frames = RADIANCE_FIELD_REFRESH_COOLDOWN_FRAMES;
-        }
-        let scheduled_cells = if temporal_accumulation_enabled || full_refresh {
-            self.clear_pending_cells();
-            Vec::new()
-        } else {
-            self.schedule_cells()
-        };
-        let mut packed_scheduled_cells = [[u32::MAX; 4]; 4];
+        self.update_camera_focus(camera_position);
+        let scheduled_cells = if frozen { Vec::new() } else { self.schedule_cells(temporal_accumulation_enabled, angular_region_count as usize) };
+        let scheduled_rays = scheduled_cells.iter().map(|cell| ((cell >> RADIANCE_FIELD_RAY_COUNT_SHIFT) & 0x7f) as usize).sum::<usize>();
+        let mut packed_scheduled_cells = [[u32::MAX; 4]; 8];
         for (index, cell) in scheduled_cells.iter().enumerate() {
             packed_scheduled_cells[index / 4][index % 4] = *cell;
         }
@@ -5392,107 +5721,276 @@ impl WorldRadianceField {
             minimum: self.minimum.extend(0.0).to_array(),
             maximum: self.maximum.extend(0.0).to_array(),
             resolution: [self.resolution[0], self.resolution[1], self.resolution[2], 0],
-            settings: [
-                self.frame_index,
-                RADIANCE_FIELD_RAY_COUNT as u32,
-                angular_region_count,
-                u32::from(full_refresh) | (u32::from(dirty_refresh) << 1) | (u32::from(temporal_accumulation_enabled) << 2) | (u32::from(probe_relocation_enabled) << 3),
-            ],
+            settings: [self.frame_index, RADIANCE_FIELD_MAX_RAYS_PER_CELL as u32, angular_region_count, (u32::from(temporal_accumulation_enabled) << 2) | (u32::from(probe_relocation_enabled) << 3)],
             scheduled_cells: packed_scheduled_cells,
-            schedule_metadata: [scheduled_cells.len() as u32, u32::from(temporal_accumulation_enabled || full_refresh), 0, 0],
+            schedule_metadata: [scheduled_cells.len() as u32, scheduled_rays as u32, 0, 0],
         }
     }
 
     fn invalidate(&mut self) {
         self.needs_full_refresh = true;
-        self.refresh_cooldown_frames = 0;
-        self.refresh_pending = false;
         self.clear_pending_cells();
     }
 
-    fn refresh_temporally(&mut self, refinement_enabled: bool) {
-        self.refresh_pending = true;
-        if refinement_enabled {
-            return;
-        }
-        self.queued_priority_cells.clear();
-        self.queued_priority_cell_mask.fill(false);
-        for index in 0..self.cell_count() as u32 {
-            self.enqueue_dirty_cell(index);
-        }
-    }
-
-    fn refresh_for_lighting_change(&mut self, priority: Option<RadianceFieldPriority>, refinement_enabled: bool) {
-        self.refresh_pending = true;
-        if refinement_enabled {
-            return;
-        }
-        if priority.is_none() {
-            self.queued_priority_cells.clear();
-            self.queued_priority_cell_mask.fill(false);
-        }
-        let mut affected_cells = Vec::new();
-        if let Some(priority) = priority {
-            let cell_diagonal = self.cell_size.length() * 0.5;
+    fn refresh_temporally(&mut self) {
+        if self.queued_reset_cells.is_empty() && self.queued_dirty_cells.is_empty() {
             for index in 0..self.cell_count() as u32 {
-                let coordinate = radiance_field_coordinate(index, self.resolution);
-                let center = self.minimum + (Vec3::new(coordinate[0] as f32, coordinate[1] as f32, coordinate[2] as f32) + Vec3::splat(0.5)) * self.cell_size;
-                let distance = center.distance(priority.position);
-                if distance <= priority.radius + cell_diagonal {
-                    affected_cells.push((distance, index));
-                }
-            }
-            affected_cells.sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        }
-        let mut affected_mask = vec![false; self.cell_count()];
-        for (_, index) in affected_cells {
-            let index_usize = index as usize;
-            affected_mask[index_usize] = true;
-            self.enqueue_priority_cell(index);
-        }
-        for index in 0..self.cell_count() as u32 {
-            if !affected_mask[index as usize] {
                 self.enqueue_dirty_cell(index);
             }
         }
     }
 
+    fn refresh_for_lighting_change(&mut self, priority: Option<RadianceFieldPriority>) {
+        if let Some(priority) = priority {
+            let radius = priority.radius + self.cell_size.length() * 0.5;
+            let radius_vector = Vec3::splat(radius);
+            let minimum_coordinate = ((priority.position - radius_vector - self.minimum) / self.cell_size).floor().as_ivec3().to_array();
+            let maximum_coordinate = ((priority.position + radius_vector - self.minimum) / self.cell_size).ceil().as_ivec3().to_array();
+            let maximum_grid_coordinate = [self.resolution[0] as i32 - 1, self.resolution[1] as i32 - 1, self.resolution[2] as i32 - 1];
+            let minimum_coordinate: [i32; 3] = std::array::from_fn(|axis| minimum_coordinate[axis].clamp(0, maximum_grid_coordinate[axis]));
+            let maximum_coordinate: [i32; 3] = std::array::from_fn(|axis| maximum_coordinate[axis].clamp(0, maximum_grid_coordinate[axis]));
+            let mut affected_cells = Vec::new();
+            for z in minimum_coordinate[2]..=maximum_coordinate[2] {
+                for y in minimum_coordinate[1]..=maximum_coordinate[1] {
+                    for x in minimum_coordinate[0]..=maximum_coordinate[0] {
+                        let coordinate = [x as u32, y as u32, z as u32];
+                        let index = coordinate[0] + coordinate[1] * self.resolution[0] + coordinate[2] * self.resolution[0] * self.resolution[1];
+                        let center = self.minimum + (Vec3::new(x as f32, y as f32, z as f32) + Vec3::splat(0.5)) * self.cell_size;
+                        let distance_squared = center.distance_squared(priority.position);
+                        if distance_squared <= radius * radius {
+                            affected_cells.push((distance_squared, index));
+                        }
+                    }
+                }
+            }
+            affected_cells.sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+            for (_, index) in affected_cells {
+                self.enqueue_priority_cell(index);
+            }
+            return;
+        }
+
+        // Directional lights affect the whole field. Keep one sweep pending at a time;
+        // camera and local-light queues still take priority while it is processed.
+        if self.queued_reset_cells.is_empty() && self.queued_dirty_cells.is_empty() {
+            for index in 0..self.cell_count() as u32 {
+                self.enqueue_dirty_cell(index);
+            }
+        }
+    }
+
+    fn cells_nearest_to(&self, position: Vec3) -> Vec<u32> {
+        let mut cells = (0..self.cell_count() as u32).collect::<Vec<_>>();
+        cells.sort_by(|left, right| {
+            let left_coordinate = radiance_field_coordinate(*left, self.resolution);
+            let right_coordinate = radiance_field_coordinate(*right, self.resolution);
+            let left_position = self.minimum + (Vec3::new(left_coordinate[0] as f32, left_coordinate[1] as f32, left_coordinate[2] as f32) + Vec3::splat(0.5)) * self.cell_size;
+            let right_position = self.minimum + (Vec3::new(right_coordinate[0] as f32, right_coordinate[1] as f32, right_coordinate[2] as f32) + Vec3::splat(0.5)) * self.cell_size;
+            left_position.distance_squared(position).total_cmp(&right_position.distance_squared(position)).then_with(|| left.cmp(right))
+        });
+        cells
+    }
+
     fn clear_pending_cells(&mut self) {
+        self.queued_reset_cells.clear();
+        self.queued_reset_cell_mask.fill(false);
         self.queued_priority_cells.clear();
         self.queued_priority_cell_mask.fill(false);
+        self.queued_camera_cells.clear();
+        self.queued_camera_cell_mask.fill(false);
         self.queued_dirty_cells.clear();
         self.queued_dirty_cell_mask.fill(false);
+    }
+
+    fn pending_cell_count(&self) -> usize {
+        (0..self.cell_count())
+            .filter(|index| self.queued_reset_cell_mask[*index] || self.queued_priority_cell_mask[*index] || self.queued_camera_cell_mask[*index] || self.queued_dirty_cell_mask[*index])
+            .count()
+    }
+
+    fn update_camera_focus(&mut self, camera_position: Vec3) {
+        let coordinate = ((camera_position - self.minimum) / self.cell_size).floor().as_ivec3().to_array();
+        if self.camera_focus_cell == Some(coordinate) {
+            return;
+        }
+        if self.camera_focus_cell.replace(coordinate).is_none() {
+            return;
+        }
+        self.queued_camera_cells.clear();
+        self.queued_camera_cell_mask.fill(false);
+        for z in -1..=1 {
+            for y in -1..=1 {
+                for x in -1..=1 {
+                    let nearby = [coordinate[0] + x, coordinate[1] + y, coordinate[2] + z];
+                    if nearby.iter().any(|component| *component < 0) || nearby[0] >= self.resolution[0] as i32 || nearby[1] >= self.resolution[1] as i32 || nearby[2] >= self.resolution[2] as i32 {
+                        continue;
+                    }
+                    let index = nearby[0] as u32 + nearby[1] as u32 * self.resolution[0] + nearby[2] as u32 * self.resolution[0] * self.resolution[1];
+                    self.enqueue_camera_cell(index);
+                }
+            }
+        }
+    }
+
+    fn enqueue_reset_cell(&mut self, index: u32) {
+        enqueue_cell(&mut self.queued_reset_cells, &mut self.queued_reset_cell_mask, index);
     }
 
     fn enqueue_priority_cell(&mut self, index: u32) {
         enqueue_cell(&mut self.queued_priority_cells, &mut self.queued_priority_cell_mask, index);
     }
 
+    fn enqueue_camera_cell(&mut self, index: u32) {
+        enqueue_cell(&mut self.queued_camera_cells, &mut self.queued_camera_cell_mask, index);
+    }
+
     fn enqueue_dirty_cell(&mut self, index: u32) {
         enqueue_cell(&mut self.queued_dirty_cells, &mut self.queued_dirty_cell_mask, index);
     }
 
-    fn schedule_cells(&mut self) -> Vec<u32> {
+    fn schedule_cells(&mut self, refinement_enabled: bool, angular_region_count: usize) -> Vec<u32> {
         let mut scheduled = Vec::with_capacity(RADIANCE_FIELD_DIRTY_CELL_BUDGET);
         let mut scheduled_mask = vec![false; self.cell_count()];
-        schedule_queued_cells(&mut self.queued_priority_cells, &mut self.queued_priority_cell_mask, &mut scheduled, &mut scheduled_mask, RADIANCE_FIELD_DIRTY_CELL_BUDGET);
-        schedule_queued_cells(&mut self.queued_dirty_cells, &mut self.queued_dirty_cell_mask, &mut scheduled, &mut scheduled_mask, RADIANCE_FIELD_DIRTY_CELL_BUDGET);
+        let bootstrap_ray_count = angular_region_count.max(RADIANCE_FIELD_BOOTSTRAP_RAYS_PER_CELL).min(RADIANCE_FIELD_MAX_RAYS_PER_CELL);
+        let mut ray_work = 0;
+        ray_work += schedule_urgent_cells(
+            &mut self.queued_priority_cells,
+            &mut self.queued_priority_cell_mask,
+            &mut self.queued_reset_cell_mask,
+            &mut scheduled,
+            &mut scheduled_mask,
+            2,
+            RADIANCE_FIELD_MAX_RAYS_PER_CELL,
+            RADIANCE_FIELD_RAY_WORK_BUDGET - ray_work,
+        );
+        ray_work += schedule_urgent_cells(
+            &mut self.queued_camera_cells,
+            &mut self.queued_camera_cell_mask,
+            &mut self.queued_reset_cell_mask,
+            &mut scheduled,
+            &mut scheduled_mask,
+            1,
+            RADIANCE_FIELD_MAX_RAYS_PER_CELL,
+            RADIANCE_FIELD_RAY_WORK_BUDGET - ray_work,
+        );
+        ray_work += schedule_queued_cells(
+            &mut self.queued_reset_cells,
+            &mut self.queued_reset_cell_mask,
+            &mut scheduled,
+            &mut scheduled_mask,
+            RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+            bootstrap_ray_count,
+            true,
+            RADIANCE_FIELD_RAY_WORK_BUDGET - ray_work,
+        );
+        if !self.queued_reset_cell_mask.iter().any(|queued| *queued) {
+            ray_work += schedule_queued_cells(
+                &mut self.queued_dirty_cells,
+                &mut self.queued_dirty_cell_mask,
+                &mut scheduled,
+                &mut scheduled_mask,
+                RADIANCE_FIELD_DIRTY_CELL_BUDGET,
+                bootstrap_ray_count,
+                false,
+                RADIANCE_FIELD_RAY_WORK_BUDGET - ray_work,
+            );
+            if refinement_enabled && ray_work < RADIANCE_FIELD_RAY_WORK_BUDGET {
+                let mut visited = 0;
+                while scheduled.len() < RADIANCE_FIELD_DIRTY_CELL_BUDGET && ray_work + RADIANCE_FIELD_MAX_RAYS_PER_CELL <= RADIANCE_FIELD_RAY_WORK_BUDGET && visited < self.cell_count() {
+                    let index = self.refinement_cursor % self.cell_count() as u32;
+                    self.refinement_cursor = (self.refinement_cursor + 1) % self.cell_count() as u32;
+                    visited += 1;
+                    if scheduled_mask[index as usize] {
+                        continue;
+                    }
+                    scheduled_mask[index as usize] = true;
+                    scheduled.push(encode_scheduled_cell(index, RADIANCE_FIELD_MAX_RAYS_PER_CELL, false));
+                    ray_work += RADIANCE_FIELD_MAX_RAYS_PER_CELL;
+                }
+            }
+        }
         scheduled
     }
 }
 
-fn schedule_queued_cells(queue: &mut VecDeque<u32>, queued_mask: &mut Vec<bool>, scheduled: &mut Vec<u32>, scheduled_mask: &mut Vec<bool>, maximum_count: usize) {
+fn schedule_queued_cells(
+    queue: &mut VecDeque<u32>,
+    queued_mask: &mut Vec<bool>,
+    scheduled: &mut Vec<u32>,
+    scheduled_mask: &mut Vec<bool>,
+    maximum_count: usize,
+    ray_count: usize,
+    reset_history: bool,
+    remaining_work: usize,
+) -> usize {
     let mut selected_count = 0;
-    while selected_count < maximum_count && scheduled.len() < RADIANCE_FIELD_DIRTY_CELL_BUDGET {
+    let mut ray_work = 0;
+    while selected_count < maximum_count && scheduled.len() < RADIANCE_FIELD_DIRTY_CELL_BUDGET && ray_work + ray_count <= remaining_work {
         let Some(index) = pop_queued_cell(queue, queued_mask) else { break };
         let slot = index as usize;
         if scheduled_mask[slot] {
             continue;
         }
         scheduled_mask[slot] = true;
-        scheduled.push(index);
+        scheduled.push(encode_scheduled_cell(index, ray_count, reset_history));
         selected_count += 1;
+        ray_work += ray_count;
     }
+    ray_work
+}
+
+fn schedule_urgent_cells(
+    queue: &mut VecDeque<u32>,
+    queued_mask: &mut Vec<bool>,
+    reset_mask: &mut [bool],
+    scheduled: &mut Vec<u32>,
+    scheduled_mask: &mut [bool],
+    maximum_count: usize,
+    ray_count: usize,
+    remaining_work: usize,
+) -> usize {
+    let mut selected_count = 0;
+    let mut ray_work = 0;
+    while selected_count < maximum_count && scheduled.len() < RADIANCE_FIELD_DIRTY_CELL_BUDGET && ray_work + ray_count <= remaining_work {
+        let Some(index) = pop_queued_cell(queue, queued_mask) else { break };
+        let slot = index as usize;
+        if scheduled_mask[slot] {
+            continue;
+        }
+        let reset_history = reset_mask[slot];
+        if reset_history {
+            reset_mask[slot] = false;
+        }
+        scheduled_mask[slot] = true;
+        scheduled.push(encode_scheduled_cell(index, ray_count, reset_history));
+        selected_count += 1;
+        ray_work += ray_count;
+    }
+    ray_work
+}
+
+fn encode_scheduled_cell(index: u32, ray_count: usize, reset_history: bool) -> u32 {
+    (index & RADIANCE_FIELD_CELL_INDEX_MASK) | ((ray_count as u32) << RADIANCE_FIELD_RAY_COUNT_SHIFT) | if reset_history { RADIANCE_FIELD_RESET_CELL_FLAG } else { 0 }
+}
+
+fn radiance_field_coverage_percentages(summaries: &[[u32; 4]], angular_region_count: u32) -> [f32; 5] {
+    if summaries.is_empty() || angular_region_count == 0 {
+        return [0.0; 5];
+    }
+    let cell_count = summaries.len() as f32;
+    let total_regions = cell_count * angular_region_count as f32;
+    let covered_once = summaries.iter().map(|summary| summary[0]).sum::<u32>() as f32;
+    let covered_twice = summaries.iter().map(|summary| summary[1]).sum::<u32>() as f32;
+    let covered_cells = summaries.iter().filter(|summary| summary[0] > 0).count() as f32;
+    let attempted_regions = summaries.iter().map(|summary| summary[2]).sum::<u32>() as f32;
+    let valid_cells = summaries.iter().filter(|summary| summary[3] > 0).count() as f32;
+    [
+        (covered_once * 100.0 / total_regions).clamp(0.0, 100.0),
+        (covered_twice * 100.0 / total_regions).clamp(0.0, 100.0),
+        (covered_cells * 100.0 / cell_count).clamp(0.0, 100.0),
+        (attempted_regions * 100.0 / total_regions).clamp(0.0, 100.0),
+        (valid_cells * 100.0 / cell_count).clamp(0.0, 100.0),
+    ]
 }
 
 fn radiance_field_coordinate(index: u32, resolution: [u32; 3]) -> [u32; 3] {
@@ -5557,14 +6055,14 @@ fn expand_sdf_texture_region(region: SdfTextureRegion, amount: u32, resolution: 
     SdfTextureRegion { origin, size: [expanded_end[0] - origin[0], expanded_end[1] - origin[1], expanded_end[2] - origin[2]] }
 }
 
-fn sdf_region_indices(regions: &[SdfTextureRegion], resolution: [u32; 3]) -> Vec<usize> {
+fn sdf_region_indices(regions: &[SdfTextureRegion], resolution: [u32; 3]) -> Vec<u32> {
     let voxel_count = regions.iter().map(|region| region.size.iter().product::<u32>() as usize).sum();
     let mut indices = Vec::with_capacity(voxel_count);
     for region in regions {
         for z in region.origin[2]..region.origin[2] + region.size[2] {
             for y in region.origin[1]..region.origin[1] + region.size[1] {
-                let row_start = (region.origin[0] + y * resolution[0] + z * resolution[0] * resolution[1]) as usize;
-                indices.extend(row_start..row_start + region.size[0] as usize);
+                let row_start = region.origin[0] + y * resolution[0] + z * resolution[0] * resolution[1];
+                indices.extend(row_start..row_start + region.size[0]);
             }
         }
     }
@@ -6413,6 +6911,18 @@ fn padded_grid_shape(scene_bounds: GeometryBounds, padding: Vec3, cell_size: f32
     (resolution, extent)
 }
 
+fn radiance_field_grid_shape(bounds: GeometryBounds, target_cell_size: f32) -> ([u32; 3], Vec3, f32) {
+    let mut effective_cell_size = target_cell_size;
+    loop {
+        let (resolution, extent) = padded_grid_shape(bounds, RADIANCE_FIELD_PADDING, effective_cell_size);
+        let cell_count = resolution.iter().product::<u32>();
+        if cell_count <= RADIANCE_FIELD_MAX_CELL_COUNT {
+            return (resolution, extent, effective_cell_size);
+        }
+        effective_cell_size *= (cell_count as f32 / RADIANCE_FIELD_MAX_CELL_COUNT as f32).cbrt().max(1.05);
+    }
+}
+
 fn probe_irradiance(
     position: Vec3,
     static_samples: &[ProbeSurfaceSample],
@@ -6792,6 +7302,25 @@ mod radiance_field_tests {
     use super::*;
 
     #[test]
+    fn coverage_metrics_report_observed_regions_and_cells() {
+        let summaries = [[2, 1, 2, 1], [1, 0, 1, 1], [0, 0, 0, 0]];
+
+        let coverage = radiance_field_coverage_percentages(&summaries, 2);
+
+        assert_eq!(coverage, [50.0, 100.0 / 6.0, 200.0 / 3.0, 50.0, 200.0 / 3.0]);
+        assert_eq!(radiance_field_coverage_percentages(&[], 2), [0.0; 5]);
+    }
+
+    #[test]
+    fn scheduled_cells_encode_ray_count_and_reset_flag() {
+        let scheduled = encode_scheduled_cell(17, 8, true);
+
+        assert_eq!(scheduled & RADIANCE_FIELD_CELL_INDEX_MASK, 17);
+        assert_eq!((scheduled >> RADIANCE_FIELD_RAY_COUNT_SHIFT) & 0x7f, 8);
+        assert_ne!(scheduled & RADIANCE_FIELD_RESET_CELL_FLAG, 0);
+    }
+
+    #[test]
     fn room_test_outer_walls_fit_inside_single_radiance_and_sdf_fields() {
         let scene_bounds = GeometryBounds { minimum: Vec3::new(-16.0, 0.0, -16.0), maximum: Vec3::new(16.0, 5.2, 16.0) };
         let (_, sdf_extent) = padded_grid_shape(scene_bounds, SDF_CLIPMAP_PADDING, SDF_TARGET_CELL_SIZE);
@@ -6808,6 +7337,18 @@ mod radiance_field_tests {
     }
 
     #[test]
+    fn oversized_radiance_fields_coarsen_spacing_to_stay_within_the_cell_cap() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-400.0), maximum: Vec3::splat(400.0) };
+
+        let field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+
+        assert!(field.cell_count() <= RADIANCE_FIELD_MAX_CELL_COUNT as usize);
+        assert!(field.cell_size.x > RADIANCE_FIELD_TARGET_CELL_SIZE);
+        assert!(field.minimum.cmple(scene_bounds.minimum - RADIANCE_FIELD_PADDING).all());
+        assert!(field.maximum.cmpge(scene_bounds.maximum + RADIANCE_FIELD_PADDING).all());
+    }
+
+    #[test]
     fn radiance_field_reanchors_without_changing_cell_spacing() {
         let small_bounds = GeometryBounds { minimum: Vec3::new(-16.0, 0.0, -16.0), maximum: Vec3::new(16.0, 5.2, 16.0) };
         let large_bounds = GeometryBounds { minimum: Vec3::new(20.0, 0.0, 0.0), maximum: Vec3::new(30.0, 5.2, 10.0) };
@@ -6815,7 +7356,7 @@ mod radiance_field_tests {
         let sdf_minimum = static_grid_minimum(bounds_center(large_bounds), sdf_extent);
         let sdf_maximum = sdf_minimum + sdf_extent;
         let mut field = WorldRadianceField::new(small_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
-        field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
+        field.uniform(false, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
 
         assert_eq!(resolution, std::array::from_fn(|axis| ((large_bounds.maximum[axis] - large_bounds.minimum[axis] + SDF_CLIPMAP_PADDING[axis] * 2.0) / SDF_TARGET_CELL_SIZE).ceil() as u32));
         assert!(sdf_minimum.cmple(large_bounds.minimum - SDF_CLIPMAP_PADDING).all());
@@ -6825,7 +7366,7 @@ mod radiance_field_tests {
         assert!(field.minimum.cmple(large_bounds.minimum - RADIANCE_FIELD_PADDING).all());
         assert!(field.maximum.cmpge(large_bounds.maximum + RADIANCE_FIELD_PADDING).all());
         assert_eq!(field.cell_size, Vec3::splat(RADIANCE_FIELD_TARGET_CELL_SIZE));
-        field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
+        field.uniform(false, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
         let expanded_minimum = field.minimum;
         let expanded_maximum = field.maximum;
         assert!(field.reanchor(small_bounds));
@@ -6839,41 +7380,108 @@ mod radiance_field_tests {
     fn static_radiance_cells_keep_their_world_bounds_across_updates() {
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
         let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
-        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
+        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
         let fixed_minimum = field.minimum;
-        let next = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
+        let next = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
 
-        assert_eq!(initial.settings[3] & 1, 1);
-        assert_eq!(next.settings[3] & 1, 0);
+        assert_eq!(initial.schedule_metadata[0], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32);
+        assert!(initial.scheduled_cells[0][0] & RADIANCE_FIELD_RESET_CELL_FLAG != 0);
+        assert_eq!(next.schedule_metadata[0], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32);
         assert_eq!(field.minimum, fixed_minimum);
     }
 
     #[test]
-    fn radiance_refinement_updates_the_full_field_and_refinement_is_toggleable() {
+    fn radiance_refinement_is_budgeted_and_freeze_preserves_pending_work() {
         let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
         let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
-        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
-        assert_eq!(initial.settings[3] & 1, 1);
+        let initial = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
         assert_eq!(initial.settings[3] & 4, 4);
-        assert_eq!(initial.schedule_metadata[0], 0);
-        assert_eq!(initial.schedule_metadata[1], 1);
+        assert_eq!(initial.schedule_metadata[0], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32);
+        assert_eq!(initial.schedule_metadata[1], RADIANCE_FIELD_RAY_WORK_BUDGET as u32);
+        assert!(initial.schedule_metadata[1] <= RADIANCE_FIELD_RAY_WORK_BUDGET as u32);
+        assert!(initial.schedule_metadata[1] > RADIANCE_FIELD_RAY_COUNT as u32);
 
-        let continuous_update = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
-        assert_eq!(continuous_update.schedule_metadata[0], 0);
-        assert_eq!(continuous_update.schedule_metadata[1], 1);
+        let continuous_update = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
+        assert_eq!(continuous_update.schedule_metadata[0], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32);
+        assert_eq!(continuous_update.schedule_metadata[1], RADIANCE_FIELD_RAY_WORK_BUDGET as u32);
 
-        field.refresh_temporally(true);
-        let changed = field.uniform(true, RadianceAngularResolution::default().segment_count(), false);
-        assert_eq!(changed.settings[3] & 2, 2);
-        assert_eq!(changed.schedule_metadata[0], 0);
-        assert_eq!(changed.schedule_metadata[1], 1);
+        while !field.queued_reset_cells.is_empty() {
+            field.uniform(false, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
+        }
 
-        let refinement_disabled = field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
+        field.refresh_temporally();
+        let frozen = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, true, Vec3::ZERO);
+        assert_eq!(frozen.schedule_metadata[0], 0);
+        let changed = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
+        assert_eq!(changed.schedule_metadata[0], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32);
+        assert_eq!(changed.scheduled_cells[0][0] & RADIANCE_FIELD_RESET_CELL_FLAG, 0);
+
+        let refinement_disabled = field.uniform(false, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
         assert_eq!(refinement_disabled.settings[3] & 4, 0);
 
-        let disabled_update = field.uniform(false, RadianceAngularResolution::default().segment_count(), false);
-        assert_eq!(disabled_update.schedule_metadata[0], 0);
-        assert_eq!(disabled_update.schedule_metadata[1], 0);
+        let disabled_update = field.uniform(false, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
+        assert_eq!(disabled_update.schedule_metadata[0], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32);
+        assert_eq!(disabled_update.schedule_metadata[1], RADIANCE_FIELD_DIRTY_CELL_BUDGET as u32 * RADIANCE_FIELD_BOOTSTRAP_RAYS_PER_CELL as u32);
+    }
+
+    #[test]
+    fn camera_cell_changes_prioritize_nearby_probes_within_the_ray_budget() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
+        while !field.queued_reset_cells.is_empty() {
+            field.uniform(false, RadianceAngularResolution::default().segment_count(), false, false, Vec3::ZERO);
+        }
+
+        let focused = field.uniform(true, RadianceAngularResolution::default().segment_count(), false, false, Vec3::new(1.6, 0.0, 0.0));
+
+        assert_eq!(focused.schedule_metadata[0], (RADIANCE_FIELD_RAY_WORK_BUDGET / RADIANCE_FIELD_MAX_RAYS_PER_CELL) as u32);
+        assert!(focused.schedule_metadata[1] <= RADIANCE_FIELD_RAY_WORK_BUDGET as u32);
+        assert_eq!((focused.scheduled_cells[0][0] >> RADIANCE_FIELD_RAY_COUNT_SHIFT) & 0x7f, RADIANCE_FIELD_MAX_RAYS_PER_CELL as u32);
+        assert_eq!(focused.schedule_metadata[1], RADIANCE_FIELD_RAY_WORK_BUDGET as u32);
+    }
+
+    #[test]
+    fn directional_light_sweeps_are_coalesced_while_pending() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        field.needs_full_refresh = false;
+
+        field.refresh_for_lighting_change(None);
+        let pending_cells = field.queued_dirty_cells.len();
+        field.refresh_for_lighting_change(None);
+
+        assert_eq!(pending_cells, field.cell_count());
+        assert_eq!(field.queued_dirty_cells.len(), pending_cells);
+    }
+
+    #[test]
+    fn local_light_changes_only_queue_cells_inside_the_affected_region() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-8.0), maximum: Vec3::splat(8.0) };
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        field.needs_full_refresh = false;
+
+        field.refresh_for_lighting_change(Some(RadianceFieldPriority { position: Vec3::ZERO, radius: 2.0 }));
+
+        assert!(!field.queued_priority_cells.is_empty());
+        assert!(field.queued_priority_cells.len() < field.cell_count());
+        assert!(field.queued_dirty_cells.is_empty());
+    }
+
+    #[test]
+    fn urgent_light_cells_preempt_pending_resets_without_scheduling_twice() {
+        let scene_bounds = GeometryBounds { minimum: Vec3::splat(-4.0), maximum: Vec3::splat(4.0) };
+        let mut field = WorldRadianceField::new(scene_bounds, RADIANCE_FIELD_TARGET_CELL_SIZE);
+        let urgent_index = (field.cell_count() / 2) as u32;
+        field.enqueue_reset_cell(urgent_index);
+        field.enqueue_reset_cell(0);
+        field.enqueue_priority_cell(urgent_index);
+
+        let scheduled = field.schedule_cells(true, RadianceAngularResolution::default().segment_count() as usize);
+
+        assert_eq!(scheduled[0] & RADIANCE_FIELD_CELL_INDEX_MASK, urgent_index);
+        assert_ne!(scheduled[0] & RADIANCE_FIELD_RESET_CELL_FLAG, 0);
+        assert!(!field.queued_reset_cell_mask[urgent_index as usize]);
     }
 }
 

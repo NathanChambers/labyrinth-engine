@@ -18,10 +18,14 @@ irradiance volumes ──> gizmos ──> rendering
 active scene geometry bounds + target cell spacing + padding ──> rounded per-axis SDF and radiance grids ──> rendering; out-of-bounds motion re-anchors and refreshes caches
 renderer visibility grid ──occupancy/regions──> probe placement and bounce filtering
 mesh triangles ──> renderer BVH nearest-surface queries ──conservative surface shell + clearance grid──> world-space radiance field compute pass
-light-change bounds ──> per-field radiance refresh flags ──two counter-sweeping rays per scheduled cell update, round-robin region coverage──> radiance region samples
-world-cell-seeded stratified sphere directions ──> equal-area 8/32/64 angular regions, each with its own running estimate ──round-robin samples──> scene radiance field
+hard field invalidation ──> per-cell history reset queue ──> radiance region samples
+active camera position ──> distance-ordered initial reset queue; camera-cell changes queue a nearby focus neighborhood
+geometry changes ──> one coalesced whole-field dirty sweep; directional-light changes ──> one coalesced whole-field sweep; moving point/spot lights ──> bounded affected-cell priority queue
+urgent local-light and camera-focus cells preempt pending resets; each consumes its reset once ──> remaining reset, dirty, and round-robin refinement queues ──> up to 1,024 rays and 32 cell invocations per frame──> radiance region samples
+freeze control ──> pause radiance-field compute without consuming queued refresh work; refinement resumes round-robin when work budget remains──> radiance field
+world-cell-seeded stratified sphere directions ──> equal-area 8/32/64 angular regions, each with its own running estimate ──bootstrap covers every region, then refinement schedules up to 64 rays per cell──> scene radiance field
 transformed source triangles ──> renderer-built triangle BVH ──Render Options toggle──> GPU probe-segment visibility filter in radiance-field sampling
-selected field cell + Geometry/Radiance mode ──> latest-sample gizmo pass ──two trace records + 64 region radiance/sample-age records──> async readback ──> GI radiance inspector and freshness heatmap
+selected field cell + Geometry/Radiance mode ──> latest-sample gizmo pass ──up to eight trace records + 64 region radiance/sample-age records──> async readback ──> GI radiance inspector and freshness heatmap
 clicked viewport pixel ──> depth-prepass depth + world normal + surface ID ──> shared GPU candidate evaluator + SDF voxel segment checks ──async weights and RGB contributions──> readback ──> renderer CPU exact transformed-triangle segment checks ──> per-probe mesh/SDF visibility comparison, hit triangle and hit geometry ──> GI Surface Inspector and diagnostic gizmos
 panel header input ──click/drag──> shared UI window state ──collapse/position/size──> shared panels and Genos inspector
 Cornell Box and Sponza examples ──DebugPanels──> shared display-mode, render-options, gizmo, and performance UI
@@ -29,7 +33,7 @@ Primitives, Lighting, Genos, and Sponza ──camera id + input + inspector key-
 F1 key press ──> UI visibility mode ──skip normal UI vertices and input; preserve marked FPS label──> rendering
 windowing run ──initialize once──> logging ──UTC timestamp + level + target + key-values──> stderr or application-provided log backend
 uniform angular-region radiance field + relocation validity ──trilinear + soft receiver-plane weighting ──SDF voxel + direct scene-AABB segment filters + optional source-triangle BVH segment filter──> cosine-weighted angular integration──> full-resolution raster GI
-SDF build/upload timings + radiance-field GPU timing/availability ──> renderer performance stats ──> lighting diagnostics
+SDF build/upload timings + GPU per-cell sampled-region summaries ──30-frame async readback and CPU aggregation──> field coverage and scheduler performance stats ──> lighting diagnostics and capture reports
 ```
 
 | Producer | Consumer | Data or command | When |
@@ -57,7 +61,7 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Primitives example](../examples/primitives/src/main.rs), [Lighting example](../examples/lighting/src/main.rs), [Genos stress example](../examples/genos/src/main.rs), [Sponza example](../examples/sponza/src/main.rs) | [Shared free camera](../crates/debug_ui/src/free_camera.rs) | Per-example orientation, captured mouse input, WASD/Space/C movement, Shift boost, and debug-inspector movement-key suppression | Setup and each application update |
 | [Shared free camera](../crates/debug_ui/src/free_camera.rs) | [Scene](systems/scene.md) | Rotation and normalized flight translation applied to the selected camera | Each application update |
 | [Shared debug panels](../crates/debug_ui/src/lib.rs) | [Rendering](systems/rendering.md) | `Triangle probe occlusion` render setting toggled from Render Options | Each UI update |
-| [Shared debug panels](../crates/debug_ui/src/lib.rs) | [Irradiance volumes](systems/irradiance.md) | `Relocate GI probes` toggle updates `RuntimeContext::gi_radiance_probe_relocation_enabled`; defaults off | Each UI update while AABB-SDF is available |
+| [Shared debug panels](../crates/debug_ui/src/lib.rs) | [Irradiance volumes](systems/irradiance.md) | `Relocate GI probes` toggle updates `RuntimeContext::gi_radiance_probe_relocation_enabled`; defaults on | Each UI update while AABB-SDF is available |
 | [RuntimeContext](../crates/engine/src/lib.rs) | [Rendering](systems/rendering.md) | Probe-relocation setting forwarded to the renderer; changing it invalidates the cached radiance field for a full refresh | Each redraw; refresh on setting change |
 | [Mesh](systems/mesh.md) | [Rendering](systems/rendering.md) | Shared indexed triangles, per-triangle base color/emission, four PBR texture channels, per-instance transforms, normal transforms, materials, and surface IDs drive scene draws and triangle-surface SDF generation | Renderer initialization and redraw |
 | [Rendering](systems/rendering.md) | [Mesh](systems/mesh.md) | Transformed indexed triangles flattened into a world-space BVH; transform-only instance changes refit leaf triangles and node bounds, while topology changes rebuild the tree | Renderer initialization, instance update, or GI sampling when enabled |
@@ -102,9 +106,9 @@ SDF build/upload timings + radiance-field GPU timing/availability ──> render
 | [Windowing](systems/windowing.md) | [Irradiance volumes](systems/irradiance.md) | Active camera position used to snap authored irradiance clipmap bounds | Each redraw |
 | [Irradiance volumes](systems/irradiance.md) | [Rendering](systems/rendering.md) | Debug gizmo line vertices | Each redraw |
 | [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Visibility-grid occupancy, region labels, and evaluated probe locations | Grid rebuild and probe refresh |
-| [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Active camera transform, scene instances, lights, and sky for the experimental triangle-surface SDF GI and world-space radiance field; changed scene bounds re-anchor the static fields | Each redraw or scene/light update |
-| [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Equal-area 8/32/64 angular regions per cell, two counter-sweeping rays per scheduled cell update with round-robin coverage, relocation state, and latest trace data | Scene/light change, field update, raster shading, and diagnostics |
-| [Irradiance volumes](systems/irradiance.md) | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | Latest asynchronously read back trace for the selected cell plus 64 segment radiance, sample count, attempt count, and age records; sphere gizmo maps successful sample age from white to black; unresolved regions remain black | Each redraw |
+| [Windowing](systems/windowing.md) | [Rendering](systems/rendering.md) | Active camera transform prioritizes nearby queued SDF radiance cells when crossing a field-cell boundary; scene instances, lights, and sky update the experimental triangle-surface SDF GI; changed scene bounds re-anchor the static fields | Each redraw or scene/light update |
+| [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Equal-area 8/32/64 angular regions per cell, hard-reset and history-preserving queues, 16-cell/1,024-ray frame ceiling, variable ray batches, refinement cursor, relocation state, and latest trace data | Scene/light/camera change, field update, raster shading, and diagnostics |
+| [Irradiance volumes](systems/irradiance.md) | [Shared radiance inspector](../crates/debug_ui/src/radiance_inspector.rs) | Up to eight asynchronously read-back traces for the selected cell plus 64 segment radiance, sample count, attempt count, and age records; field-wide coverage percentages refresh every 30 rendered frames | Each redraw |
 | [Rendering](systems/rendering.md) | [Irradiance volumes](systems/irradiance.md) | Single field refresh queue, per-cell probe relocation, trilinear interpolation, cosine-weighted angular-region integration, receiver-plane heuristic, and optional triangle-BVH probe visibility | GI-enabled compute update, raster shading, and debug views |
 
 The windowing system is the lifecycle coordinator. The renderer owns GPU resources and does not decide window mode. The example supplies an update callback that changes transforms before each redraw; there is no world state or scripting interaction yet. Any producer that can provide the mesh contract can use the same render path.

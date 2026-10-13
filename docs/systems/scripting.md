@@ -28,7 +28,7 @@ Scripts are operation-limited. Camera, capture, and exit operations are capabili
 `capture.set_triangle_probe_occlusion(enabled)` toggles the world-space source-triangle visibility filter used by AABB-SDF radiance-field shading.
 `capture.set_triangle_probe_diagnostics(enabled)` opts into GPU traversal counters included in subsequent performance reports; leave it disabled for representative timings because the counters use atomics.
 `capture.set_triangle_probe_bvh_sah(enabled)` selects the binned SAH builder when true and the previous median builder when false, rebuilding the tree for same-run A/B captures.
-`capture.set_render_mode("lit" | "unlit" | "wireframe")` selects the scene material/debug pass and remains active for the rest of the capture plan.
+`capture.set_render_mode("lit" | "unlit" | "wireframe" | "shadow_visibility" | "gi_only" | "gi_support")` selects the scene material/debug pass and remains active for the rest of the capture plan. `gi_support` (also `sdf_support`) displays AABB-SDF radiance-field support.
 `capture.set_ui_enabled(enabled)` controls whether the runtime UI is generated and composited during the remaining capture actions, which is useful for isolating scene rendering costs.
 
 ## Lifecycle

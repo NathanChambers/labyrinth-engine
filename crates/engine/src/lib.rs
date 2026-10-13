@@ -228,7 +228,7 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         irradiance_clipmap: IrradianceClipmapDesc::default(),
         irradiance_update_budget: 8,
         gi_radiance_field_cell_size: RadianceFieldCellSize::default(),
-        gi_radiance_probe_relocation_enabled: false,
+        gi_radiance_probe_relocation_enabled: true,
         gi_radiance_field_grid: RendererRadianceFieldGrid::default(),
         sky_lighting: RendererSkyLighting::default(),
         performance_stats: RendererPerformanceStats::default(),
@@ -520,6 +520,7 @@ where
                             scripting::CaptureRenderMode::Wireframe => RenderDebugMode::Wireframe,
                             scripting::CaptureRenderMode::ShadowVisibility => RenderDebugMode::ShadowVisibility,
                             scripting::CaptureRenderMode::GiOnly => RenderDebugMode::GiOnly,
+                            scripting::CaptureRenderMode::GiSupport => RenderDebugMode::GiSupport,
                         };
                     }
                     if let Some(ui_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::ui_enabled) {

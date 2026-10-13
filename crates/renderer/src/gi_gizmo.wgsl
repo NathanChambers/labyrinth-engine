@@ -31,6 +31,10 @@ struct RadianceFieldValues {
     values: array<RadianceFieldAngularSample>,
 };
 
+struct RadianceFieldBounceValues {
+    values: array<vec4<f32>>,
+};
+
 struct RadianceFieldTraceDebug {
     probe_position: vec4<f32>,
     hit_position: vec4<f32>,
@@ -70,6 +74,9 @@ var<uniform> radiance_field: RadianceFieldData;
 
 @group(0) @binding(12)
 var<storage, read> radiance_field_values: RadianceFieldValues;
+
+@group(0) @binding(27)
+var<storage, read> radiance_field_bounce_values: RadianceFieldBounceValues;
 
 @group(0) @binding(20)
 var<storage, read> radiance_field_trace_debug: RadianceFieldTraceDebugValues;
@@ -121,7 +128,7 @@ fn field_radiance(index: u32, field: RadianceFieldData) -> vec3<f32> {
     for (var region_index = 0u; region_index < field.settings.z; region_index++) {
         let value = radiance_field_values.values[physical_index * 64u + region_index];
         if value.sampling.x > 0u {
-            result += value.radiance.rgb;
+            result += radiance_field_bounce_values.values[physical_index * 64u + region_index].rgb;
         }
     }
     return result / f32(max(field.settings.z, 1u));

@@ -14,7 +14,7 @@ Each implemented engine system gets one page named for its responsibility. Use [
 | [Asset import](asset-import.md) | `crates/asset_import` | Implemented for static FBX meshes and metallic-roughness PBR maps |
 | [Primitives](primitives.md) | `crates/engine` | Implemented |
 | [Rendering](rendering.md) | `crates/renderer` | Implemented |
-| [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Two-bounce authored volumes and experimental single-bounce triangle-surface SDF with a scene-bounded radiance field and optional probe relocation (off by default) |
+| [Irradiance volumes](irradiance.md) | `crates/engine`, `crates/renderer` | Two-bounce authored volumes and experimental single-bounce triangle-surface SDF with a scene-bounded radiance field, a dynamic-scene scheduler, measured coverage, and probe relocation enabled by default |
 | [Scripting](scripting.md) | `crates/scripting` | Implemented for debug capture |
 | [Debug Capture](capture.md) | `crates/engine`, `crates/renderer` | Implemented |
 

@@ -13,6 +13,7 @@ pub enum CaptureRenderMode {
     Wireframe,
     ShadowVisibility,
     GiOnly,
+    GiSupport,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,7 +151,8 @@ impl ScriptBuilder {
             "wireframe" => CaptureRenderMode::Wireframe,
             "shadow_visibility" | "shadows" => CaptureRenderMode::ShadowVisibility,
             "gi_only" | "gi" => CaptureRenderMode::GiOnly,
-            _ => return Err("render mode must be lit, unlit, wireframe, shadow_visibility, or gi_only".into()),
+            "gi_support" | "sdf_support" => CaptureRenderMode::GiSupport,
+            _ => return Err("render mode must be lit, unlit, wireframe, shadow_visibility, gi_only, or gi_support".into()),
         };
         self.plan.actions.push(CaptureAction::SetRenderMode(mode));
         Ok(())

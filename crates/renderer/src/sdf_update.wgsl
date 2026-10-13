@@ -16,6 +16,12 @@ struct SdfUpdateSettings {
     voxel_size: vec4<f32>,
     counts: vec4<u32>,
     update: vec4<u32>,
+    region_counts: vec4<u32>,
+};
+
+struct SdfDirtyRegion {
+    origin: vec4<u32>,
+    size: vec4<u32>,
 };
 
 struct SdfSurfaceSample {
@@ -34,7 +40,7 @@ var<storage, read> bvh_nodes: array<TriangleBvhNode>;
 var<storage, read> bvh_triangles: array<TriangleBvhTriangle>;
 
 @group(0) @binding(3)
-var<storage, read> dirty_indices: array<u32>;
+var<storage, read> dirty_regions: array<SdfDirtyRegion>;
 
 @group(0) @binding(4)
 var sdf_output: texture_storage_3d<rgba32float, write>;
@@ -155,6 +161,22 @@ fn nearest_surface(position: vec3<f32>, maximum_distance: f32) -> SdfSurfaceSamp
     return SdfSurfaceSample(nearest_distance, nearest_albedo, nearest_emission);
 }
 
+fn dirty_voxel_coordinate(dirty_index: u32, first_region: u32, region_count: u32) -> vec3<u32> {
+    var local_index = dirty_index;
+    for (var region_offset = 0u; region_offset < region_count; region_offset++) {
+        let region = dirty_regions[first_region + region_offset];
+        let voxel_count = region.size.x * region.size.y * region.size.z;
+        if local_index < voxel_count {
+            let x = local_index % region.size.x;
+            let y = (local_index / region.size.x) % region.size.y;
+            let z = local_index / (region.size.x * region.size.y);
+            return region.origin.xyz + vec3<u32>(x, y, z);
+        }
+        local_index -= voxel_count;
+    }
+    return vec3<u32>(0u);
+}
+
 @compute @workgroup_size(64)
 fn update_voxels(@builtin(global_invocation_id) invocation: vec3<u32>) {
     let dirty_index = invocation.x;
@@ -162,12 +184,7 @@ fn update_voxels(@builtin(global_invocation_id) invocation: vec3<u32>) {
         return;
     }
 
-    let linear_index = dirty_indices[dirty_index];
-    let resolution = settings.counts.xyz;
-    let x = linear_index % resolution.x;
-    let y = (linear_index / resolution.x) % resolution.y;
-    let z = linear_index / (resolution.x * resolution.y);
-    let coordinate = vec3<u32>(x, y, z);
+    let coordinate = dirty_voxel_coordinate(dirty_index, 0u, settings.update.z);
     let voxel_size = settings.voxel_size.xyz;
     let position = settings.minimum.xyz + (vec3<f32>(coordinate) + vec3<f32>(0.5)) * voxel_size;
     let half_voxel_diagonal = length(voxel_size) * 0.5;
@@ -183,16 +200,13 @@ fn update_clearance(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if dirty_index >= settings.update.y {
         return;
     }
-    let linear_index = dirty_indices[settings.update.z + dirty_index];
+    let coordinate = dirty_voxel_coordinate(dirty_index, settings.update.z, settings.region_counts.x);
     let resolution = settings.counts.xyz;
-    let x = linear_index % resolution.x;
-    let y = (linear_index / resolution.x) % resolution.y;
-    let z = linear_index / (resolution.x * resolution.y);
     var distance = 4u;
     for (var offset_z = -4; offset_z <= 4; offset_z += 1) {
         for (var offset_y = -4; offset_y <= 4; offset_y += 1) {
             for (var offset_x = -4; offset_x <= 4; offset_x += 1) {
-                let neighbor = vec3<i32>(i32(x) + offset_x, i32(y) + offset_y, i32(z) + offset_z);
+                let neighbor = vec3<i32>(coordinate) + vec3<i32>(offset_x, offset_y, offset_z);
                 if any(neighbor < vec3<i32>(0)) || any(neighbor >= vec3<i32>(resolution)) {
                     continue;
                 }
@@ -204,5 +218,5 @@ fn update_clearance(@builtin(global_invocation_id) invocation: vec3<u32>) {
     }
     let half_voxel_diagonal = length(settings.voxel_size.xyz) * 0.5;
     let safe_distance = max(f32(distance) * min(settings.voxel_size.x, min(settings.voxel_size.y, settings.voxel_size.z)) - half_voxel_diagonal, 0.0);
-    textureStore(clearance_output, vec3<i32>(i32(x), i32(y), i32(z)), vec4<f32>(safe_distance));
+    textureStore(clearance_output, vec3<i32>(coordinate), vec4<f32>(safe_distance));
 }

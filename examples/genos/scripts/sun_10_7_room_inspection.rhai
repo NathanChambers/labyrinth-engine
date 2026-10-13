@@ -1,0 +1,12 @@
+capture.configure(1280, 720, "genos-sun-10-7-no-sky", false);
+capture.set_render_effects(true, true, false);
+capture.set_camera([13.0, 1.7, 20.0], [13.0, 0.4, 10.5]);
+capture.wait(12.0);
+capture.set_render_mode("shadow_visibility");
+capture.screenshot("room_direct_shadow_visibility");
+capture.set_render_mode("lit");
+capture.screenshot("room_lit");
+capture.set_render_mode("gi_only");
+capture.screenshot("room_indirect_only");
+capture.report("sun_10_7_room");
+capture.exit();

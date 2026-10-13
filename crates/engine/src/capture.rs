@@ -193,7 +193,7 @@ impl DebugCapture {
         let path = directory.join(format!("{file_name}.txt"));
         let stats = renderer.performance_stats();
         let contents = format!(
-            "frame_cpu_ms={:.3}\ngpu_shadow_ms={:.3}\ngpu_scene_ms={:.3}\ngpu_sdf_gi_ms={:.3}\ngpu_sdf_update_ms={:.3}\ngpu_gizmo_ms={:.3}\ngpu_ui_ms={:.3}\ngpu_total_ms={:.3}\nlight_update_ms={:.3}\ninstance_update_ms={:.3}\nsdf_build_cpu_ms={:.3}\nsdf_geometry_bvh_build_ms={:.3}\nsdf_voxel_build_ms={:.3}\nsdf_clearance_build_ms={:.3}\nsdf_upload_ms={:.3}\nsdf_voxels_updated={}\ngi_history_valid_percent={:.1}\nprobe_update_ms={:.3}\nirradiance_upload_ms={:.3}\nvisibility_rebuild_ms={:.3}\nprobes_updated={}\nprobe_budget={}\nstatic_samples={}\ndynamic_samples={}\nregions={}\ntriangle_bvh_segments={}\ntriangle_bvh_bounds_tests={}\ntriangle_bvh_triangle_tests={}\ntriangle_bvh_hits={}\ntriangle_bvh_build_ms={:.3}\ntriangle_bvh_refit_ms={:.3}\ntriangle_bvh_node_count={}\ntriangle_bvh_triangle_count={}\n",
+            "frame_cpu_ms={:.3}\ngpu_shadow_ms={:.3}\ngpu_scene_ms={:.3}\ngpu_sdf_gi_ms={:.3}\ngpu_sdf_update_ms={:.3}\ngpu_gizmo_ms={:.3}\ngpu_ui_ms={:.3}\ngpu_total_ms={:.3}\nlight_update_ms={:.3}\ninstance_update_ms={:.3}\nsdf_build_cpu_ms={:.3}\nsdf_geometry_bvh_build_ms={:.3}\nsdf_voxel_build_ms={:.3}\nsdf_clearance_build_ms={:.3}\nsdf_upload_ms={:.3}\nsdf_voxels_updated={}\ngi_region_coverage_percent={:.1}\ngi_regions_covered_twice_percent={:.1}\ngi_cells_with_coverage_percent={:.1}\ngi_regions_attempted_percent={:.1}\ngi_valid_cells_percent={:.1}\ngi_coverage_available={}\ngi_pending_cells={}\ngi_cells_updated={}\ngi_rays_scheduled={}\ngi_angular_regions={}\nprobe_update_ms={:.3}\nirradiance_upload_ms={:.3}\nvisibility_rebuild_ms={:.3}\nprobes_updated={}\nprobe_budget={}\nstatic_samples={}\ndynamic_samples={}\nregions={}\ntriangle_bvh_segments={}\ntriangle_bvh_bounds_tests={}\ntriangle_bvh_triangle_tests={}\ntriangle_bvh_hits={}\ntriangle_bvh_build_ms={:.3}\ntriangle_bvh_refit_ms={:.3}\ntriangle_bvh_node_count={}\ntriangle_bvh_triangle_count={}\n",
             stats.frame_cpu_ms,
             stats.gpu_shadow_ms,
             stats.gpu_scene_ms,
@@ -210,7 +210,16 @@ impl DebugCapture {
             stats.sdf_clearance_build_ms,
             stats.sdf_upload_ms,
             stats.sdf_voxels_updated,
-            stats.gi_history_valid_percent,
+            stats.gi_region_coverage_percent,
+            stats.gi_regions_covered_twice_percent,
+            stats.gi_cells_with_coverage_percent,
+            stats.gi_regions_attempted_percent,
+            stats.gi_valid_cells_percent,
+            stats.gi_coverage_available,
+            stats.gi_pending_cells,
+            stats.gi_cells_updated,
+            stats.gi_rays_scheduled,
+            stats.gi_angular_regions,
             stats.probe_update_ms,
             stats.irradiance_upload_ms,
             stats.visibility_rebuild_ms,

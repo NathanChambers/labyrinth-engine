@@ -1,0 +1,16 @@
+capture.configure(1280, 720, "genos-gi-sampling-diagnosis", false);
+capture.set_render_effects(true, true, false);
+capture.set_camera([13.0, 1.7, 20.0], [13.0, 0.4, 10.5]);
+capture.set_triangle_probe_occlusion(true);
+capture.wait(12.0);
+capture.set_render_mode("gi_support");
+capture.screenshot("support_triangle_occlusion_on");
+capture.set_render_mode("gi_only");
+capture.screenshot("gi_triangle_occlusion_on");
+capture.set_triangle_probe_occlusion(false);
+capture.set_render_mode("gi_support");
+capture.screenshot("support_triangle_occlusion_off");
+capture.set_render_mode("gi_only");
+capture.screenshot("gi_triangle_occlusion_off");
+capture.report("gi_sampling");
+capture.exit();
