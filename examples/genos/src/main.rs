@@ -3,10 +3,7 @@ mod building;
 use std::path::Path;
 
 use building::{Building, LampSlot, MovingBox, distributed_lamps};
-use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, FontAsset, IrradianceMode, LightId, Material, PointLight, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId,
-    UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run,
-};
+use labyrinth::{Application, Camera, CameraId, Color, DirectionalLight, FontAsset, IrradianceMode, LightId, Material, PointLight, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout, UiSliderId, Vec2, Vec3, WindowSettings, primitives, run};
 use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig, FreeCamera};
 
 const MAX_POINT_LIGHTS: usize = 7;
@@ -75,6 +72,7 @@ impl Application for GenosDemo {
         context.irradiance_mode = IrradianceMode::AabbSdf;
         context.render_settings.ambient_intensity = 0.0;
         self.build_scene(context);
+
         self.setup_ui(context)
     }
 
@@ -97,11 +95,13 @@ impl Application for GenosDemo {
             let point_light = context.scene.get_point_light_mut(lamp.id).ok_or("point light disappeared from the scene")?;
             point_light.position = if lamp.moving { lamp.slot.home + lamp.slot.motion.offset(self.time) } else { lamp.slot.home };
         }
+
         for moving_box in &self.moving_boxes {
             let (position, yaw) = moving_box.motion.pose(self.box_time);
             let mesh = context.scene.get_mesh_mut(moving_box.id).ok_or("moving box disappeared from the scene")?;
             mesh.transform = Transform::new(position, Quat::from_rotation_y(yaw), moving_box.motion.size);
         }
+
         Ok(())
     }
 }
@@ -169,6 +169,7 @@ impl GenosDemo {
             moving_lights = moving_count;
             "Genos stress scene ready"
         );
+
         self.update_sun(context);
     }
 
@@ -177,7 +178,9 @@ impl GenosDemo {
         context.ui.set_font(FontAsset::from_file(font_path)?);
         let panel_size = Vec2::new(420.0, 390.0);
         context.ui.set_window_layout(UiLayout::anchored(panel_size, UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(20.0, 20.0)));
-        let header = context.ui.add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(panel_size.x, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(20.0, 20.0)), false);
+        let header = context
+            .ui
+            .add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(panel_size.x, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(20.0, 20.0)), false);
         context.ui.set_button_text(header, "Genos Stress Inspector", 15.0, Color::WHITE);
         context.ui.set_button_text_centered(header, false);
         context.ui.set_button_toggled_colors(header, Color::rgba(0.1, 0.12, 0.17, 1.0), Color::rgba(0.1, 0.12, 0.17, 1.0));
@@ -190,8 +193,13 @@ impl GenosDemo {
 
         add_inspector_section(context, stack, "STRESS SCENE");
         self.buttons.lights = add_inspector_mode_row(context, stack, "Point lights", &["1", "3", "5", "7"], light_mode_index(self.light_count));
-        self.buttons.dynamic =
-            add_inspector_mode_row(context, stack, "Moving lights", &["0%", "50%", "100%"], DYNAMIC_PERCENTAGES.iter().position(|percent| *percent == self.dynamic_percent).unwrap_or(1));
+        self.buttons.dynamic = add_inspector_mode_row(
+            context,
+            stack,
+            "Moving lights",
+            &["0%", "50%", "100%"],
+            DYNAMIC_PERCENTAGES.iter().position(|percent| *percent == self.dynamic_percent).unwrap_or(1),
+        );
         self.buttons.layout = add_inspector_mode_row(context, stack, "Lamp layout", &["Spread", "Section 0"], usize::from(self.layout == LampLayout::FirstSection));
         self.buttons.scale = add_inspector_mode_row(context, stack, "Scene scale", &["Small", "Big"], usize::from(self.cols > 1));
         self.buttons.sun = add_inspector_mode_row(context, stack, "Sun", &["Run", "Freeze"], usize::from(self.sun_frozen));
@@ -202,8 +210,13 @@ impl GenosDemo {
         self.buttons.time_of_day_value = Some(time_label);
         self.buttons.boxes = add_inspector_mode_row(context, stack, "Boxes", &["Move", "Still"], usize::from(self.boxes_still));
 
-        self.debug_panels =
-            Some(DebugPanels::new(context, DebugPanelsConfig::new("Render Debug").with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0)).with_performance_offset(Vec2::new(-24.0, 500.0))));
+        self.debug_panels = Some(DebugPanels::new(
+            context,
+            DebugPanelsConfig::new("Render Debug")
+                .with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0))
+                .with_performance_offset(Vec2::new(-24.0, 500.0)),
+        ));
+
         Ok(())
     }
 
@@ -219,6 +232,7 @@ impl GenosDemo {
         if let Some(sun) = self.sun {
             context.active_lights.push(sun);
         }
+
         context.active_lights.extend(self.lamps.iter().take(self.light_count).map(|lamp| lamp.id));
     }
 
@@ -226,6 +240,7 @@ impl GenosDemo {
         let angle = std::f32::consts::TAU * self.day.rem_euclid(1.0);
         let elevation = angle.sin();
         let fade = (elevation / 0.1).min(1.0).max(0.0);
+
         if let Some(sun_id) = self.sun
             && let Some(sun) = context.scene.get_directional_light_mut(sun_id)
         {
@@ -239,6 +254,7 @@ impl GenosDemo {
         if let Some(slider) = self.buttons.time_of_day {
             context.ui.set_slider_value(slider, clock_hours(self.day));
         }
+
         if let Some(label) = self.buttons.time_of_day_value {
             context.ui.set_label_text(label, format!("{:04.1} h", clock_hours(self.day)));
         }
@@ -255,6 +271,7 @@ impl GenosDemo {
             }
             self.apply_active_lights(context);
         }
+
         if let Some(index) = select_new_button(context, &self.buttons.dynamic, DYNAMIC_PERCENTAGES.iter().position(|percent| *percent == self.dynamic_percent).unwrap_or(0)) {
             self.dynamic_percent = DYNAMIC_PERCENTAGES[index];
             let moving_count = (self.light_count * self.dynamic_percent as usize + 50) / 100;
@@ -263,6 +280,7 @@ impl GenosDemo {
                 lamp.moving = moving.get(index).copied().unwrap_or(false);
             }
         }
+
         if select_new_button(context, &self.buttons.layout, usize::from(self.layout == LampLayout::FirstSection)).is_some() {
             self.layout = if button_selected(context, &self.buttons.layout[1]) { LampLayout::FirstSection } else { LampLayout::Spread };
             let building = Building::new(self.cols, self.rows, self.seed);
@@ -274,6 +292,7 @@ impl GenosDemo {
                 lamp.moving = moving.get(index).copied().unwrap_or(false);
             }
         }
+
         if select_new_button(context, &self.buttons.scale, usize::from(self.cols > 1)).is_some() {
             let wants_big = button_selected(context, &self.buttons.scale[1]);
             let (cols, rows) = if wants_big { (4, 4) } else { (1, 1) };
@@ -290,9 +309,11 @@ impl GenosDemo {
                 self.build_scene(context);
             }
         }
+
         if let Some(index) = select_new_button(context, &self.buttons.sun, usize::from(self.sun_frozen)) {
             self.sun_frozen = index == 1;
         }
+
         if let Some(slider) = self.buttons.time_of_day {
             let time_of_day = context.ui.slider_value(slider).unwrap_or_else(|| clock_hours(self.day));
             if (time_of_day - clock_hours(self.day)).abs() > 0.01 {
@@ -300,12 +321,15 @@ impl GenosDemo {
                 self.sun_frozen = true;
             }
         }
+
         if let Some(index) = select_new_button(context, &self.buttons.sky, usize::from(!self.sky_on)) {
             self.sky_on = index == 0;
         }
+
         if let Some(index) = select_new_button(context, &self.buttons.speed, SUN_SPEEDS.iter().position(|speed| *speed == self.sun_speed).unwrap_or(1)) {
             self.sun_speed = SUN_SPEEDS[index];
         }
+
         if let Some(index) = select_new_button(context, &self.buttons.boxes, usize::from(self.boxes_still)) {
             self.boxes_still = index == 1;
         }
@@ -317,6 +341,7 @@ impl GenosDemo {
         sync_group(context, &self.buttons.sky, usize::from(!self.sky_on));
         sync_group(context, &self.buttons.speed, SUN_SPEEDS.iter().position(|speed| *speed == self.sun_speed).unwrap_or(1));
         sync_group(context, &self.buttons.boxes, usize::from(self.boxes_still));
+
         Ok(())
     }
 
@@ -332,6 +357,7 @@ fn add_inspector_section(context: &mut RuntimeContext, parent: UiContainerId, te
 fn add_inspector_mode_row(context: &mut RuntimeContext, parent: UiContainerId, label: &str, names: &[&str], selected: usize) -> Vec<UiButtonId> {
     let row = context.ui.add_container(Some(parent), UiLayout::new(Vec2::new(0.0, 24.0)), UiAutoLayout::row(0.0, 5.0));
     context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(94.0, 20.0)), label, 11.0, Color::WHITE);
+
     names.iter().enumerate().map(|(index, name)| add_inspector_mode_button(context, row, name, selected == index)).collect()
 }
 
@@ -340,12 +366,14 @@ fn add_inspector_slider_row(context: &mut RuntimeContext, parent: UiContainerId,
     context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(94.0, 20.0)), name, 11.0, Color::WHITE);
     let slider = context.ui.add_slider_layout(Some(row), UiLayout::new(Vec2::new(180.0, 18.0)), minimum, maximum, value);
     let value_label = context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(50.0, 20.0)), "", 11.0, Color::WHITE);
+
     (slider, value_label)
 }
 
 fn add_inspector_mode_button(context: &mut RuntimeContext, parent: UiContainerId, name: &str, selected: bool) -> UiButtonId {
     let button = context.ui.add_toggle_button_layout(Some(parent), UiLayout::new(Vec2::new(58.0, 24.0)), selected);
     context.ui.set_button_text(button, name, 10.0, Color::WHITE);
+
     button
 }
 
@@ -374,9 +402,11 @@ fn moving_set(count: usize, dynamic_count: usize) -> Vec<bool> {
         key(*a).total_cmp(&key(*b))
     });
     let mut moving = vec![false; count];
+
     for index in order.into_iter().take(dynamic_count) {
         moving[index] = true;
     }
+
     moving
 }
 
@@ -419,6 +449,7 @@ fn main() -> Result<(), String> {
     let mut boxes_still = false;
     let mut debug_script = None;
     let mut args = std::env::args().skip(1);
+
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--scale" => (cols, rows) = parse_scale(&args.next().ok_or("--scale needs a value")?)?,
@@ -431,14 +462,13 @@ fn main() -> Result<(), String> {
             "--boxes-still" => boxes_still = true,
             argument if argument.starts_with("--capture-script=") => debug_script = Some(argument.trim_start_matches("--capture-script=").into()),
             "--help" | "-h" => {
-                println!(
-                    "genos [--scale small|big|N|NxM] [--lights 0..7] [--dynamic 0..100] [--sun-speed 0|1|4|16] [--time 0..24] [--no-sky] [--seed N] [--boxes-still] [--capture-script=PATH]\nClick to capture mouse; WASD + mouse to fly, Space/C to rise or descend, Shift to move faster. Escape releases the mouse."
-                );
+                println!("genos [--scale small|big|N|NxM] [--lights 0..7] [--dynamic 0..100] [--sun-speed 0|1|4|16] [--time 0..24] [--no-sky] [--seed N] [--boxes-still] [--capture-script=PATH]\nClick to capture mouse; WASD + mouse to fly, Space/C to rise or descend, Shift to move faster. Escape releases the mouse.");
                 return Ok(());
             }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
+
     if light_count > MAX_POINT_LIGHTS {
         return Err(format!("--lights must be between 0 and {MAX_POINT_LIGHTS}; the renderer supports eight active lights including the sun"));
     }
@@ -458,27 +488,6 @@ fn main() -> Result<(), String> {
     settings.debug_script = debug_script;
     run(
         settings,
-        GenosDemo {
-            cols,
-            rows,
-            light_count,
-            dynamic_percent,
-            layout: LampLayout::Spread,
-            sun_speed,
-            sun_frozen: false,
-            sky_on,
-            boxes_still,
-            seed,
-            time: 0.0,
-            box_time: 0.0,
-            day: start_day,
-            free_camera: FreeCamera::default(),
-            camera: None,
-            sun: None,
-            lamps: Vec::new(),
-            moving_boxes: Vec::new(),
-            buttons: InspectorButtons::default(),
-            debug_panels: None,
-        },
+        GenosDemo { cols, rows, light_count, dynamic_percent, layout: LampLayout::Spread, sun_speed, sun_frozen: false, sky_on, boxes_still, seed, time: 0.0, box_time: 0.0, day: start_day, free_camera: FreeCamera::default(), camera: None, sun: None, lamps: Vec::new(), moving_boxes: Vec::new(), buttons: InspectorButtons::default(), debug_panels: None },
     )
 }

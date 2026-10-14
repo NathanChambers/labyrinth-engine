@@ -21,6 +21,7 @@ impl Scene {
     pub fn spawn_mesh(&mut self, mesh: Mesh, transform: Transform) -> MeshId {
         let id = MeshId(self.meshes.len());
         self.meshes.push(MeshInstance::new(mesh, transform));
+
         id
     }
 
@@ -29,6 +30,7 @@ impl Scene {
         let mut instance = MeshInstance::new(mesh, transform);
         instance.probe_dynamic = false;
         self.meshes.push(instance);
+
         id
     }
 
@@ -37,30 +39,35 @@ impl Scene {
         let mut instance = MeshInstance::new(mesh, transform);
         instance.material = material;
         self.meshes.push(instance);
+
         id
     }
 
     pub fn spawn_camera(&mut self, camera: Camera) -> CameraId {
         let id = CameraId(self.cameras.len());
         self.cameras.push(camera);
+
         id
     }
 
     pub fn spawn_light(&mut self, light: DirectionalLight) -> LightId {
         let id = LightId(self.lights.len());
         self.lights.push(Light::Directional(light));
+
         id
     }
 
     pub fn spawn_point_light(&mut self, light: PointLight) -> LightId {
         let id = LightId(self.lights.len());
         self.lights.push(Light::Point(light));
+
         id
     }
 
     pub fn spawn_spot_light(&mut self, light: SpotLight) -> LightId {
         let id = LightId(self.lights.len());
         self.lights.push(Light::Spot(light));
+
         id
     }
 

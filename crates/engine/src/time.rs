@@ -30,6 +30,7 @@ impl Time {
     pub fn create_scale(&mut self, factor: f32) -> TimeScaleId {
         let id = TimeScaleId(self.scales.len());
         self.scales.push(TimeScale { factor: factor.max(0.0), elapsed_seconds: 0.0 });
+
         id
     }
 
@@ -42,6 +43,7 @@ impl Time {
             return false;
         };
         scale.factor = factor.max(0.0);
+
         true
     }
 

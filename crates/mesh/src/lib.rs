@@ -22,17 +22,7 @@ pub struct Material {
 
 impl Default for Material {
     fn default() -> Self {
-        Self {
-            base_color: Color::WHITE,
-            metallic: 0.0,
-            roughness: 0.5,
-            emission: Color::BLACK,
-            emission_strength: 0.0,
-            base_color_texture: None,
-            normal_texture: None,
-            metallic_texture: None,
-            roughness_texture: None,
-        }
+        Self { base_color: Color::WHITE, metallic: 0.0, roughness: 0.5, emission: Color::BLACK, emission_strength: 0.0, base_color_texture: None, normal_texture: None, metallic_texture: None, roughness_texture: None }
     }
 }
 
@@ -47,6 +37,7 @@ pub struct Texture {
 impl Texture {
     pub fn from_rgba8(width: u32, height: u32, rgba8: Vec<u8>) -> Result<Self, String> {
         let expected_length = width as usize * height as usize * 4;
+
         if width == 0 || height == 0 || rgba8.len() != expected_length {
             return Err("texture RGBA data must match its non-zero dimensions".into());
         }
@@ -134,6 +125,7 @@ impl Mesh {
         let index = geometry.vertices.len() as u32;
         geometry.vertices.push(vertex);
         geometry.revision = geometry.revision.wrapping_add(1);
+
         index
     }
 
@@ -143,6 +135,7 @@ impl Mesh {
         assert!((third as usize) < self.geometry.vertices.len(), "third mesh index is outside the vertex data");
         let geometry = self.geometry_mut();
         geometry.indices.extend_from_slice(&[first, second, third]);
+
         geometry.revision = geometry.revision.wrapping_add(1);
     }
 
@@ -152,6 +145,7 @@ impl Mesh {
         let third = self.add_vertex(vertices[2]);
         let fourth = self.add_vertex(vertices[3]);
         self.add_triangle(first, second, third);
+
         self.add_triangle(first, third, fourth);
     }
 
@@ -177,6 +171,7 @@ impl Mesh {
             geometry.id = NEXT_MESH_ID.fetch_add(1, Ordering::Relaxed);
             self.geometry = Arc::new(geometry);
         }
+
         Arc::make_mut(&mut self.geometry)
     }
 }
@@ -210,12 +205,14 @@ mod tests {
     #[test]
     fn rejects_invalid_indices() {
         let result = Mesh::from_data(vec![vertex()], vec![0, 1, 0]);
+
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_incomplete_triangles() {
         let result = Mesh::from_data(vec![vertex(); 3], vec![0, 1]);
+
         assert!(result.is_err());
     }
 }

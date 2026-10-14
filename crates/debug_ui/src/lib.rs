@@ -38,6 +38,7 @@ impl FpsCounter {
         let fps = self.frame_count as f32 / self.elapsed_seconds;
         self.elapsed_seconds = 0.0;
         self.frame_count = 0;
+
         Some(fps)
     }
 }
@@ -49,6 +50,7 @@ pub fn format_fps_counter(fps: f32) -> String {
 pub fn add_fps_counter_overlay(context: &mut RuntimeContext) -> UiLabelId {
     let label = context.ui.add_label_layout(None, UiLayout::absolute(labyrinth::UiRect::new(8.0, 8.0, 56.0, 20.0)), "   --", 16.0, Color::WHITE);
     context.ui.set_label_visible_when_debug_ui_hidden(label, true);
+
     label
 }
 
@@ -64,34 +66,31 @@ pub struct DebugPanelsConfig {
 
 impl DebugPanelsConfig {
     pub fn new(title: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-            anchor: UiAnchor::TOP_LEFT,
-            offset: Vec2::new(24.0, 24.0),
-            use_window_background: false,
-            performance_offset: Vec2::new(-24.0, 24.0),
-            extra_gizmo_content_height: 0.0,
-        }
+        Self { title: title.into(), anchor: UiAnchor::TOP_LEFT, offset: Vec2::new(24.0, 24.0), use_window_background: false, performance_offset: Vec2::new(-24.0, 24.0), extra_gizmo_content_height: 0.0 }
     }
 
     pub fn with_position(mut self, anchor: UiAnchor, offset: Vec2) -> Self {
         self.anchor = anchor;
         self.offset = offset;
+
         self
     }
 
     pub fn with_window_background(mut self) -> Self {
         self.use_window_background = true;
+
         self
     }
 
     pub fn with_performance_offset(mut self, offset: Vec2) -> Self {
         self.performance_offset = offset;
+
         self
     }
 
     pub fn with_extra_gizmo_content_height(mut self, height: f32) -> Self {
         self.extra_gizmo_content_height = height.max(0.0);
+
         self
     }
 }
@@ -160,7 +159,9 @@ impl DebugPanels {
         context.ui.set_button_toggled_colors(inspector_header, Color::rgba(0.1, 0.12, 0.17, 1.0), Color::rgba(0.1, 0.12, 0.17, 1.0));
 
         let stack_offset = offset + Vec2::new(0.0, HEADER_HEIGHT + 6.0);
-        let inspector_content = context.ui.add_container(None, UiLayout::anchored(Vec2::new(PANEL_WIDTH, 560.0), anchor, anchor, stack_offset), UiAutoLayout::column(10.0, 3.0));
+        let inspector_content = context
+            .ui
+            .add_container(None, UiLayout::anchored(Vec2::new(PANEL_WIDTH, 560.0), anchor, anchor, stack_offset), UiAutoLayout::column(10.0, 3.0));
         let inspector_window = if let Some(panel) = inspector_panel {
             context.ui.register_panel_window(panel, inspector_header, inspector_content, HEADER_HEIGHT)
         } else {
@@ -176,14 +177,21 @@ impl DebugPanels {
         let gi_support_button = add_mode_button(context, gi_mode_button_container, "SDF Support", context.render_debug_mode == RenderDebugMode::GiSupport);
         let display_mode_buttons = [lit_button, unlit_button, wire_button, gi_support_button];
         let gi_support_hint = context.ui.add_container(display_mode_drawer.content, UiLayout::new(Vec2::new(0.0, 32.0)), UiAutoLayout::column(0.0, 0.0));
-        context.ui.add_label_layout(Some(gi_support_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "SDF Support: R valid cells · G spatial", 9.0, Color::rgb(0.72, 0.76, 0.82));
-        context.ui.add_label_layout(Some(gi_support_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "B directional · magenta means no usable cells", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        context
+            .ui
+            .add_label_layout(Some(gi_support_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "SDF Support: R valid cells · G spatial", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        context.ui.add_label_layout(
+            Some(gi_support_hint),
+            UiLayout::new(Vec2::new(0.0, 16.0)),
+            "B directional · magenta means no usable cells",
+            9.0,
+            Color::rgb(0.72, 0.76, 0.82),
+        );
 
         let render_options_drawer = add_drawer(context, inspector_content, "RENDER OPTIONS", 4.0 * CHECKBOX_ROW_HEIGHT + 3.0 * DRAWER_CONTENT_SPACING);
         let render_options_content = render_options_drawer.content.expect("render options drawer content exists");
         let (irradiance_row, irradiance_button) = add_checkbox(context, render_options_content, "Global illumination", context.render_settings.irradiance_enabled);
-        let (triangle_probe_occlusion_row, triangle_probe_occlusion_button) =
-            add_checkbox(context, render_options_content, "Triangle probe occlusion", context.render_settings.triangle_probe_occlusion_enabled);
+        let (triangle_probe_occlusion_row, triangle_probe_occlusion_button) = add_checkbox(context, render_options_content, "Triangle probe occlusion", context.render_settings.triangle_probe_occlusion_enabled);
         let (probe_relocation_row, probe_relocation_button) = add_checkbox(context, render_options_content, "Relocate GI probes", context.gi_radiance_probe_relocation_enabled);
         let (shadows_row, shadows_button) = add_checkbox(context, render_options_content, "Shadows", context.render_settings.shadows_enabled);
 
@@ -196,8 +204,16 @@ impl DebugPanels {
         let gi_gizmos_content = context.ui.add_container(Some(gizmos_content), UiLayout::new(Vec2::new(0.0, 23.0)), UiAutoLayout::column(0.0, DRAWER_CONTENT_SPACING));
         let (global_probes_row, global_probes_button) = add_checkbox(context, gi_gizmos_content, "GI global probes", context.gi_global_gizmos_enabled);
         let volume_gi_hint = context.ui.add_container(Some(gi_gizmos_content), UiLayout::new(Vec2::new(0.0, 34.0)), UiAutoLayout::column(0.0, 0.0));
-        context.ui.add_label_layout(Some(volume_gi_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "Volume GI: show gizmos for its probe grid.", 9.0, Color::rgb(0.72, 0.76, 0.82));
-        context.ui.add_label_layout(Some(volume_gi_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "Ray inspectors currently require AABB-SDF GI.", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        context
+            .ui
+            .add_label_layout(Some(volume_gi_hint), UiLayout::new(Vec2::new(0.0, 16.0)), "Volume GI: show gizmos for its probe grid.", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        context.ui.add_label_layout(
+            Some(volume_gi_hint),
+            UiLayout::new(Vec2::new(0.0, 16.0)),
+            "Ray inspectors currently require AABB-SDF GI.",
+            9.0,
+            Color::rgb(0.72, 0.76, 0.82),
+        );
         let sdf_gizmos_content = context.ui.add_container(Some(gi_gizmos_content), UiLayout::new(Vec2::new(0.0, 70.0)), UiAutoLayout::column(0.0, DRAWER_CONTENT_SPACING));
         let (sdf_occupancy_row, sdf_occupancy_button) = add_checkbox(context, sdf_gizmos_content, "SDF occupied voxels", context.sdf_occupancy_gizmos_enabled);
         let radiance_inspector = RadianceInspector::new(context, sdf_gizmos_content);
@@ -207,20 +223,28 @@ impl DebugPanels {
         let performance_offset = config.performance_offset;
         let performance_panel_layout = UiLayout::anchored(Vec2::new(PANEL_WIDTH, PERFORMANCE_HEIGHT), performance_anchor, performance_anchor, performance_offset);
         let performance_panel = context.ui.add_panel(performance_panel_layout, Color::rgba(0.03, 0.04, 0.06, 0.94));
-        let performance_header =
-            context.ui.add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(PANEL_WIDTH, HEADER_HEIGHT), performance_anchor, performance_anchor, performance_offset), false);
+        let performance_header = context
+            .ui
+            .add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(PANEL_WIDTH, HEADER_HEIGHT), performance_anchor, performance_anchor, performance_offset), false);
         context.ui.set_button_text(performance_header, "Performance", 15.0, Color::WHITE);
         context.ui.set_button_text_centered(performance_header, false);
         context.ui.set_button_toggled_colors(performance_header, Color::rgba(0.1, 0.12, 0.17, 1.0), Color::rgba(0.1, 0.12, 0.17, 1.0));
         let performance_content = context.ui.add_container(
             None,
-            UiLayout::anchored(Vec2::new(PANEL_WIDTH, PERFORMANCE_HEIGHT - HEADER_HEIGHT), performance_anchor, performance_anchor, performance_offset + Vec2::new(0.0, HEADER_HEIGHT)),
+            UiLayout::anchored(
+                Vec2::new(PANEL_WIDTH, PERFORMANCE_HEIGHT - HEADER_HEIGHT),
+                performance_anchor,
+                performance_anchor,
+                performance_offset + Vec2::new(0.0, HEADER_HEIGHT),
+            ),
             UiAutoLayout::column(10.0, 2.0),
         );
         let performance_label = context.ui.add_label_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 20.0)), "CPU --", 11.0, Color::rgb(0.62, 0.68, 0.78));
         let performance_frame_label = context.ui.add_label_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 20.0)), "FPS -- | Frame -- ms", 12.0, Color::WHITE);
         let fps_counter_label = add_fps_counter_overlay(context);
-        let performance_graph = context.ui.add_graph_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 72.0)), Color::rgb(0.25, 0.75, 1.0), Color::rgba(0.05, 0.07, 0.1, 0.95));
+        let performance_graph = context
+            .ui
+            .add_graph_layout(Some(performance_content), UiLayout::new(Vec2::new(0.0, 72.0)), Color::rgb(0.25, 0.75, 1.0), Color::rgba(0.05, 0.07, 0.1, 0.95));
         let performance_window = context.ui.register_panel_window(performance_panel, performance_header, performance_content, HEADER_HEIGHT);
 
         let mut panels = Self {
@@ -269,6 +293,7 @@ impl DebugPanels {
         };
         panels.update_feature_availability(context);
         panels.update_layout(context);
+
         panels
     }
 
@@ -296,11 +321,15 @@ impl DebugPanels {
         self.update_layout(context);
 
         let modes = [RenderDebugMode::LitMaterials, RenderDebugMode::UnlitMaterials, RenderDebugMode::Wireframe, RenderDebugMode::GiSupport];
-        if let Some((index, _)) =
-            self.display_mode_buttons.iter().enumerate().find(|(index, button)| *index != render_mode_index(context.render_debug_mode) && context.ui.button_toggled(**button).unwrap_or(false))
+        if let Some((index, _)) = self
+            .display_mode_buttons
+            .iter()
+            .enumerate()
+            .find(|(index, button)| *index != render_mode_index(context.render_debug_mode) && context.ui.button_toggled(**button).unwrap_or(false))
         {
             context.render_debug_mode = modes[index];
         }
+
         for (index, button) in self.display_mode_buttons.iter().enumerate() {
             context.ui.set_button_toggled(*button, index == render_mode_index(context.render_debug_mode));
         }
@@ -309,6 +338,7 @@ impl DebugPanels {
         if context.has_irradiance_source() {
             settings.irradiance_enabled = read_checkbox(context, self.irradiance_button, settings.irradiance_enabled);
         }
+
         if context.irradiance_mode == IrradianceMode::AabbSdf && context.has_irradiance_source() {
             settings.triangle_probe_occlusion_enabled = read_checkbox(context, self.triangle_probe_occlusion_button, settings.triangle_probe_occlusion_enabled);
             context.gi_radiance_probe_relocation_enabled = read_checkbox(context, self.probe_relocation_button, context.gi_radiance_probe_relocation_enabled);
@@ -321,6 +351,7 @@ impl DebugPanels {
         if context.has_irradiance_source() {
             context.gi_global_gizmos_enabled = read_checkbox(context, self.global_probes_button, context.gi_global_gizmos_enabled);
         }
+
         if context.irradiance_mode == IrradianceMode::AabbSdf && context.has_irradiance_source() {
             context.sdf_occupancy_gizmos_enabled = read_checkbox(context, self.sdf_occupancy_button, context.sdf_occupancy_gizmos_enabled);
         }
@@ -334,12 +365,16 @@ impl DebugPanels {
         if self.frame_history.len() > 48 {
             self.frame_history.remove(0);
         }
+
         if self.performance_refresh_elapsed >= PERFORMANCE_REFRESH_SECONDS {
             self.performance_refresh_elapsed %= PERFORMANCE_REFRESH_SECONDS;
             let stats = context.performance_stats;
             context.ui.set_label_text(
                 self.performance_label,
-                format!("CPU {:.1} ms | SDF CPU {:.2} GPU {:.2} | GI {:.2} ms", stats.frame_cpu_ms, stats.sdf_build_cpu_ms, stats.gpu_sdf_update_ms, stats.gpu_sdf_gi_ms),
+                format!(
+                    "CPU {:.1} ms | SDF CPU {:.2} GPU {:.2} | GI {:.2} ms",
+                    stats.frame_cpu_ms, stats.sdf_build_cpu_ms, stats.gpu_sdf_update_ms, stats.gpu_sdf_gi_ms
+                ),
             );
             let fps_text = self.fps.map_or_else(|| "--".into(), |fps| format!("{fps:.1}"));
             context.ui.set_label_text(self.performance_frame_label, format!("FPS {fps_text} | Frame {:.2} ms", delta_seconds * 1000.0));
@@ -363,6 +398,7 @@ impl DebugPanels {
         let gi_enabled = gi_source_available && context.render_settings.irradiance_enabled;
         let sdf_gi_available = gi_source_available && context.irradiance_mode == IrradianceMode::AabbSdf;
         let sdf_gi_enabled = sdf_gi_available && context.render_settings.irradiance_enabled;
+
         if !sdf_gi_enabled && context.render_debug_mode == RenderDebugMode::GiSupport {
             context.render_debug_mode = RenderDebugMode::LitMaterials;
         }
@@ -404,8 +440,7 @@ impl DebugPanels {
         };
         context.ui.set_container_size(self.gi_gizmos_content, Vec2::new(0.0, gi_content_height));
         let gizmo_row_count = if gi_enabled { 4 } else { 3 };
-        let gizmo_content_height =
-            3.0 * CHECKBOX_ROW_HEIGHT + (gizmo_row_count - 1) as f32 * DRAWER_CONTENT_SPACING + if gi_enabled { gi_content_height } else { 0.0 } + self.extra_gizmo_content_height;
+        let gizmo_content_height = 3.0 * CHECKBOX_ROW_HEIGHT + (gizmo_row_count - 1) as f32 * DRAWER_CONTENT_SPACING + if gi_enabled { gi_content_height } else { 0.0 } + self.extra_gizmo_content_height;
         self.gizmos_drawer.content_height = gizmo_content_height;
         if let Some(content) = self.gizmos_drawer.content {
             context.ui.set_container_size(content, Vec2::new(0.0, gizmo_content_height));
@@ -415,8 +450,11 @@ impl DebugPanels {
     fn update_layout(&mut self, context: &mut RuntimeContext) {
         let drawers = [self.display_mode_drawer, self.render_options_drawer, self.gizmos_drawer];
         let expanded_drawer_count = drawers.iter().filter(|drawer| drawer.header.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false)).count();
-        let expanded_content_height =
-            drawers.iter().filter(|drawer| drawer.header.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false)).map(|drawer| drawer.content_height).sum::<f32>();
+        let expanded_content_height = drawers
+            .iter()
+            .filter(|drawer| drawer.header.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false))
+            .map(|drawer| drawer.content_height)
+            .sum::<f32>();
         let visible_stack_children = drawers.len() + expanded_drawer_count;
         let stack_height = 20.0 + drawers.len() as f32 * DRAWER_HEADER_HEIGHT + expanded_content_height + 3.0 * visible_stack_children.saturating_sub(1) as f32;
         let panel_height = HEADER_HEIGHT + 6.0 + stack_height;
@@ -424,6 +462,7 @@ impl DebugPanels {
 
         let performance_collapsed = context.ui.panel_window_collapsed(self.performance_window).unwrap_or(false);
         context.ui.set_panel_window_expanded_height(self.performance_window, PERFORMANCE_HEIGHT);
+
         context.ui.set_container_visible(self.performance_content, !performance_collapsed);
     }
 }
@@ -435,6 +474,7 @@ fn add_drawer(context: &mut RuntimeContext, parent: UiContainerId, title: &str, 
     context.ui.set_button_toggled_colors(header, Color::rgb(0.15, 0.2, 0.28), Color::rgb(0.1, 0.12, 0.17));
     let drawer = Drawer { header: Some(header), content: Some(content), content_height };
     update_drawer(context, drawer, title);
+
     drawer
 }
 
@@ -451,12 +491,14 @@ fn add_checkbox(context: &mut RuntimeContext, parent: UiContainerId, title: &str
     context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 18.0)), title, 12.0, Color::WHITE);
     let button = context.ui.add_toggle_button_layout(Some(row), UiLayout::new(Vec2::new(15.0, 15.0)), enabled);
     set_checkbox_mark(&mut context.ui, button);
+
     (row, button)
 }
 
 fn add_mode_button(context: &mut RuntimeContext, parent: UiContainerId, title: &str, selected: bool) -> UiButtonId {
     let button = context.ui.add_toggle_button_layout(Some(parent), UiLayout::new(Vec2::new(68.0, 22.0)), selected);
     context.ui.set_button_text(button, title, 11.0, Color::WHITE);
+
     button
 }
 
@@ -474,10 +516,12 @@ fn render_mode_index(mode: RenderDebugMode) -> usize {
 fn read_checkbox(context: &mut RuntimeContext, button: UiButtonId, fallback: bool) -> bool {
     let enabled = context.ui.button_toggled(button).unwrap_or(fallback);
     set_checkbox_mark(&mut context.ui, button);
+
     enabled
 }
 
 fn set_checkbox_mark(context: &mut labyrinth::UiCanvas, button: UiButtonId) {
     let text = if context.button_toggled(button).unwrap_or(false) { "✓" } else { "" };
+
     context.set_button_text(button, text, 12.0, Color::WHITE);
 }

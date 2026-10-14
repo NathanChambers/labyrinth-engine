@@ -139,6 +139,7 @@ fn handle_connection(mut stream: TcpStream, sender: Sender<McpDebugRequest>) {
     };
     let mut reader = BufReader::new(reader_stream).take(512);
     let mut request = String::new();
+
     if reader.read_line(&mut request).is_err() {
         return;
     }
@@ -202,6 +203,7 @@ fn handle_connection(mut stream: TcpStream, sender: Sender<McpDebugRequest>) {
 
 fn write_payload(stream: &mut TcpStream, payload: &[u8], frame_id: u64, paused: bool) {
     let _ = writeln!(stream, "OK\t{}\t{}\t{}", payload.len(), frame_id, paused);
+
     let _ = stream.write_all(payload);
 }
 
@@ -222,14 +224,7 @@ pub(crate) fn process_requests(requests: &Receiver<McpDebugRequest>, renderer: &
             } else if profiler.pending.is_some() {
                 let _ = reply.send(Err("a frame profile is already running".into()));
             } else {
-                profiler.pending = Some(PendingProfile {
-                    reply,
-                    requested_frames: *frame_count,
-                    include_gpu_timing: *include_gpu_timing,
-                    gpu_timing_available: renderer.gpu_timing_available(),
-                    start_frame_id: frame_id,
-                    samples: Vec::with_capacity(*frame_count as usize),
-                });
+                profiler.pending = Some(PendingProfile { reply, requested_frames: *frame_count, include_gpu_timing: *include_gpu_timing, gpu_timing_available: renderer.gpu_timing_available(), start_frame_id: frame_id, samples: Vec::with_capacity(*frame_count as usize) });
             }
             continue;
         }
@@ -240,12 +235,16 @@ pub(crate) fn process_requests(requests: &Receiver<McpDebugRequest>, renderer: &
                 .map(|pick| McpDebugResponse::Json(viewport_pick_json(pick), 0, false))
                 .ok_or_else(|| "no rendered surface at that viewport pixel".to_owned()),
             McpDebugOperation::GridInfo => Ok(McpDebugResponse::Json(grid_info_json(renderer), 0, false)),
-            McpDebugOperation::Probe { x, y, z } => renderer
-                .inspect_radiance_probe([x, y, z])
-                .and_then(|probe| probe.map(|probe| McpDebugResponse::Json(radiance_probe_json(&probe), 0, false)).ok_or_else(|| "radiance cell coordinate is outside the field".to_owned())),
-            McpDebugOperation::SdfVoxel { x, y, z } => renderer
-                .inspect_sdf_voxel([x, y, z])
-                .and_then(|voxel| voxel.map(|voxel| McpDebugResponse::Json(sdf_voxel_json(voxel), 0, false)).ok_or_else(|| "SDF voxel coordinate is outside the grid".to_owned())),
+            McpDebugOperation::Probe { x, y, z } => renderer.inspect_radiance_probe([x, y, z]).and_then(|probe| {
+                probe
+                    .map(|probe| McpDebugResponse::Json(radiance_probe_json(&probe), 0, false))
+                    .ok_or_else(|| "radiance cell coordinate is outside the field".to_owned())
+            }),
+            McpDebugOperation::SdfVoxel { x, y, z } => renderer.inspect_sdf_voxel([x, y, z]).and_then(|voxel| {
+                voxel
+                    .map(|voxel| McpDebugResponse::Json(sdf_voxel_json(voxel), 0, false))
+                    .ok_or_else(|| "SDF voxel coordinate is outside the grid".to_owned())
+            }),
             McpDebugOperation::Pause => {
                 *paused = true;
                 Ok(McpDebugResponse::Json("{\"state\":\"paused\"}".into(), 0, false))
@@ -274,6 +273,7 @@ fn performance_stats_response(renderer: &mut Renderer) -> Result<McpDebugRespons
     let stats = renderer.performance_stats();
     let gpu_timing_available = renderer.gpu_timing_available();
     let data = performance_stats_json(stats, gpu_timing_available, gpu_timing_available);
+
     Ok(McpDebugResponse::Json(data, 0, false))
 }
 
@@ -286,9 +286,11 @@ fn collect_profile_sample(profiler: &mut McpProfiler, renderer: &mut Renderer, f
         finish_profile(pending, frame_id, false, true, Some("paused"));
         return;
     }
+
     if frame_id <= pending.start_frame_id {
         return;
     }
+
     if pending.include_gpu_timing && pending.gpu_timing_available {
         if let Err(error) = renderer.update_gpu_timestamps() {
             let pending = profiler.pending.take().unwrap();
@@ -328,6 +330,7 @@ fn finish_profile(pending: PendingProfile, frame_id: u64, complete: bool, paused
         samples
     );
     let result = Ok(McpDebugResponse::Json(data, frame_id, paused));
+
     let _ = pending.reply.send(result);
 }
 
@@ -393,7 +396,14 @@ fn metric_summary_json(values: &[f32]) -> String {
     sorted.sort_by(f32::total_cmp);
     let percentile = |fraction: f32| sorted[((sorted.len() as f32 * fraction).ceil() as usize).saturating_sub(1).min(sorted.len() - 1)];
     let mean = sorted.iter().sum::<f32>() / sorted.len() as f32;
-    format!("{{\"mean\":{},\"p50\":{},\"p95\":{},\"p99\":{},\"max\":{}}}", mean, percentile(0.50), percentile(0.95), percentile(0.99), sorted[sorted.len() - 1])
+    format!(
+        "{{\"mean\":{},\"p50\":{},\"p95\":{},\"p99\":{},\"max\":{}}}",
+        mean,
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
+        sorted[sorted.len() - 1]
+    )
 }
 
 fn json_string(value: &str) -> String {
@@ -513,14 +523,13 @@ fn capture_to_file(renderer: &mut Renderer, camera: &Camera, output_root: &Path,
     let capture_id = CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
     let path = directory.join(format!("frame_{capture_id:06}.png"));
     write_buffer_png(&path, &frame, buffer, camera.near_clip, camera.far_clip)?;
+
     Ok(path)
 }
 
 fn write_buffer_png(path: &Path, frame: &CapturedFrame, buffer: CaptureBuffer, near_clip: f32, far_clip: f32) -> Result<(), String> {
     match buffer {
-        CaptureBuffer::Color | CaptureBuffer::Unlit | CaptureBuffer::Wireframe | CaptureBuffer::ShadowVisibility | CaptureBuffer::GiOnly | CaptureBuffer::GiSupport => {
-            write_rgba_png(path, frame.width, frame.height, &frame.rgba8)
-        }
+        CaptureBuffer::Color | CaptureBuffer::Unlit | CaptureBuffer::Wireframe | CaptureBuffer::ShadowVisibility | CaptureBuffer::GiOnly | CaptureBuffer::GiSupport => write_rgba_png(path, frame.width, frame.height, &frame.rgba8),
         CaptureBuffer::SurfaceNormals => {
             let pixels = frame.surface_normals.iter().flatten().copied().collect::<Vec<_>>();
             write_rgba_png(path, frame.width, frame.height, &pixels)
@@ -535,6 +544,7 @@ fn write_buffer_png(path: &Path, frame: &CapturedFrame, buffer: CaptureBuffer, n
 fn write_depth_png(path: &Path, buffer: &CapturedDepthBuffer, camera_clip: Option<(f32, f32)>, layer: usize) -> Result<(), String> {
     let values = buffer.layers.get(layer).ok_or_else(|| format!("requested render buffer layer {layer} is not available in this scene"))?;
     let mut pixels = Vec::with_capacity((buffer.width * buffer.height * 4) as usize);
+
     for value in values.iter().take((buffer.width * buffer.height) as usize) {
         let depth = if let Some((near, far)) = camera_clip {
             let near = near.max(0.001);
@@ -550,6 +560,7 @@ fn write_depth_png(path: &Path, buffer: &CapturedDepthBuffer, camera_clip: Optio
         let intensity = ((1.0 - depth).powf(0.35) * 255.0).round() as u8;
         pixels.extend_from_slice(&[intensity, intensity, intensity, 255]);
     }
+
     write_rgba_png(path, buffer.width, buffer.height, &pixels)
 }
 
@@ -559,5 +570,6 @@ fn write_rgba_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(|error| format!("failed to write MCP PNG header: {error}"))?;
+
     writer.write_image_data(pixels).map_err(|error| format!("failed to write MCP PNG pixels: {error}"))
 }

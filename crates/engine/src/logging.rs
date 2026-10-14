@@ -26,6 +26,7 @@ impl log::Log for EngineLogger {
         };
         let structured_fields = if fields.0.is_empty() { String::new() } else { format!(" {}", fields.0.join(" ")) };
         let mut stderr = io::stderr().lock();
+
         let _ = writeln!(stderr, "{} {:<5} {}{} {}{}", timestamp_utc(), record.level(), record.target(), source, record.args(), structured_fields);
     }
 
@@ -38,6 +39,7 @@ struct FieldCollector(Vec<String>);
 impl<'kvs> VisitSource<'kvs> for FieldCollector {
     fn visit_pair(&mut self, key: Key<'kvs>, value: Value<'kvs>) -> Result<(), log::kv::Error> {
         self.0.push(format!("{key}={value:?}"));
+
         Ok(())
     }
 }
@@ -72,6 +74,7 @@ fn timestamp_utc() -> String {
     let minute = day_seconds % 3_600 / 60;
     let second = day_seconds % 60;
     let milliseconds = duration.subsec_millis();
+
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
 }
 
@@ -86,5 +89,6 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let day = day_of_year - (153 * month_part + 2) / 5 + 1;
     let month = month_part + if month_part < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
+
     (year, month, day)
 }

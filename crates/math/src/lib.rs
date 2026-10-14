@@ -60,6 +60,7 @@ impl Default for DirectionalLight {
 impl Camera {
     pub fn look_at(&mut self, target: Vec3) {
         let direction = (target - self.transform.position).normalize_or_zero();
+
         if direction.length_squared() > 0.0 {
             let yaw = (-direction.x).atan2(-direction.z);
             let pitch = direction.y.asin();
@@ -69,6 +70,7 @@ impl Camera {
 
     pub fn view_projection(&self, aspect_ratio: f32) -> Mat4 {
         let projection = Mat4::perspective_rh(self.field_of_view_y.to_radians(), aspect_ratio, self.near_clip, self.far_clip);
+
         projection * self.transform.matrix().inverse()
     }
 }
@@ -77,6 +79,7 @@ impl Default for Camera {
     fn default() -> Self {
         let mut camera = Self { transform: Transform::from_position(Vec3::new(3.4, 2.5, 5.2)), clear_color: Color::rgb(0.08, 0.11, 0.16), field_of_view_y: 45.0, near_clip: 0.1, far_clip: 100.0 };
         camera.look_at(Vec3::new(0.0, 0.4, 0.0));
+
         camera
     }
 }
@@ -119,6 +122,7 @@ pub enum Easing {
 
 pub fn ease(kind: Easing, t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
+
     match kind {
         Easing::Linear => t,
         Easing::SmoothStep => t * t * (3.0 - 2.0 * t),
@@ -151,6 +155,7 @@ pub fn ping_pong(time: f32, duration: f32) -> f32 {
         return 0.0;
     }
     let cycle = (time / duration).rem_euclid(2.0);
+
     if cycle <= 1.0 { cycle } else { 2.0 - cycle }
 }
 
@@ -203,16 +208,19 @@ impl Transform {
 
     pub fn with_position(mut self, position: Vec3) -> Self {
         self.position = position;
+
         self
     }
 
     pub fn with_rotation(mut self, rotation: Quat) -> Self {
         self.rotation = rotation;
+
         self
     }
 
     pub fn with_scale(mut self, scale: Vec3) -> Self {
         self.scale = scale;
+
         self
     }
 }
@@ -236,6 +244,7 @@ mod tests {
     #[test]
     fn matrix_applies_scale_rotation_and_position() {
         let transform = Transform::new(Vec3::new(3.0, 2.0, 1.0), Quat::IDENTITY, Vec3::splat(2.0));
+
         assert_eq!(transform.transform_point(Vec3::X), Vec3::new(5.0, 2.0, 1.0));
     }
 

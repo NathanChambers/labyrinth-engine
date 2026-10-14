@@ -28,14 +28,7 @@ pub struct IrradianceClipmapDesc {
 
 impl Default for IrradianceClipmapDesc {
     fn default() -> Self {
-        Self {
-            levels: [
-                IrradianceClipmapLevel { extent: Vec3::new(40.0, 20.0, 40.0), resolution: [13, 14, 13] },
-                IrradianceClipmapLevel { extent: Vec3::new(64.0, 48.0, 64.0), resolution: [8, 5, 8] },
-                IrradianceClipmapLevel { extent: Vec3::new(128.0, 96.0, 128.0), resolution: [6, 4, 6] },
-            ],
-            level_count: 3,
-        }
+        Self { levels: [IrradianceClipmapLevel { extent: Vec3::new(40.0, 20.0, 40.0), resolution: [13, 14, 13] }, IrradianceClipmapLevel { extent: Vec3::new(64.0, 48.0, 64.0), resolution: [8, 5, 8] }, IrradianceClipmapLevel { extent: Vec3::new(128.0, 96.0, 128.0), resolution: [6, 4, 6] }], level_count: 3 }
     }
 }
 
@@ -53,10 +46,18 @@ impl IrradianceClipmapLevel {
     fn volume_at(self, camera_position: Vec3) -> IrradianceVolumeDesc {
         let resolution = self.resolution.map(|value| value.max(1));
         let extent = Vec3::new(self.extent.x.max(0.001), self.extent.y.max(0.001), self.extent.z.max(0.001));
-        let spacing =
-            Vec3::new(extent.x / resolution[0].saturating_sub(1).max(1) as f32, extent.y / resolution[1].saturating_sub(1).max(1) as f32, extent.z / resolution[2].saturating_sub(1).max(1) as f32);
-        let center = Vec3::new((camera_position.x / spacing.x).round() * spacing.x, (camera_position.y / spacing.y).round() * spacing.y, (camera_position.z / spacing.z).round() * spacing.z);
+        let spacing = Vec3::new(
+            extent.x / resolution[0].saturating_sub(1).max(1) as f32,
+            extent.y / resolution[1].saturating_sub(1).max(1) as f32,
+            extent.z / resolution[2].saturating_sub(1).max(1) as f32,
+        );
+        let center = Vec3::new(
+            (camera_position.x / spacing.x).round() * spacing.x,
+            (camera_position.y / spacing.y).round() * spacing.y,
+            (camera_position.z / spacing.z).round() * spacing.z,
+        );
         let half_extent = extent * 0.5;
+
         IrradianceVolumeDesc { minimum: center - half_extent, maximum: center + half_extent, resolution, enabled: true }
     }
 }
@@ -89,6 +90,7 @@ impl IrradianceVolumes {
     pub fn add(&mut self, desc: IrradianceVolumeDesc) -> IrradianceVolumeId {
         let id = IrradianceVolumeId(self.volumes.len());
         self.volumes.push(IrradianceVolume { desc });
+
         id
     }
 
@@ -115,6 +117,7 @@ impl IrradianceVolumes {
                 draw_volume_debug_gizmos(gizmos, volume.desc, Color::rgba(0.2, 0.8, 1.0, 0.9));
             }
         }
+
         if matches!(mode, IrradianceMode::Clipmap | IrradianceMode::Combined) {
             for (level, clipmap) in clipmaps.iter().enumerate() {
                 let color = match level {
@@ -134,6 +137,7 @@ fn draw_volume_debug_gizmos(gizmos: &mut GizmoCanvas, desc: IrradianceVolumeDesc
     let extent = desc.maximum - desc.minimum;
     gizmos.ring(center, Vec3::new(extent.x, 0.0, extent.z).length() * 0.15, color);
     let resolution = desc.resolution.map(|value| value.max(1));
+
     for z in 0..resolution[2] {
         for y in 0..resolution[1] {
             for x in 0..resolution[0] {
@@ -146,5 +150,6 @@ fn draw_volume_debug_gizmos(gizmos: &mut GizmoCanvas, desc: IrradianceVolumeDesc
 fn probe_position(desc: IrradianceVolumeDesc, coordinate: [u32; 3]) -> Vec3 {
     let denominator = [desc.resolution[0].saturating_sub(1).max(1), desc.resolution[1].saturating_sub(1).max(1), desc.resolution[2].saturating_sub(1).max(1)];
     let fraction = Vec3::new(coordinate[0] as f32 / denominator[0] as f32, coordinate[1] as f32 / denominator[1] as f32, coordinate[2] as f32 / denominator[2] as f32);
+
     desc.minimum + (desc.maximum - desc.minimum) * fraction
 }

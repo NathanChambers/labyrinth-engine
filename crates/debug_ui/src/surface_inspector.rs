@@ -49,12 +49,20 @@ impl SurfaceInspector {
         let pick_button = context.ui.add_toggle_button_layout(Some(pick_row), UiLayout::new(Vec2::new(128.0, 28.0)), false);
         context.ui.set_button_text(pick_button, "Pick surface", 12.0, Color::WHITE);
         context.ui.set_button_toggled_colors(pick_button, Color::rgb(0.5, 0.28, 0.12), Color::rgb(0.15, 0.2, 0.28));
-        let status = context.ui.add_label_layout(Some(pick_row), UiLayout::new(Vec2::new(0.0, 22.0)), "Open, then pick a scene surface", 12.0, Color::rgb(0.72, 0.76, 0.82));
-        let field_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "Active field: scene radiance field", 12.0, Color::rgb(0.72, 0.76, 0.82));
+        let status = context
+            .ui
+            .add_label_layout(Some(pick_row), UiLayout::new(Vec2::new(0.0, 22.0)), "Open, then pick a scene surface", 12.0, Color::rgb(0.72, 0.76, 0.82));
+        let field_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "Active field: scene radiance field", 12.0, Color::rgb(0.72, 0.76, 0.82));
         let point_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "Surface: --", 12.0, Color::WHITE);
         let normal_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "Normal: --", 12.0, Color::rgb(0.2, 0.6, 1.0));
-        let sdf_origin_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "SDF start voxel: -- · origin offset: --", 12.0, Color::rgb(0.85, 0.72, 0.35));
-        let visibility_summary_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "Triangle visibility: --", 12.0, Color::rgb(0.55, 0.95, 0.62));
+        let sdf_origin_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "SDF start voxel: -- · origin offset: --", 12.0, Color::rgb(0.85, 0.72, 0.35));
+        let visibility_summary_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "Triangle visibility: --", 12.0, Color::rgb(0.55, 0.95, 0.62));
         let sdf_summary_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 20.0)), "SDF comparison: --", 11.0, Color::rgb(1.0, 0.62, 0.22));
         context.ui.add_label_layout(
             Some(content),
@@ -66,9 +74,14 @@ impl SurfaceInspector {
         let mut candidate_first_labels = [None; CANDIDATE_COUNT];
         let mut candidate_second_labels = [None; CANDIDATE_COUNT];
         let mut candidate_third_labels = [None; CANDIDATE_COUNT];
+
         for index in 0..CANDIDATE_COUNT {
             let row = context.ui.add_container(Some(content), UiLayout::new(Vec2::new(0.0, 52.0)), UiAutoLayout::column(0.0, 0.0));
-            candidate_first_labels[index] = Some(context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 17.0)), format!("P{index}: waiting for a surface sample"), 11.0, Color::WHITE));
+            candidate_first_labels[index] = Some(
+                context
+                    .ui
+                    .add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 17.0)), format!("P{index}: waiting for a surface sample"), 11.0, Color::WHITE),
+            );
             candidate_second_labels[index] = Some(context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 17.0)), "", 11.0, Color::rgb(0.72, 0.76, 0.82)));
             candidate_third_labels[index] = Some(context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 17.0)), "", 11.0, Color::rgb(0.85, 0.72, 0.35)));
         }
@@ -108,6 +121,7 @@ impl SurfaceInspector {
             context.gi_surface_inspector_pick_request = None;
             return;
         }
+
         if !field_enabled {
             self.pick_armed = false;
             context.ui.set_button_toggled(self.pick_button, false);
@@ -133,7 +147,9 @@ impl SurfaceInspector {
 
         let inspection = context.gi_surface_inspection;
         let grid = context.gi_radiance_field_grid;
-        context.ui.set_label_text(self.field_label, format!("Active field: scene · {} × {} × {} probes", grid.resolution[0], grid.resolution[1], grid.resolution[2]));
+        context
+            .ui
+            .set_label_text(self.field_label, format!("Active field: scene · {} × {} × {} probes", grid.resolution[0], grid.resolution[1], grid.resolution[2]));
         if context.gi_surface_inspection_pending {
             context.ui.set_label_text(self.status, "Sampling depth-prepass surface...");
             context.ui.set_label_text(self.point_label, "Surface: sampling...");
@@ -152,6 +168,7 @@ impl SurfaceInspector {
         } else if !self.has_requested_sample {
             context.ui.set_label_text(self.status, "Pick a surface to inspect its eight candidates");
         }
+
         if !inspection.valid {
             if self.has_requested_sample && !context.gi_surface_inspection_pending {
                 context.ui.set_label_text(self.visibility_summary_label, "No triangle visibility result available");
@@ -176,7 +193,10 @@ impl SurfaceInspector {
         } else {
             "clear"
         };
-        context.ui.set_label_text(self.sdf_origin_label, format!("SDF start voxel: {sdf_start_voxel} · {sdf_start_occupancy} · origin offset {} m", format_vec3(inspection.sdf_origin_offset)));
+        context.ui.set_label_text(
+            self.sdf_origin_label,
+            format!("SDF start voxel: {sdf_start_voxel} · {sdf_start_occupancy} · origin offset {} m", format_vec3(inspection.sdf_origin_offset)),
+        );
         if let Some((index, candidate)) = candidate_with_most_contribution(inspection) {
             let mesh_blocked = candidate.triangle_occlusion_tested && candidate.triangle_occluded;
             let sdf_blocked = candidate.has_occupied_voxel_after_start;
@@ -215,6 +235,7 @@ impl SurfaceInspector {
             context.ui.set_label_text(self.visibility_summary_label, "No valid probe candidates to inspect");
             context.ui.set_label_text(self.sdf_summary_label, "SDF comparison: no valid probe candidates");
         }
+
         if !inspection.inside_field {
             if !context.gi_surface_inspection_pending {
                 context.ui.set_label_text(self.status, "Surface is outside the scene radiance field");
@@ -228,12 +249,16 @@ impl SurfaceInspector {
             }
             return;
         }
+
         for (index, candidate) in inspection.candidates.iter().enumerate() {
             let (first, second, third) = candidate_text(index, *candidate);
             context.ui.set_label_text(self.candidate_first_labels[index], first);
             context.ui.set_label_text(self.candidate_second_labels[index], second);
             context.ui.set_label_text(self.candidate_third_labels[index], third);
-            context.ui.set_label_color(self.candidate_second_labels[index], if candidate.probe_valid { color(candidate.contribution_radiance) } else { Color::rgb(1.0, 0.35, 0.25) });
+            context.ui.set_label_color(
+                self.candidate_second_labels[index],
+                if candidate.probe_valid { color(candidate.contribution_radiance) } else { Color::rgb(1.0, 0.35, 0.25) },
+            );
             context.ui.set_label_color(self.candidate_third_labels[index], candidate_visibility_color(*candidate));
         }
     }
@@ -265,14 +290,24 @@ fn format_vec3i(value: [i32; 3]) -> String {
 }
 
 fn candidate_with_most_contribution(inspection: labyrinth::RendererRadianceSurfaceInspection) -> Option<(usize, RendererRadianceSurfaceCandidate)> {
-    inspection.candidates.iter().copied().enumerate().filter(|(_, candidate)| candidate.probe_valid).max_by(|(_, first), (_, second)| first.final_weight.total_cmp(&second.final_weight))
+    inspection
+        .candidates
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.probe_valid)
+        .max_by(|(_, first), (_, second)| first.final_weight.total_cmp(&second.final_weight))
 }
 
 fn candidate_visibility_text(candidate: RendererRadianceSurfaceCandidate) -> String {
     if !candidate.triangle_occlusion_tested {
         return "Mesh: not tested · SDF voxel: --".to_string();
     }
-    let sdf_status = if candidate.has_occupied_voxel_after_start { format!("SDF voxel {}", format_vec3i(candidate.first_occupied_after_start)) } else { "SDF clear".to_string() };
+    let sdf_status = if candidate.has_occupied_voxel_after_start {
+        format!("SDF voxel {}", format_vec3i(candidate.first_occupied_after_start))
+    } else {
+        "SDF clear".to_string()
+    };
     if candidate.triangle_occluded {
         format!(
             "Mesh HIT I{}/T{} d={:.2} @ {} n={} b={} · {sdf_status}",
@@ -310,5 +345,6 @@ fn color(value: [f32; 3]) -> Color {
 
 fn display_radiance(value: f32) -> f32 {
     let value = value.max(0.0);
+
     value / (1.0 + value)
 }

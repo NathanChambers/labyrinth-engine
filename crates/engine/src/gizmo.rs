@@ -19,6 +19,7 @@ impl GizmoCanvas {
 
     pub fn line(&mut self, start: Vec3, end: Vec3, color: Color) {
         self.vertices.push(GizmoVertex { position: start, color });
+
         self.vertices.push(GizmoVertex { position: end, color });
     }
 
@@ -40,16 +41,22 @@ impl GizmoCanvas {
 
     pub fn ring(&mut self, center: Vec3, radius: f32, color: Color) {
         let segments = 24;
+
         for index in 0..segments {
             let first = std::f32::consts::TAU * index as f32 / segments as f32;
             let second = std::f32::consts::TAU * (index + 1) as f32 / segments as f32;
-            self.line(center + Vec3::new(first.cos() * radius, 0.0, first.sin() * radius), center + Vec3::new(second.cos() * radius, 0.0, second.sin() * radius), color);
+            self.line(
+                center + Vec3::new(first.cos() * radius, 0.0, first.sin() * radius),
+                center + Vec3::new(second.cos() * radius, 0.0, second.sin() * radius),
+                color,
+            );
         }
     }
 
     pub fn dot(&mut self, position: Vec3, radius: f32, color: Color) {
         self.line(position - Vec3::X * radius, position + Vec3::X * radius, color);
         self.line(position - Vec3::Y * radius, position + Vec3::Y * radius, color);
+
         self.line(position - Vec3::Z * radius, position + Vec3::Z * radius, color);
     }
 
@@ -93,6 +100,7 @@ impl GizmoCanvas {
 
     pub fn mesh_normals(&mut self, instances: &[MeshInstance], length: f32) {
         let color = Color::rgb(1.0, 0.35, 0.1);
+
         for instance in instances {
             for triangle in instance.mesh.indices().as_chunks::<3>().0.iter().step_by(4) {
                 let Some(vertex_a) = instance.mesh.vertices().get(triangle[0] as usize) else { continue };
@@ -110,6 +118,7 @@ impl GizmoCanvas {
 
     fn ring_axis(&mut self, center: Vec3, axis: Vec3, radius: f32, color: Color) {
         let (right, up) = cone_basis(axis.normalize_or_zero());
+
         for index in 0..24 {
             let first = std::f32::consts::TAU * index as f32 / 24.0;
             let second = std::f32::consts::TAU * (index + 1) as f32 / 24.0;
@@ -126,5 +135,6 @@ fn cone_basis(axis: Vec3) -> (Vec3, Vec3) {
     let reference = if axis.dot(Vec3::Y).abs() < 0.95 { Vec3::Y } else { Vec3::X };
     let right = axis.cross(reference).normalize_or_zero();
     let up = right.cross(axis).normalize_or_zero();
+
     (right, up)
 }

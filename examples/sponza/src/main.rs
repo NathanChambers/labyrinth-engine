@@ -19,6 +19,7 @@ impl Application for SponzaDemo {
         context.render_settings.ambient_intensity = 0.08;
 
         let imported_meshes = load_fbx_allow_missing_textures(&self.model_path)?;
+
         for imported in imported_meshes {
             context.scene.spawn_mesh_with_material(imported.mesh, imported.transform, imported.material);
         }
@@ -30,13 +31,20 @@ impl Application for SponzaDemo {
             self.free_camera = FreeCamera::from_rotation(camera.transform.rotation);
         }
         context.active_camera = Some(camera);
-        let sun = context.scene.spawn_light(DirectionalLight { direction: Vec3::new(0.35, 0.82, 0.45).normalize(), color: Color::rgb(1.0, 0.9, 0.76), intensity: 1.4 });
+        let sun = context
+            .scene
+            .spawn_light(DirectionalLight { direction: Vec3::new(0.35, 0.82, 0.45).normalize(), color: Color::rgb(1.0, 0.9, 0.76), intensity: 1.4 });
         context.active_lights = vec![sun];
         context.sky_lighting = labyrinth::RendererSkyLighting { color: Color::rgb(0.32, 0.38, 0.5), intensity: 0.35 };
         let font_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/default.ttf");
         context.ui.set_font(FontAsset::from_file(font_path)?);
-        self.debug_panels =
-            Some(DebugPanels::new(context, DebugPanelsConfig::new("Render Debug").with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0)).with_performance_offset(Vec2::new(-24.0, 500.0))));
+        self.debug_panels = Some(DebugPanels::new(
+            context,
+            DebugPanelsConfig::new("Render Debug")
+                .with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0))
+                .with_performance_offset(Vec2::new(-24.0, 500.0)),
+        ));
+
         Ok(())
     }
 
@@ -46,6 +54,7 @@ impl Application for SponzaDemo {
         let camera_id = context.active_camera.ok_or("active camera was not assigned")?;
         let delta_seconds = context.time.delta_seconds();
         self.free_camera.update(context, camera_id, delta_seconds, movement_keys_active)?;
+
         Ok(())
     }
 }
@@ -53,11 +62,13 @@ impl Application for SponzaDemo {
 fn main() -> Result<(), String> {
     let mut settings = WindowSettings { title: "Labyrinth Engine — Sponza".into(), ..WindowSettings::default() };
     let mut model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/meshes/Sponza.fbx");
+
     for argument in std::env::args().skip(1) {
         if let Some(path) = argument.strip_prefix("--model=") {
             model_path = PathBuf::from(path);
             continue;
         }
+
         match argument.as_str() {
             "--windowed" => settings.mode = WindowMode::Windowed,
             "--borderless" => settings.mode = WindowMode::Borderless,
@@ -70,8 +81,10 @@ fn main() -> Result<(), String> {
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
+
     if !model_path.is_file() {
         return Err(format!("Sponza FBX does not exist: {}", model_path.display()));
     }
+
     run(settings, SponzaDemo { model_path, debug_panels: None, free_camera: FreeCamera::default() })
 }

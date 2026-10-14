@@ -1,7 +1,4 @@
-use labyrinth::{
-    Color, KeyCode, RadianceAngularResolution, RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererRadianceFieldGrid, RuntimeContext, UiAnchor, UiAutoLayout, UiButtonId, UiContainerId,
-    UiLabelId, UiLayout, UiPanelWindowId, Vec2, Vec3,
-};
+use labyrinth::{Color, KeyCode, RadianceAngularResolution, RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererRadianceFieldGrid, RuntimeContext, UiAnchor, UiAutoLayout, UiButtonId, UiContainerId, UiLabelId, UiLayout, UiPanelWindowId, Vec2, Vec3};
 
 const INSPECTOR_WIDTH: f32 = 440.0;
 const INSPECTOR_TOP: f32 = 220.0;
@@ -97,7 +94,9 @@ impl RadianceInspector {
         let gpu_timing_button = context.ui.add_toggle_button_layout(Some(gpu_timing_row), UiLayout::new(Vec2::new(136.0, 22.0)), false);
         context.ui.set_button_text(gpu_timing_button, "Sample GPU timing", 10.0, Color::WHITE);
         context.ui.set_button_toggled_colors(gpu_timing_button, Color::rgb(0.18, 0.32, 0.44), Color::rgb(0.15, 0.2, 0.28));
-        let gpu_timing_label = context.ui.add_label_layout(Some(gpu_timing_row), UiLayout::new(Vec2::new(210.0, 18.0)), "Scene pass GPU: -- ms", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let gpu_timing_label = context
+            .ui
+            .add_label_layout(Some(gpu_timing_row), UiLayout::new(Vec2::new(210.0, 18.0)), "Scene pass GPU: -- ms", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let tool_row = context.ui.add_container(Some(content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 6.0));
         let pick_button = context.ui.add_toggle_button_layout(Some(tool_row), UiLayout::new(Vec2::new(96.0, 22.0)), false);
         context.ui.set_button_text(pick_button, "Pick surface", 11.0, Color::WHITE);
@@ -105,32 +104,52 @@ impl RadianceInspector {
         let move_button = context.ui.add_toggle_button_layout(Some(tool_row), UiLayout::new(Vec2::new(96.0, 22.0)), false);
         context.ui.set_button_text(move_button, "Move cell", 11.0, Color::WHITE);
         context.ui.set_button_toggled_colors(move_button, Color::rgb(0.18, 0.42, 0.3), Color::rgb(0.15, 0.2, 0.28));
-        let status_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 16.0)), "Pick a surface or move the selected cell", 10.0, Color::rgb(0.72, 0.76, 0.82));
-        let cell_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Radiance field · cell (4, 1, 4) / (16, 4, 16)", 11.0, Color::rgb(0.72, 0.76, 0.82));
-        let grid_metrics_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Field size: -- · Cell size: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let status_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 16.0)), "Pick a surface or move the selected cell", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let cell_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Radiance field · cell (4, 1, 4) / (16, 4, 16)", 11.0, Color::rgb(0.72, 0.76, 0.82));
+        let grid_metrics_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Field size: -- · Cell size: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let cell_world_position_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Cell center: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
-        let coverage_label = context.ui.add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Coverage: waiting for GPU readback", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let coverage_label = context
+            .ui
+            .add_label_layout(Some(content), UiLayout::new(Vec2::new(0.0, 15.0)), "Coverage: waiting for GPU readback", 10.0, Color::rgb(0.72, 0.76, 0.82));
 
         let cell_drawer = add_drawer(context, content, "RADIANCE CELL", true, 250.0);
         let cell_content = cell_drawer.content.expect("radiance cell content exists");
         let angular_resolution_row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 22.0)), UiAutoLayout::row(0.0, 5.0));
-        context.ui.add_label_layout(Some(angular_resolution_row), UiLayout::new(Vec2::new(66.0, 18.0)), "Sphere bins", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        context
+            .ui
+            .add_label_layout(Some(angular_resolution_row), UiLayout::new(Vec2::new(66.0, 18.0)), "Sphere bins", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let angular_resolution_buttons = [
             add_mode_button(context, angular_resolution_row, "8", context.gi_angular_resolution == RadianceAngularResolution::Low),
             add_mode_button(context, angular_resolution_row, "32", context.gi_angular_resolution == RadianceAngularResolution::Balanced),
             add_mode_button(context, angular_resolution_row, "64", context.gi_angular_resolution == RadianceAngularResolution::High),
         ];
-        let angular_coverage_label = context.ui.add_label_layout(Some(cell_content), UiLayout::new(Vec2::new(0.0, 16.0)), "Angular coverage: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
-        let angular_legend_label =
-            context.ui.add_label_layout(Some(cell_content), UiLayout::new(Vec2::new(0.0, 16.0)), "White = recent sample · fades to black when stale or missed", 9.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_coverage_label = context
+            .ui
+            .add_label_layout(Some(cell_content), UiLayout::new(Vec2::new(0.0, 16.0)), "Angular coverage: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_legend_label = context.ui.add_label_layout(
+            Some(cell_content),
+            UiLayout::new(Vec2::new(0.0, 16.0)),
+            "White = recent sample · fades to black when stale or missed",
+            9.0,
+            Color::rgb(0.72, 0.76, 0.82),
+        );
         let angular_sample_page_row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 20.0)), UiAutoLayout::row(0.0, 5.0));
         let angular_sample_previous_button = context.ui.add_toggle_button_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(24.0, 20.0)), false);
         context.ui.set_button_text(angular_sample_previous_button, "<", 11.0, Color::WHITE);
-        let angular_sample_page_label = context.ui.add_label_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(155.0, 18.0)), "Regions 1-8 / 32", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let angular_sample_page_label = context
+            .ui
+            .add_label_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(155.0, 18.0)), "Regions 1-8 / 32", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let angular_sample_next_button = context.ui.add_toggle_button_layout(Some(angular_sample_page_row), UiLayout::new(Vec2::new(24.0, 20.0)), false);
         context.ui.set_button_text(angular_sample_next_button, ">", 11.0, Color::WHITE);
         let mut angular_sample_swatches = [None; ANGULAR_SAMPLE_PAGE_SIZE];
         let mut angular_sample_labels = [None; ANGULAR_SAMPLE_PAGE_SIZE];
+
         for sample_index in 0..ANGULAR_SAMPLE_PAGE_SIZE {
             let row = context.ui.add_container(Some(cell_content), UiLayout::new(Vec2::new(0.0, 18.0)), UiAutoLayout::row(0.0, 5.0));
             angular_sample_swatches[sample_index] = Some(add_color_swatch(context, row, [0.0; 3], 14.0));
@@ -156,7 +175,9 @@ impl RadianceInspector {
         let sampling_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Direction: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let cell_center_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Cell center: --", 10.0, Color::rgb(0.15, 0.85, 1.0));
         let ray_origin_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Ray origin: --", 10.0, Color::WHITE);
-        let relocation_offset_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Relocation offset: --", 10.0, Color::rgb(1.0, 0.72, 0.12));
+        let relocation_offset_label = context
+            .ui
+            .add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Relocation offset: --", 10.0, Color::rgb(1.0, 0.72, 0.12));
         let hit_position_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Hit position: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
         let hit_normal_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 15.0)), "Normal: --", 10.0, Color::rgb(0.15, 0.5, 1.0));
         let total_row = context.ui.add_container(Some(ray_content), UiLayout::new(Vec2::new(0.0, 20.0)), UiAutoLayout::row(0.0, 5.0));
@@ -166,7 +187,9 @@ impl RadianceInspector {
         let (direct_swatch, direct_label) = add_color_value_row(context, ray_content, "Direct");
         let (emission_swatch, emission_label) = add_color_value_row(context, ray_content, "Emission");
         let (sky_swatch, sky_label) = add_color_value_row(context, ray_content, "Sky");
-        let ray_weights_label = context.ui.add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 30.0)), "Directional weights: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
+        let ray_weights_label = context
+            .ui
+            .add_label_layout(Some(ray_content), UiLayout::new(Vec2::new(0.0, 30.0)), "Directional weights: --", 10.0, Color::rgb(0.72, 0.76, 0.82));
 
         Self {
             open_button,
@@ -261,6 +284,7 @@ impl RadianceInspector {
         } else if move_enabled {
             context.ui.set_button_toggled(self.pick_button, false);
         }
+
         if self.pick_armed && !was_pick_armed {
             context.ui.set_label_text(self.status_label, "Click a mesh surface in the scene");
         } else if move_enabled && !was_move_enabled {
@@ -285,12 +309,7 @@ impl RadianceInspector {
         let coverage_text = if context.performance_stats.gi_coverage_available {
             format!(
                 "Coverage {:.1}% / ≥2 {:.1}% · tried {:.1}% · valid {:.1}% · pending {} · rays {}",
-                context.performance_stats.gi_region_coverage_percent,
-                context.performance_stats.gi_regions_covered_twice_percent,
-                context.performance_stats.gi_regions_attempted_percent,
-                context.performance_stats.gi_valid_cells_percent,
-                context.performance_stats.gi_pending_cells,
-                context.performance_stats.gi_rays_scheduled,
+                context.performance_stats.gi_region_coverage_percent, context.performance_stats.gi_regions_covered_twice_percent, context.performance_stats.gi_regions_attempted_percent, context.performance_stats.gi_valid_cells_percent, context.performance_stats.gi_pending_cells, context.performance_stats.gi_rays_scheduled,
             )
         } else {
             "Coverage: waiting for GPU readback".to_owned()
@@ -307,17 +326,20 @@ impl RadianceInspector {
         context.normal_gizmos_enabled &= !radiance_focus;
         context.light_gizmos_enabled &= !radiance_focus;
         context.sdf_occupancy_gizmos_enabled &= !radiance_focus;
+
         self.movement_keys_active
     }
 
     fn panel_height(&self, context: &RuntimeContext) -> f32 {
         let cell_open = self.cell_drawer.header.and_then(|button| context.ui.button_toggled(button)).unwrap_or(true);
         let rays_open = self.rays_drawer.header.and_then(|button| context.ui.button_toggled(button)).unwrap_or(false);
+
         272.0 + if cell_open { self.cell_drawer.content_height } else { 0.0 } + if rays_open { self.rays_drawer.content_height } else { 0.0 }
     }
 
     fn update_cell_selection(&mut self, context: &mut RuntimeContext) {
         let grid = selected_grid(context);
+
         for axis in 0..3 {
             context.gi_selected_radiance_cell[axis] = context.gi_selected_radiance_cell[axis].min(grid.resolution[axis].saturating_sub(1));
         }
@@ -334,7 +356,10 @@ impl RadianceInspector {
             ),
         );
         if field_extent.is_finite() && field_extent.min_element() > 0.0 {
-            context.ui.set_label_text(self.grid_metrics_label, format!("Field size: {} m · Cell size: {} m", format_vec3(field_extent.to_array()), format_vec3(cell_size.to_array())));
+            context.ui.set_label_text(
+                self.grid_metrics_label,
+                format!("Field size: {} m · Cell size: {} m", format_vec3(field_extent.to_array()), format_vec3(cell_size.to_array())),
+            );
             context.ui.set_label_text(self.cell_world_position_label, format!("Cell center: {}", format_vec3(cell_center.to_array())));
         } else {
             context.ui.set_label_text(self.grid_metrics_label, "Field size: waiting for renderer bounds");
@@ -346,6 +371,7 @@ impl RadianceInspector {
         if !self.pick_armed || !context.input.left_mouse_pressed() || context.ui.pointer_press_consumed() {
             return;
         }
+
         match raycast_scene(context) {
             Some(position) => {
                 if let Some((cell, _)) = nearest_cell_in_grid(position, selected_grid(context)) {
@@ -361,6 +387,7 @@ impl RadianceInspector {
         }
         self.pick_armed = false;
         context.ui.set_button_toggled(self.pick_button, false);
+
         context.cursor_capture_on_scene_click = true;
     }
 
@@ -371,12 +398,7 @@ impl RadianceInspector {
             return;
         }
         let input = &context.input;
-        let mask = u8::from(input.is_key_down(KeyCode::KeyW))
-            | (u8::from(input.is_key_down(KeyCode::KeyS)) << 1)
-            | (u8::from(input.is_key_down(KeyCode::KeyA)) << 2)
-            | (u8::from(input.is_key_down(KeyCode::KeyD)) << 3)
-            | (u8::from(input.is_key_down(KeyCode::KeyR)) << 4)
-            | (u8::from(input.is_key_down(KeyCode::KeyF)) << 5);
+        let mask = u8::from(input.is_key_down(KeyCode::KeyW)) | (u8::from(input.is_key_down(KeyCode::KeyS)) << 1) | (u8::from(input.is_key_down(KeyCode::KeyA)) << 2) | (u8::from(input.is_key_down(KeyCode::KeyD)) << 3) | (u8::from(input.is_key_down(KeyCode::KeyR)) << 4) | (u8::from(input.is_key_down(KeyCode::KeyF)) << 5);
         if mask == 0 {
             self.previous_move_mask = 0;
             self.move_repeat_elapsed = 0.0;
@@ -398,15 +420,18 @@ impl RadianceInspector {
             self.move_repeat_elapsed = 0.0;
             context.ui.set_label_text(self.status_label, "W/S: Z · A/D: X · R/F: Y");
         }
+
         self.previous_move_mask = mask;
     }
 
     fn update_ray_selection(&mut self, context: &mut RuntimeContext) {
         context.gi_trace_selected_ray = context.gi_trace_selected_ray.min(RAY_COUNT as u32 - 1);
         let current_ray = context.gi_trace_selected_ray as usize;
+
         if let Some((index, _)) = self.ray_buttons.iter().enumerate().find(|(index, button)| *index != current_ray && context.ui.button_toggled(**button).unwrap_or(false)) {
             context.gi_trace_selected_ray = index as u32;
         }
+
         for (index, button) in self.ray_buttons.iter().enumerate() {
             context.ui.set_button_toggled(*button, index as u32 == context.gi_trace_selected_ray);
         }
@@ -419,15 +444,23 @@ impl RadianceInspector {
             _ => mode,
         };
         context.ui.set_button_toggled(self.geometry_button, context.gi_trace_debug_mode == RendererGiTraceDebugMode::Geometry);
+
         context.ui.set_button_toggled(self.radiance_button, context.gi_trace_debug_mode == RendererGiTraceDebugMode::Radiance);
     }
 
     fn update_angular_resolution(&mut self, context: &mut RuntimeContext) {
         let choices = [RadianceAngularResolution::Low, RadianceAngularResolution::Balanced, RadianceAngularResolution::High];
         let selected_index = choices.iter().position(|choice| *choice == context.gi_angular_resolution).unwrap_or(1);
-        if let Some((index, _)) = self.angular_resolution_buttons.iter().enumerate().find(|(index, button)| *index != selected_index && context.ui.button_toggled(**button).unwrap_or(false)) {
+
+        if let Some((index, _)) = self
+            .angular_resolution_buttons
+            .iter()
+            .enumerate()
+            .find(|(index, button)| *index != selected_index && context.ui.button_toggled(**button).unwrap_or(false))
+        {
             context.gi_angular_resolution = choices[index];
         }
+
         for (index, button) in self.angular_resolution_buttons.iter().enumerate() {
             context.ui.set_button_toggled(*button, choices[index] == context.gi_angular_resolution);
         }
@@ -442,10 +475,13 @@ impl RadianceInspector {
         let displayed_trace = if trace_is_current { selected_trace } else { RendererGiRayDiagnostic::default() };
         let active_region_count = context.gi_angular_resolution.segment_count() as usize;
         let angular_data_is_current = context.gi_angular_segments_cell == cell;
+
         if angular_data_is_current {
             let sampled_region_count = context.gi_angular_segments.iter().take(active_region_count).filter(|segment| segment.sampled).count();
             let fresh_region_count = context.gi_angular_segments.iter().take(active_region_count).filter(|segment| segment.sampled && segment.age_frames <= 60).count();
-            context.ui.set_label_text(self.angular_coverage_label, format!("Coverage: {sampled_region_count}/{active_region_count} sampled · {fresh_region_count} fresh"));
+            context
+                .ui
+                .set_label_text(self.angular_coverage_label, format!("Coverage: {sampled_region_count}/{active_region_count} sampled · {fresh_region_count} fresh"));
         } else {
             context.ui.set_label_text(self.angular_coverage_label, "Coverage: reading selected cell…");
         }
@@ -474,15 +510,17 @@ impl RadianceInspector {
         context.ui.set_label_text(self.ray_origin_label, format!("Ray origin: {ray_origin_text}"));
         context.ui.set_label_text(self.relocation_offset_label, format!("Relocation offset: {relocation_offset_text}"));
         let hit = trace_is_current && displayed_trace.termination_reason == 1;
-        context.ui.set_label_text(self.hit_position_label, format!("Hit position: {}", if hit { format_vec3(displayed_trace.hit_position) } else { "--".to_owned() }));
-        context.ui.set_label_text(self.hit_normal_label, format!("Normal: {}", if hit { format_vec3(displayed_trace.hit_normal) } else { "--".to_owned() }));
+        context
+            .ui
+            .set_label_text(self.hit_position_label, format!("Hit position: {}", if hit { format_vec3(displayed_trace.hit_position) } else { "--".to_owned() }));
+        context
+            .ui
+            .set_label_text(self.hit_normal_label, format!("Normal: {}", if hit { format_vec3(displayed_trace.hit_normal) } else { "--".to_owned() }));
         update_swatch(context, self.total_swatch, displayed_trace.radiance);
-        context.ui.set_label_text(self.total_label, if trace_is_current { format!("RGB {}", format_rgb(displayed_trace.radiance)) } else { "RGB --".to_owned() });
-        for (swatch, label, value) in [
-            (self.direct_swatch, self.direct_label, displayed_trace.direct_radiance),
-            (self.emission_swatch, self.emission_label, displayed_trace.emission_radiance),
-            (self.sky_swatch, self.sky_label, displayed_trace.sky_radiance),
-        ] {
+        context
+            .ui
+            .set_label_text(self.total_label, if trace_is_current { format!("RGB {}", format_rgb(displayed_trace.radiance)) } else { "RGB --".to_owned() });
+        for (swatch, label, value) in [(self.direct_swatch, self.direct_label, displayed_trace.direct_radiance), (self.emission_swatch, self.emission_label, displayed_trace.emission_radiance), (self.sky_swatch, self.sky_label, displayed_trace.sky_radiance)] {
             update_swatch(context, swatch, value);
             context.ui.set_label_text(label, if trace_is_current { format!("RGB {}", format_rgb(value)) } else { "RGB --".to_owned() });
         }
@@ -498,14 +536,19 @@ impl RadianceInspector {
             "Direction: --".to_owned()
         };
         context.ui.set_label_text(self.sampling_label, sampling);
-        let region_text =
-            if trace_is_current { format!("Region mean: RGB {} · blend {:.2}", format_rgb(displayed_trace.stored_radiance), displayed_trace.blend_factor) } else { "Region mean: --".to_owned() };
+        let region_text = if trace_is_current {
+            format!("Region mean: RGB {} · blend {:.2}", format_rgb(displayed_trace.stored_radiance), displayed_trace.blend_factor)
+        } else {
+            "Region mean: --".to_owned()
+        };
+
         context.ui.set_label_text(self.ray_weights_label, region_text);
     }
 
     fn update_angular_sample_page(&mut self, context: &mut RuntimeContext, selected_cell: [u32; 3], data_is_current: bool, active_region_count: usize) {
         let page_count = active_region_count.div_ceil(ANGULAR_SAMPLE_PAGE_SIZE);
         let last_page = page_count.saturating_sub(1);
+
         if context.ui.button_toggled(self.angular_sample_previous_button).unwrap_or(false) && self.angular_sample_page > 0 {
             self.angular_sample_page -= 1;
         } else if context.ui.button_toggled(self.angular_sample_next_button).unwrap_or(false) {
@@ -522,8 +565,11 @@ impl RadianceInspector {
             if region_index < active_region_count && data_is_current && context.gi_angular_segments_cell == selected_cell {
                 let segment = context.gi_angular_segments[region_index];
                 update_swatch(context, self.angular_sample_swatches[sample_index], segment.radiance);
-                let samples =
-                    if segment.sampled { format!("{} / {} · {}f", segment.sample_count, segment.attempt_count, segment.age_frames) } else { format!("0 / {} · unsampled", segment.attempt_count) };
+                let samples = if segment.sampled {
+                    format!("{} / {} · {}f", segment.sample_count, segment.attempt_count, segment.age_frames)
+                } else {
+                    format!("0 / {} · unsampled", segment.attempt_count)
+                };
                 context.ui.set_label_text(
                     self.angular_sample_labels[sample_index],
                     format!("Region {region_index:02} · RGB {} · {samples}", if segment.sampled { format_rgb(segment.radiance) } else { "--".to_owned() }),
@@ -553,6 +599,7 @@ fn nearest_cell_in_grid(position: Vec3, grid: RendererRadianceFieldGrid) -> Opti
     let cell_size = extent / Vec3::new(grid.resolution[0] as f32, grid.resolution[1] as f32, grid.resolution[2] as f32);
     let cell = std::array::from_fn(|axis| (((position[axis] - minimum[axis]) / cell_size[axis] - 0.5).round() as i32).clamp(0, grid.resolution[axis] as i32 - 1) as u32);
     let center = minimum + (Vec3::from_array(cell.map(|coordinate| coordinate as f32)) + Vec3::splat(0.5)) * cell_size;
+
     Some((cell, center.distance_squared(position)))
 }
 
@@ -567,6 +614,7 @@ fn raycast_scene(context: &RuntimeContext) -> Option<Vec3> {
     let ray_origin = camera.transform.position;
     let ray_direction = (camera.transform.rotation * local_direction).normalize();
     let mut nearest_distance = f32::INFINITY;
+
     for instance in context.scene.instances() {
         for triangle in instance.mesh.indices().chunks_exact(3) {
             let first = instance.transform.transform_point(Vec3::from_array(instance.mesh.vertices()[triangle[0] as usize].position));
@@ -579,6 +627,7 @@ fn raycast_scene(context: &RuntimeContext) -> Option<Vec3> {
             }
         }
     }
+
     nearest_distance.is_finite().then_some(ray_origin + ray_direction * nearest_distance)
 }
 
@@ -587,6 +636,7 @@ fn ray_triangle_distance(origin: Vec3, direction: Vec3, first: Vec3, second: Vec
     let edge_two = third - first;
     let cross = direction.cross(edge_two);
     let determinant = edge_one.dot(cross);
+
     if determinant.abs() < 0.000001 {
         return None;
     }
@@ -602,6 +652,7 @@ fn ray_triangle_distance(origin: Vec3, direction: Vec3, first: Vec3, second: Vec
         return None;
     }
     let distance = edge_two.dot(cross) * inverse_determinant;
+
     (distance > 0.0).then_some(distance)
 }
 
@@ -613,6 +664,7 @@ fn add_drawer(context: &mut RuntimeContext, parent: UiContainerId, title: &str, 
     context.ui.set_button_toggled_colors(header, Color::rgb(0.15, 0.2, 0.28), Color::rgb(0.1, 0.12, 0.17));
     let drawer = Drawer { header: Some(header), content: Some(content), content_height };
     update_drawer(context, drawer, title);
+
     drawer
 }
 
@@ -631,6 +683,7 @@ fn add_section(context: &mut RuntimeContext, parent: UiContainerId, title: &str)
 fn add_mode_button(context: &mut RuntimeContext, parent: UiContainerId, title: &str, selected: bool) -> UiButtonId {
     let button = context.ui.add_toggle_button_layout(Some(parent), UiLayout::new(Vec2::new(74.0, 22.0)), selected);
     context.ui.set_button_text(button, title, 11.0, Color::WHITE);
+
     button
 }
 
@@ -639,12 +692,14 @@ fn add_checkbox(context: &mut RuntimeContext, parent: UiContainerId, title: &str
     context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(0.0, 17.0)), title, 12.0, Color::WHITE);
     let button = context.ui.add_toggle_button_layout(Some(row), UiLayout::new(Vec2::new(15.0, 15.0)), enabled);
     set_checkbox_mark(context, button);
+
     button
 }
 
 fn add_color_swatch(context: &mut RuntimeContext, parent: UiContainerId, color: [f32; 3], size: f32) -> UiButtonId {
     let button = context.ui.add_toggle_button_layout(Some(parent), UiLayout::new(Vec2::new(size, size)), true);
     update_swatch(context, button, color);
+
     button
 }
 
@@ -653,17 +708,20 @@ fn add_color_value_row(context: &mut RuntimeContext, parent: UiContainerId, titl
     context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(58.0, 18.0)), title, 10.0, Color::rgb(0.72, 0.76, 0.82));
     let swatch = add_color_swatch(context, row, [0.0; 3], 16.0);
     let label = context.ui.add_label_layout(Some(row), UiLayout::new(Vec2::new(118.0, 18.0)), "RGB --", 10.0, Color::WHITE);
+
     (swatch, label)
 }
 
 fn update_swatch(context: &mut RuntimeContext, button: UiButtonId, value: [f32; 3]) {
     let channel = |input: f32| (input.max(0.0) / (input.max(0.0) + 0.3)).clamp(0.06, 1.0);
     let color = Color::rgb(channel(value[0]), channel(value[1]), channel(value[2]));
+
     context.ui.set_button_toggled_colors(button, color, color);
 }
 
 fn set_checkbox_mark(context: &mut RuntimeContext, button: UiButtonId) {
     let text = if context.ui.button_toggled(button).unwrap_or(false) { "✓" } else { "" };
+
     context.ui.set_button_text(button, text, 12.0, Color::WHITE);
 }
 

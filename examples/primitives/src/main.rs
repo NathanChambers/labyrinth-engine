@@ -1,9 +1,6 @@
 use std::path::Path;
 
-use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, Easing, FontAsset, GraphicsApi, IrradianceMode, LightId, MeshId, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId,
-    UiLayout, UiSliderId, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run,
-};
+use labyrinth::{Application, Camera, CameraId, Color, DirectionalLight, Easing, FontAsset, GraphicsApi, IrradianceMode, LightId, MeshId, Quat, RuntimeContext, Transform, UiAnchor, UiAutoLayout, UiButtonId, UiLayout, UiSliderId, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run};
 use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig, FreeCamera};
 
 const PROFILE_WARMUP_SECONDS: f32 = 2.0;
@@ -31,9 +28,18 @@ struct PrimitiveDemo {
 impl PrimitiveDemo {
     fn setup_scene(&mut self, context: &mut RuntimeContext) {
         context.scene.spawn_mesh(primitives::plane(10.0, Color::WHITE), Transform::IDENTITY);
-        self.cube = Some(context.scene.spawn_mesh(primitives::cube([0.0, 0.0, 0.0], 1.2, Color::rgb(0.9, 0.08, 0.06)), Transform::from_position(Vec3::new(-1.2, 0.6, 0.0))));
-        self.sphere = Some(context.scene.spawn_mesh(primitives::sphere([0.0, 0.0, 0.0], 0.7, Color::rgb(0.08, 0.75, 0.18), 24, 16), Transform::from_position(Vec3::new(1.2, 0.7, 0.0))));
+        self.cube = Some(
+            context
+                .scene
+                .spawn_mesh(primitives::cube([0.0, 0.0, 0.0], 1.2, Color::rgb(0.9, 0.08, 0.06)), Transform::from_position(Vec3::new(-1.2, 0.6, 0.0))),
+        );
+        self.sphere = Some(
+            context
+                .scene
+                .spawn_mesh(primitives::sphere([0.0, 0.0, 0.0], 0.7, Color::rgb(0.08, 0.75, 0.18), 24, 16), Transform::from_position(Vec3::new(1.2, 0.7, 0.0))),
+        );
         self.camera = Some(context.scene.spawn_camera(Camera { clear_color: Color::rgb(0.06, 0.08, 0.12), ..Camera::default() }));
+
         self.light = Some(context.scene.spawn_light(DirectionalLight::default()));
     }
 
@@ -44,12 +50,18 @@ impl PrimitiveDemo {
         self.font = Some(font);
         let panel_layout = UiLayout::anchored(Vec2::new(320.0, 110.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0));
         context.ui.set_window_layout(panel_layout);
-        let header = context.ui.add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(320.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0)), false);
+        let header = context
+            .ui
+            .add_toggle_button_layout(None, UiLayout::anchored(Vec2::new(320.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 24.0)), false);
         context.ui.set_button_text(header, "Lighting", 16.0, Color::WHITE);
         context.ui.set_button_text_centered(header, false);
         context.ui.set_button_toggled_colors(header, Color::rgba(0.1, 0.12, 0.17, 1.0), Color::rgba(0.1, 0.12, 0.17, 1.0));
 
-        let stack = context.ui.add_container(None, UiLayout::anchored(Vec2::new(320.0, 84.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 50.0)), UiAutoLayout::column(10.0, 4.0));
+        let stack = context.ui.add_container(
+            None,
+            UiLayout::anchored(Vec2::new(320.0, 84.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(24.0, 50.0)),
+            UiAutoLayout::column(10.0, 4.0),
+        );
         context.ui.register_window_panel(header, stack, 26.0);
         let light_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
         context.ui.add_label_layout(
@@ -59,8 +71,16 @@ impl PrimitiveDemo {
             13.0,
             Color::rgb(0.75, 0.8, 0.9),
         );
-        self.light_slider = Some(context.ui.add_slider_layout(Some(light_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 360.0, 0.0));
-        self.light_lock = Some(context.ui.add_toggle_button_layout(Some(light_row), UiLayout::anchored(Vec2::new(28.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 2.0)), false));
+        self.light_slider = Some(
+            context
+                .ui
+                .add_slider_layout(Some(light_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 360.0, 0.0),
+        );
+        self.light_lock = Some(
+            context
+                .ui
+                .add_toggle_button_layout(Some(light_row), UiLayout::anchored(Vec2::new(28.0, 26.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 2.0)), false),
+        );
 
         let sphere_row = context.ui.add_container(Some(stack), UiLayout::new(Vec2::new(0.0, 30.0)), UiAutoLayout::row(0.0, 4.0));
         context.ui.add_label_layout(
@@ -70,9 +90,18 @@ impl PrimitiveDemo {
             13.0,
             Color::rgb(0.75, 0.8, 0.9),
         );
-        self.time_slider = Some(context.ui.add_slider_layout(Some(sphere_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 2.0, 0.5));
-        self.debug_panels =
-            Some(DebugPanels::new(context, DebugPanelsConfig::new("Render Debug").with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0)).with_performance_offset(Vec2::new(-24.0, 500.0))));
+        self.time_slider = Some(
+            context
+                .ui
+                .add_slider_layout(Some(sphere_row), UiLayout::anchored(Vec2::new(0.0, 18.0), UiAnchor::TOP_LEFT, UiAnchor::TOP_LEFT, Vec2::new(0.0, 6.0)), 0.0, 2.0, 0.5),
+        );
+        self.debug_panels = Some(DebugPanels::new(
+            context,
+            DebugPanelsConfig::new("Render Debug")
+                .with_position(UiAnchor::TOP_RIGHT, Vec2::new(-24.0, 24.0))
+                .with_performance_offset(Vec2::new(-24.0, 500.0)),
+        ));
+
         Ok(())
     }
 
@@ -82,6 +111,7 @@ impl PrimitiveDemo {
         let camera_id = self.camera.ok_or("camera was not created")?;
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was not stored")?;
         camera.transform.rotation = self.free_camera.rotation();
+
         Ok(())
     }
 
@@ -90,6 +120,7 @@ impl PrimitiveDemo {
         let cube_id = self.cube.ok_or("cube was not initialized")?;
         let cube = context.scene.get_mesh_mut(cube_id).ok_or("cube object was removed before update")?;
         cube.transform = Transform::from_position(Vec3::new(-1.2, 0.8, 0.0)).with_rotation(self.cube_rotation);
+
         Ok(())
     }
 
@@ -101,6 +132,7 @@ impl PrimitiveDemo {
         let amount = ease(Easing::EaseInOutCubic, ping_pong(self.sphere_time * 0.35, 1.0));
         let position = Vec3::new(0.4, 0.7, 0.0).lerp(Vec3::new(2.0, 1.4, 0.0), amount);
         sphere.transform = Transform::from_position(position);
+
         Ok(())
     }
 
@@ -119,6 +151,7 @@ impl PrimitiveDemo {
         let light = context.scene.get_directional_light_mut(light_id).ok_or("light was removed before update")?;
         let angle = self.light_angle.to_radians();
         light.direction = Vec3::new(angle.cos() * 0.7, 1.0, angle.sin() * 0.7).normalize();
+
         Ok(())
     }
 
@@ -127,6 +160,7 @@ impl PrimitiveDemo {
         println!("Scene entities: meshes=3 cameras=1 lights=1; cube, sphere, and light animate");
         println!("Captured frames: {}", self.frame_intervals_ms.len());
         report_series("Frame interval", &self.frame_intervals_ms);
+
         report_series("Engine CPU frame", &self.engine_frame_ms);
     }
 }
@@ -136,6 +170,7 @@ impl Application for PrimitiveDemo {
         self.setup_scene(context);
         context.irradiance_mode = IrradianceMode::AabbSdf;
         self.setup_ui(context)?;
+
         self.setup_active_entities(context)
     }
 
@@ -147,6 +182,7 @@ impl Application for PrimitiveDemo {
             self.frame_intervals_ms.push(delta_seconds * 1000.0);
             self.engine_frame_ms.push(context.performance_stats.frame_cpu_ms);
         }
+
         if self.profile_seconds.is_some_and(|duration| self.elapsed_seconds >= duration) {
             context.request_exit();
         }
@@ -156,6 +192,7 @@ impl Application for PrimitiveDemo {
         let movement_keys_active = self.debug_panels.as_ref().is_some_and(DebugPanels::movement_keys_active);
         self.update_camera(context, delta_seconds, movement_keys_active)?;
         self.update_light(context, delta_seconds)?;
+
         Ok(())
     }
 
@@ -188,12 +225,14 @@ fn report_series(name: &str, samples: &[f32]) {
 
 fn percentile(sorted_samples: &[f32], percentile: f32) -> f32 {
     let index = ((sorted_samples.len() - 1) as f32 * percentile).ceil() as usize;
+
     sorted_samples[index]
 }
 
 fn main() -> Result<(), String> {
     let mut settings = WindowSettings::default();
     let mut profile_seconds = None;
+
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             _ if argument.starts_with("--profile-seconds=") => {

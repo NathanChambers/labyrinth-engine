@@ -62,11 +62,13 @@ impl DebugCapture {
         let camera_id = active_camera.ok_or("capture script requires an active camera")?;
         let camera = scene.get_camera_mut(camera_id).ok_or("capture script camera was removed")?;
         let mut remaining = delta_seconds.max(0.0);
+
         loop {
             if self.action_index >= self.plan.actions.len() {
                 self.exit_requested = true;
                 return Ok(());
             }
+
             match &self.plan.actions[self.action_index] {
                 CaptureAction::SetRenderEffects { shadows, irradiance, gizmos } => {
                     self.render_effects = Some((*shadows, *irradiance, *gizmos));
@@ -180,6 +182,7 @@ impl DebugCapture {
         write_depth_capture(&directory, file_name, "spot_shadow", &frame.spot_shadow, None)?;
         write_depth_capture(&directory, file_name, "point_shadow", &frame.point_shadow, None)?;
         crate::info!(capture_path:? = path.display().to_string(); "Capture written");
+
         Ok(())
     }
 
@@ -239,6 +242,7 @@ impl DebugCapture {
         );
         fs::write(&path, contents).map_err(|error| format!("failed to write performance report: {error}"))?;
         crate::info!(report_path:? = path.display().to_string(); "Performance report written");
+
         Ok(())
     }
 
@@ -293,25 +297,25 @@ impl DebugCapture {
 
 fn current_pose(camera: &Camera) -> CameraPose {
     let forward = camera.transform.rotation * Vec3::NEG_Z;
+
     CameraPose { position: camera.transform.position.to_array(), target: (camera.transform.position + forward).to_array() }
 }
 
 fn apply_pose(camera: &mut Camera, pose: CameraPose) {
     camera.transform.position = Vec3::from_array(pose.position);
+
     camera.look_at(Vec3::from_array(pose.target));
 }
 
 fn interpolate_pose(start: CameraPose, target: CameraPose, amount: f32) -> CameraPose {
-    CameraPose {
-        position: lerp_vec3(Vec3::from_array(start.position), Vec3::from_array(target.position), amount).to_array(),
-        target: lerp_vec3(Vec3::from_array(start.target), Vec3::from_array(target.target), amount).to_array(),
-    }
+    CameraPose { position: lerp_vec3(Vec3::from_array(start.position), Vec3::from_array(target.position), amount).to_array(), target: lerp_vec3(Vec3::from_array(start.target), Vec3::from_array(target.target), amount).to_array() }
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), String> {
     if path.is_absolute() || path.components().any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
         return Err("capture output directory must be relative and cannot contain parent traversal".into());
     }
+
     Ok(())
 }
 
@@ -319,6 +323,7 @@ fn safe_file_name(name: &str) -> Result<&str, String> {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':']) {
         return Err("capture names must be simple file names".into());
     }
+
     Ok(name.strip_suffix(".png").unwrap_or(name))
 }
 
@@ -328,6 +333,7 @@ fn write_png(path: &Path, frame: &renderer::CapturedFrame) -> Result<(), String>
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(|error| format!("failed to write PNG header: {error}"))?;
+
     writer.write_image_data(&frame.rgba8).map_err(|error| format!("failed to write PNG pixels: {error}"))
 }
 
@@ -337,11 +343,13 @@ fn write_depth_capture(directory: &Path, base_name: &str, buffer_name: &str, buf
         let preview_path = directory.join(format!("{base_name}_{buffer_name}{suffix}.png"));
         write_depth_preview(&preview_path, buffer.width, buffer.height, values, camera_clip)?;
     }
+
     Ok(())
 }
 
 fn write_depth_preview(path: &Path, width: u32, height: u32, values: &[f32], camera_clip: Option<(f32, f32)>) -> Result<(), String> {
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+
     for value in values.iter().take((width * height) as usize) {
         let value = if let Some((near, far)) = camera_clip {
             let near = near.max(0.001);
@@ -363,5 +371,6 @@ fn write_depth_preview(path: &Path, width: u32, height: u32, values: &[f32], cam
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(|error| format!("failed to write depth preview header: {error}"))?;
+
     writer.write_image_data(&pixels).map_err(|error| format!("failed to write depth preview pixels: {error}"))
 }

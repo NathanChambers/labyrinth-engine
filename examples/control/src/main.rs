@@ -18,16 +18,7 @@ struct ControlScene {
 
 impl ControlScene {
     fn new(profile_seconds: Option<f32>, fps_counter_enabled: bool) -> Self {
-        Self {
-            profile_seconds,
-            fps_counter_enabled,
-            elapsed_seconds: 0.0,
-            frame_intervals_ms: Vec::new(),
-            engine_frame_ms: Vec::new(),
-            fps_label: None,
-            fps_counter: FpsCounter::default(),
-            font: None,
-        }
+        Self { profile_seconds, fps_counter_enabled, elapsed_seconds: 0.0, frame_intervals_ms: Vec::new(), engine_frame_ms: Vec::new(), fps_label: None, fps_counter: FpsCounter::default(), font: None }
     }
 
     fn report_samples(&self) {
@@ -36,6 +27,7 @@ impl ControlScene {
         println!("FPS counter: {}", if self.fps_counter_enabled { "enabled" } else { "disabled" });
         println!("Captured frames: {}", self.frame_intervals_ms.len());
         report_series("Frame interval", &self.frame_intervals_ms);
+
         report_series("Engine CPU frame", &self.engine_frame_ms);
     }
 }
@@ -51,6 +43,7 @@ impl Application for ControlScene {
         }
         context.ui_enabled = self.fps_counter_enabled;
         context.cursor_capture_on_scene_click = false;
+
         Ok(())
     }
 
@@ -65,13 +58,16 @@ impl Application for ControlScene {
                 context.ui.set_label_text(label, format_fps_counter(fps));
             }
         }
+
         if self.profile_seconds.is_some() && sample_frame {
             self.frame_intervals_ms.push(delta_seconds * 1000.0);
             self.engine_frame_ms.push(context.performance_stats.frame_cpu_ms);
         }
+
         if self.profile_seconds.is_some_and(|duration| self.elapsed_seconds >= duration) {
             context.request_exit();
         }
+
         Ok(())
     }
 
@@ -104,6 +100,7 @@ fn report_series(name: &str, samples: &[f32]) {
 
 fn percentile(sorted_samples: &[f32], percentile: f32) -> f32 {
     let index = ((sorted_samples.len() - 1) as f32 * percentile).ceil() as usize;
+
     sorted_samples[index]
 }
 
@@ -111,6 +108,7 @@ fn main() -> Result<(), String> {
     let mut settings = WindowSettings { title: "Labyrinth Engine Control Scene".into(), ..WindowSettings::default() };
     let mut profile_seconds = None;
     let mut fps_counter_enabled = true;
+
     for argument in std::env::args().skip(1) {
         if let Some(value) = argument.strip_prefix("--profile-seconds=") {
             let duration = value.parse::<f32>().map_err(|error| format!("invalid profile duration: {error}"))?;
@@ -128,5 +126,6 @@ fn main() -> Result<(), String> {
             return Err(format!("unknown option: {argument}"));
         }
     }
+
     run(settings, ControlScene::new(profile_seconds, fps_counter_enabled))
 }

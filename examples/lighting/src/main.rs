@@ -1,9 +1,6 @@
 use std::path::Path;
 
-use labyrinth::{
-    Application, Camera, CameraId, Color, DirectionalLight, Easing, FontAsset, GraphicsApi, IrradianceMode, KeyCode, LightId, Material, MeshId, PointLight, Quat, RendererSkyLighting, RuntimeContext,
-    SpotLight, Transform, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run,
-};
+use labyrinth::{Application, Camera, CameraId, Color, DirectionalLight, Easing, FontAsset, GraphicsApi, IrradianceMode, KeyCode, LightId, Material, MeshId, PointLight, Quat, RendererSkyLighting, RuntimeContext, SpotLight, Transform, Vec2, Vec3, WindowMode, WindowSettings, ease, ping_pong, primitives, run};
 use labyrinth_debug_ui::{DebugPanels, DebugPanelsConfig, FreeCamera};
 
 struct LightingDemo {
@@ -44,17 +41,24 @@ impl LightingDemo {
             context.scene.spawn_static_mesh(primitives::plane(20.0, Color::WHITE), Transform::IDENTITY);
             self.spawn_lighting_test_room(context);
         }
+
         if !self.room_test_scene {
             let object_depth = if self.gi_test_scene { -3.2 } else { 0.0 };
             let object_x = if self.gi_test_scene { 1.5 } else { 1.2 };
-            self.cube = Some(context.scene.spawn_mesh(primitives::cube([0.0, 0.0, 0.0], 1.2, Color::rgb(0.9, 0.08, 0.06)), Transform::from_position(Vec3::new(-object_x, 0.6, object_depth))));
+            self.cube = Some(
+                context
+                    .scene
+                    .spawn_mesh(primitives::cube([0.0, 0.0, 0.0], 1.2, Color::rgb(0.9, 0.08, 0.06)), Transform::from_position(Vec3::new(-object_x, 0.6, object_depth))),
+            );
             if let Some(cube_id) = self.cube
                 && let Some(cube) = context.scene.get_mesh_mut(cube_id)
             {
                 cube.material = Material { metallic: 0.3, roughness: 0.2, ..Material::default() };
             }
-            self.sphere =
-                Some(context.scene.spawn_mesh(primitives::sphere([0.0, 0.0, 0.0], 0.7, Color::rgb(0.08, 0.75, 0.18), 24, 16), Transform::from_position(Vec3::new(object_x, 0.7, object_depth))));
+            self.sphere = Some(context.scene.spawn_mesh(
+                primitives::sphere([0.0, 0.0, 0.0], 0.7, Color::rgb(0.08, 0.75, 0.18), 24, 16),
+                Transform::from_position(Vec3::new(object_x, 0.7, object_depth)),
+            ));
             if let Some(sphere_id) = self.sphere
                 && let Some(sphere) = context.scene.get_mesh_mut(sphere_id)
             {
@@ -88,6 +92,7 @@ impl LightingDemo {
             }
             self.free_camera = FreeCamera::new(0.0, -0.18);
         }
+
         if self.room_test_scene {
             context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.08, 0.09, 0.11), intensity: 0.04 };
             self.point_light = Some(context.scene.spawn_point_light(PointLight { position: Vec3::new(0.0, 4.0, 0.0), color: Color::WHITE, intensity: 2.0, range: 24.0 }));
@@ -98,29 +103,25 @@ impl LightingDemo {
             context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.18, 0.2, 0.22), intensity: 0.08 };
             self.light = Some(context.scene.spawn_light(DirectionalLight { intensity: 0.12, ..DirectionalLight::default() }));
             self.point_light = Some(context.scene.spawn_point_light(PointLight { position: Vec3::new(-2.2, 1.4, -2.0), color: Color::WHITE, intensity: 3.5, range: 4.0 }));
-            self.spot_light = Some(context.scene.spawn_spot_light(SpotLight {
-                position: Vec3::new(3.0, 2.4, -0.8),
-                direction: Vec3::new(-0.5, -0.4, -1.0).normalize(),
-                color: Color::WHITE,
-                intensity: 2.0,
-                range: 9.0,
-                inner_angle: 0.22,
-                outer_angle: 0.65,
-            }));
+            self.spot_light = Some(
+                context
+                    .scene
+                    .spawn_spot_light(SpotLight { position: Vec3::new(3.0, 2.4, -0.8), direction: Vec3::new(-0.5, -0.4, -1.0).normalize(), color: Color::WHITE, intensity: 2.0, range: 9.0, inner_angle: 0.22, outer_angle: 0.65 }),
+            );
         } else {
             context.sky_lighting = RendererSkyLighting { color: Color::rgb(0.18, 0.28, 0.52), intensity: 0.65 };
             self.light = Some(context.scene.spawn_light(DirectionalLight { color: Color::rgb(1.0, 0.78, 0.55), intensity: 1.25, ..DirectionalLight::default() }));
-            self.fill_light = Some(context.scene.spawn_light(DirectionalLight { direction: Vec3::new(-0.45, 0.75, -0.3).normalize(), color: Color::rgb(0.28, 0.42, 1.0), intensity: 0.1 }));
+            self.fill_light = Some(
+                context
+                    .scene
+                    .spawn_light(DirectionalLight { direction: Vec3::new(-0.45, 0.75, -0.3).normalize(), color: Color::rgb(0.28, 0.42, 1.0), intensity: 0.1 }),
+            );
             self.point_light = Some(context.scene.spawn_point_light(PointLight { position: Vec3::new(-3.5, 1.8, -2.0), color: Color::WHITE, intensity: 4.0, range: 8.0 }));
-            self.spot_light = Some(context.scene.spawn_spot_light(SpotLight {
-                position: Vec3::new(3.5, 4.8, 3.0),
-                direction: Vec3::new(-0.4, -1.0, -0.7).normalize(),
-                color: Color::WHITE,
-                intensity: 7.0,
-                range: 12.0,
-                inner_angle: 0.25,
-                outer_angle: 0.7,
-            }));
+            self.spot_light = Some(
+                context
+                    .scene
+                    .spawn_spot_light(SpotLight { position: Vec3::new(3.5, 4.8, 3.0), direction: Vec3::new(-0.4, -1.0, -0.7).normalize(), color: Color::WHITE, intensity: 7.0, range: 12.0, inner_angle: 0.25, outer_angle: 0.7 }),
+            );
         }
     }
 
@@ -130,6 +131,7 @@ impl LightingDemo {
         self.spawn_box(context, Vec3::new(0.0, 2.5, -5.0), Vec3::new(10.0, 5.0, 0.2), wall_color);
         self.spawn_box(context, Vec3::new(-5.0, 2.5, 1.0), Vec3::new(0.2, 5.0, 12.0), wall_color);
         self.spawn_box(context, Vec3::new(5.0, 2.5, 1.0), Vec3::new(0.2, 5.0, 12.0), wall_color);
+
         self.spawn_box(context, Vec3::new(0.0, 5.0, 1.0), Vec3::new(10.0, 0.2, 12.0), wall_color);
     }
 
@@ -137,9 +139,12 @@ impl LightingDemo {
         context.scene.spawn_static_mesh(primitives::plane(24.0, Color::rgb(0.42, 0.45, 0.48)), Transform::IDENTITY);
         self.spawn_box(context, Vec3::new(-3.0, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0), Color::rgb(0.85, 0.08, 0.06));
         self.spawn_box(context, Vec3::new(-1.8, 1.2, -1.0), Vec3::new(1.6, 2.4, 1.6), Color::rgb(0.08, 0.75, 0.18));
-        context.scene.spawn_static_mesh(primitives::sphere([0.0, 0.0, 0.0], 1.0, Color::rgb(0.08, 0.35, 0.95), 32, 20), Transform::from_position(Vec3::new(1.0, 1.0, -1.0)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::sphere([0.0, 0.0, 0.0], 1.0, Color::rgb(0.08, 0.35, 0.95), 32, 20), Transform::from_position(Vec3::new(1.0, 1.0, -1.0)));
         self.spawn_box(context, Vec3::new(4.0, 1.0, -1.0), Vec3::new(2.0, 2.0, 2.0), Color::rgb(0.9, 0.55, 0.08));
         self.spawn_box(context, Vec3::new(4.0, 2.75, -1.0), Vec3::new(2.0, 1.5, 2.0), Color::rgb(0.65, 0.2, 0.8));
+
         self.spawn_box(context, Vec3::new(0.0, 2.0, -5.0), Vec3::new(12.0, 4.0, 0.25), Color::rgb(0.58, 0.62, 0.66));
     }
 
@@ -160,6 +165,7 @@ impl LightingDemo {
         self.spawn_box(context, Vec3::new(-13.0, 2.0, 0.0), Vec3::new(0.3, 4.0, 26.0), wall);
         self.spawn_box(context, Vec3::new(13.0, 2.0, 0.0), Vec3::new(0.3, 4.0, 26.0), wall);
         self.spawn_box(context, Vec3::new(0.0, 2.0, -13.0), Vec3::new(26.0, 4.0, 0.3), wall);
+
         self.spawn_box(context, Vec3::new(0.0, 2.0, 13.0), Vec3::new(26.0, 4.0, 0.3), wall);
     }
 
@@ -185,6 +191,7 @@ impl LightingDemo {
             self.spawn_box(context, Vec3::new(x, 1.0, 8.0), Vec3::splat(1.0), trim_color);
             self.spawn_box(context, Vec3::new(x, 2.8, 8.0), Vec3::new(0.65, 2.6, 0.65), wall_color);
         }
+
         for z in [-7.0, -1.0, 5.0, 11.0] {
             for x in [-11.0, -5.0, 5.0, 11.0] {
                 let color = if (x as i32 + z as i32) % 2 == 0 { trim_color } else { wall_color };
@@ -192,8 +199,7 @@ impl LightingDemo {
             }
         }
 
-        let emissive_panels =
-            [(Vec3::new(-11.0, 2.0, -8.5), Color::rgb(1.0, 0.12, 0.04)), (Vec3::new(0.0, 2.0, -8.5), Color::rgb(0.08, 1.0, 0.18)), (Vec3::new(11.0, 2.0, -8.5), Color::rgb(0.08, 0.3, 1.0))];
+        let emissive_panels = [(Vec3::new(-11.0, 2.0, -8.5), Color::rgb(1.0, 0.12, 0.04)), (Vec3::new(0.0, 2.0, -8.5), Color::rgb(0.08, 1.0, 0.18)), (Vec3::new(11.0, 2.0, -8.5), Color::rgb(0.08, 0.3, 1.0))];
         for (position, color) in emissive_panels {
             let emissive_material = Material { base_color: color, emission: color, emission_strength: 8.0, ..Material::default() };
             self.spawn_static_material_box(context, position, Vec3::new(1.0, 2.0, 0.15), color, emissive_material);
@@ -218,6 +224,7 @@ impl LightingDemo {
                 }
             }
         }
+
         for (position, color) in [(Vec3::new(-18.0, 3.0, -28.0), Color::rgb(1.0, 0.12, 0.04)), (Vec3::new(18.0, 3.0, -28.0), Color::rgb(0.04, 0.2, 1.0))] {
             let material = Material { base_color: color, emission: color, emission_strength: 4.0, ..Material::default() };
             self.spawn_static_material_box(context, position, Vec3::new(2.0, 6.0, 0.3), color, material);
@@ -230,6 +237,7 @@ impl LightingDemo {
 
     fn spawn_static_material_box(&self, context: &mut RuntimeContext, position: Vec3, scale: Vec3, color: Color, material: Material) {
         let id = context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, color), Transform::from_position(position).with_scale(scale));
+
         if let Some(instance) = context.scene.get_mesh_mut(id) {
             instance.material = material;
         }
@@ -237,13 +245,28 @@ impl LightingDemo {
 
     fn spawn_lighting_test_room(&mut self, context: &mut RuntimeContext) {
         let wall_color = Color::rgb(0.72, 0.74, 0.78);
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(0.0, 1.5, -3.0)).with_scale(Vec3::new(6.0, 3.0, 0.2)));
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(-3.0, 1.5, 0.0)).with_scale(Vec3::new(0.2, 3.0, 6.0)));
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(3.0, 1.5, 0.0)).with_scale(Vec3::new(0.2, 3.0, 6.0)));
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(-4.5, 1.5, 3.0)).with_scale(Vec3::new(3.0, 3.0, 0.2)));
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(4.5, 1.5, 3.0)).with_scale(Vec3::new(3.0, 3.0, 0.2)));
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(0.0, 3.0, 0.0)).with_scale(Vec3::new(3.0, 0.2, 3.0)));
-        context.scene.spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, Color::rgb(0.48, 0.28, 0.12)), Transform::from_position(Vec3::new(0.0, 1.0, 2.9)).with_scale(Vec3::new(1.2, 2.0, 0.1)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(0.0, 1.5, -3.0)).with_scale(Vec3::new(6.0, 3.0, 0.2)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(-3.0, 1.5, 0.0)).with_scale(Vec3::new(0.2, 3.0, 6.0)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(3.0, 1.5, 0.0)).with_scale(Vec3::new(0.2, 3.0, 6.0)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(-4.5, 1.5, 3.0)).with_scale(Vec3::new(3.0, 3.0, 0.2)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(4.5, 1.5, 3.0)).with_scale(Vec3::new(3.0, 3.0, 0.2)));
+        context
+            .scene
+            .spawn_static_mesh(primitives::cube([0.0, 0.0, 0.0], 1.0, wall_color), Transform::from_position(Vec3::new(0.0, 3.0, 0.0)).with_scale(Vec3::new(3.0, 0.2, 3.0)));
+        context.scene.spawn_static_mesh(
+            primitives::cube([0.0, 0.0, 0.0], 1.0, Color::rgb(0.48, 0.28, 0.12)),
+            Transform::from_position(Vec3::new(0.0, 1.0, 2.9)).with_scale(Vec3::new(1.2, 2.0, 0.1)),
+        );
     }
 
     fn setup_ui(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
@@ -255,6 +278,7 @@ impl LightingDemo {
         debug_config.performance_offset = Vec2::new(-24.0, 24.0);
         let debug_panels = DebugPanels::new(context, debug_config);
         self.debug_panels = Some(debug_panels);
+
         Ok(())
     }
 
@@ -268,13 +292,16 @@ impl LightingDemo {
         if let Some(light) = self.light {
             context.active_lights.push(light);
         }
+
         if !self.shadow_isolation {
             if let Some(light) = self.fill_light {
                 context.active_lights.push(light);
             }
+
             if let Some(light) = self.point_light {
                 context.active_lights.push(light);
             }
+
             if let Some(light) = self.spot_light {
                 context.active_lights.push(light);
             }
@@ -282,6 +309,7 @@ impl LightingDemo {
         let camera_id = self.camera.ok_or("camera was not created")?;
         let camera = context.scene.get_camera_mut(camera_id).ok_or("camera was not stored")?;
         camera.transform.rotation = self.free_camera.rotation();
+
         Ok(())
     }
 
@@ -290,6 +318,7 @@ impl LightingDemo {
         let cube_id = self.cube.ok_or("cube was not initialized")?;
         let cube = context.scene.get_mesh_mut(cube_id).ok_or("cube object was removed before update")?;
         cube.transform = Transform::from_position(Vec3::new(-1.2, 0.8, 0.0)).with_rotation(self.cube_rotation);
+
         Ok(())
     }
 
@@ -300,6 +329,7 @@ impl LightingDemo {
         let amount = ease(Easing::EaseInOutCubic, ping_pong(self.sphere_time * 0.35, 1.0));
         let position = Vec3::new(0.4, 0.7, 0.0).lerp(Vec3::new(2.0, 1.4, 0.0), amount);
         sphere.transform = Transform::from_position(position);
+
         Ok(())
     }
 
@@ -335,6 +365,7 @@ impl LightingDemo {
             }
             return Ok(());
         }
+
         if !self.shadow_test_scene {
             self.light_angle = (self.light_angle + delta_seconds * 30.0).rem_euclid(360.0);
         }
@@ -342,6 +373,7 @@ impl LightingDemo {
         let light = context.scene.get_directional_light_mut(light_id).ok_or("light was removed before update")?;
         let angle = self.light_angle.to_radians();
         light.direction = Vec3::new(angle.cos() * 0.7, 1.0, angle.sin() * 0.7).normalize();
+
         Ok(())
     }
 }
@@ -353,20 +385,24 @@ impl Application for LightingDemo {
         context.gi_radiance_temporal_accumulation_enabled = true;
         context.gizmos_enabled = false;
         self.setup_ui(context)?;
+
         self.setup_active_entities(context)
     }
 
     fn update(&mut self, context: &mut RuntimeContext) -> Result<(), String> {
         let delta_seconds = context.time.delta_seconds();
+
         if !self.shadow_test_scene && !self.room_test_scene {
             self.update_cube(context, delta_seconds)?;
         }
+
         if !self.shadow_test_scene && !self.room_test_scene {
             self.update_sphere(context, delta_seconds)?;
         }
         self.update_render_effects(context);
         let movement_keys_active = self.debug_panels.as_ref().is_some_and(DebugPanels::movement_keys_active);
         self.update_camera(context, delta_seconds, movement_keys_active)?;
+
         self.update_light(context, delta_seconds)
     }
 }
@@ -379,6 +415,7 @@ fn main() -> Result<(), String> {
     let mut shadow_test_scene = false;
     let mut room_test_scene = false;
     let mut shadow_isolation = false;
+
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--windowed" => settings.mode = WindowMode::Windowed,

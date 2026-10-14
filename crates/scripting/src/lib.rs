@@ -82,6 +82,7 @@ impl ScriptBuilder {
         self.plan.settings.width = width.max(1) as u32;
         self.plan.settings.height = height.max(1) as u32;
         self.plan.settings.output_directory = output_directory;
+
         self.plan.settings.include_ui = include_ui;
     }
 
@@ -90,6 +91,7 @@ impl ScriptBuilder {
             return Err("camera control capability is not granted".into());
         }
         self.plan.actions.push(CaptureAction::SetCamera(camera_pose(position, target)?));
+
         Ok(())
     }
 
@@ -97,6 +99,7 @@ impl ScriptBuilder {
         if !self.capabilities.capture {
             return;
         }
+
         self.plan.actions.push(CaptureAction::SetRenderEffects { shadows, irradiance, gizmos });
     }
 
@@ -138,6 +141,7 @@ impl ScriptBuilder {
             return Err("shadow quality must be 0 (low), 1 (medium), 2 (high), or 3 (ultra)".into());
         }
         self.plan.actions.push(CaptureAction::SetShadowQuality(quality as u8));
+
         Ok(())
     }
 
@@ -155,6 +159,7 @@ impl ScriptBuilder {
             _ => return Err("render mode must be lit, unlit, wireframe, shadow_visibility, gi_only, or gi_support".into()),
         };
         self.plan.actions.push(CaptureAction::SetRenderMode(mode));
+
         Ok(())
     }
 
@@ -172,6 +177,7 @@ impl ScriptBuilder {
             return Err("camera movement duration cannot be negative".into());
         }
         self.plan.actions.push(CaptureAction::MoveCamera { pose: camera_pose(position, target)?, duration: duration as f32 });
+
         Ok(())
     }
 
@@ -180,6 +186,7 @@ impl ScriptBuilder {
             return Err("wait duration cannot be negative".into());
         }
         self.plan.actions.push(CaptureAction::Wait(seconds as f32));
+
         Ok(())
     }
 
@@ -187,6 +194,7 @@ impl ScriptBuilder {
         if !self.capabilities.capture {
             return;
         }
+
         self.plan.actions.push(CaptureAction::Screenshot(name));
     }
 
@@ -194,6 +202,7 @@ impl ScriptBuilder {
         if !self.capabilities.capture {
             return;
         }
+
         self.plan.actions.push(CaptureAction::PerformanceReport(name));
     }
 
@@ -204,12 +213,14 @@ impl ScriptBuilder {
         if count < 1 || interval < 0.0 || (count > 1 && interval == 0.0) {
             return Err("capture sequence requires a positive count and a positive interval between frames".into());
         }
+
         for index in 0..count {
             self.plan.actions.push(CaptureAction::Screenshot(format!("{prefix}_{index:04}")));
             if index + 1 < count {
                 self.plan.actions.push(CaptureAction::Wait(interval as f32));
             }
         }
+
         Ok(())
     }
 
@@ -217,6 +228,7 @@ impl ScriptBuilder {
         if !self.capabilities.exit {
             return;
         }
+
         self.plan.actions.push(CaptureAction::Exit);
     }
 }
@@ -249,6 +261,7 @@ pub fn compile_capture_script_with_capabilities(source: &str, capabilities: Scri
     engine.register_fn("sequence", ScriptBuilder::sequence);
     engine.register_fn("exit", ScriptBuilder::exit);
     engine.eval_with_scope::<()>(&mut scope, source).map_err(|error| error.to_string())?;
+
     Ok(scope.get_value::<ScriptBuilder>("capture").ok_or("capture script did not initialize its plan")?.plan)
 }
 
@@ -258,11 +271,17 @@ fn camera_pose(position: rhai::Array, target: rhai::Array) -> Result<CameraPose,
     }
     let position = [number(&position[0])?, number(&position[1])?, number(&position[2])?];
     let target = [number(&target[0])?, number(&target[1])?, number(&target[2])?];
+
     Ok(CameraPose { position, target })
 }
 
 fn number(value: &rhai::Dynamic) -> Result<f32, Box<rhai::EvalAltResult>> {
-    value.clone().try_cast::<f64>().map(|number| number as f32).or_else(|| value.clone().try_cast::<i64>().map(|number| number as f32)).ok_or_else(|| "camera coordinates must be numeric".into())
+    value
+        .clone()
+        .try_cast::<f64>()
+        .map(|number| number as f32)
+        .or_else(|| value.clone().try_cast::<i64>().map(|number| number as f32))
+        .ok_or_else(|| "camera coordinates must be numeric".into())
 }
 
 #[cfg(test)]

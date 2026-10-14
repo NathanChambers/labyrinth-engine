@@ -102,6 +102,7 @@ impl MovingBox {
             BoxPath::Slide { from, to } => from.lerp(to, 0.5 - 0.5 * turn.cos()),
             BoxPath::Orbit { center, radius } => center + Vec3::new(turn.cos(), 0.0, turn.sin()) * radius,
         };
+
         (ground_position + Vec3::Y * self.size.y * 0.5, self.spin * local_time)
     }
 }
@@ -120,12 +121,14 @@ impl Building {
         let rows = rows.max(1);
         let mut rng = Rng(seed);
         let mut building = Self { cols, rows, static_boxes: Vec::new(), moving_boxes: Vec::new(), lamps: lamp_slots(&mut rng) };
+
         for row in 0..rows {
             for col in 0..cols {
                 let origin = Vec3::new(col as f32 * SECTION_SIZE, 0.0, row as f32 * SECTION_SIZE);
                 building.add_section(origin, col == 0, row == 0, col + 1 == cols, row + 1 == rows, &mut rng);
             }
         }
+
         building
     }
 
@@ -145,6 +148,7 @@ impl Building {
         if east_edge {
             self.wall_run(false, SECTION_SIZE, 0.0, SECTION_SIZE, &EAST_OUTSIDE, origin, Color::WHITE);
         }
+
         if south_edge {
             self.wall_run(true, SECTION_SIZE, 0.0, SECTION_SIZE, &SOUTH_OUTSIDE, origin, Color::WHITE);
         }
@@ -152,6 +156,7 @@ impl Building {
         self.add_inner_walls(origin);
         self.add_roof(origin);
         self.add_static_furniture(origin);
+
         self.add_moving_boxes(origin, rng);
     }
 
@@ -167,11 +172,13 @@ impl Building {
         self.push_box(origin, 0.21, 1.1, 4.0, 0.12, 2.2, 3.0, Color::rgb(0.15, 0.75, 0.2));
         self.push_box(origin, 21.5, 0.9, 0.45, 4.0, 1.8, 0.5, Color::rgb(0.85, 0.8, 0.7));
         self.push_box(origin, 3.5, 0.225, 12.5, 3.0, 0.45, 0.6, Color::rgb(0.55, 0.5, 0.45));
+
         self.push_box(origin, 5.5, 0.225, 22.0, 3.0, 0.45, 0.6, Color::rgb(0.55, 0.5, 0.45));
     }
 
     fn add_roof(&mut self, origin: Vec3) {
         let mut x_edges = vec![0.0, SECTION_SIZE];
+
         for hole in ROOF_HOLES {
             x_edges.extend([hole[0], hole[2]]);
         }
@@ -188,8 +195,18 @@ impl Building {
                 }
                 z = z.max(z1);
             }
+
             if z < SECTION_SIZE {
-                self.push_box(origin, (x0 + x1) * 0.5, ROOM_HEIGHT + ROOF_THICKNESS * 0.5, (z + SECTION_SIZE) * 0.5, x1 - x0, ROOF_THICKNESS, SECTION_SIZE - z, Color::WHITE);
+                self.push_box(
+                    origin,
+                    (x0 + x1) * 0.5,
+                    ROOM_HEIGHT + ROOF_THICKNESS * 0.5,
+                    (z + SECTION_SIZE) * 0.5,
+                    x1 - x0,
+                    ROOF_THICKNESS,
+                    SECTION_SIZE - z,
+                    Color::WHITE,
+                );
             }
         }
     }
@@ -200,38 +217,20 @@ impl Building {
         }
         self.push_box(origin, 2.0, 0.375, 2.5, 1.4, 0.75, 1.4, Color::rgb(0.9, 0.9, 0.9));
         self.push_box(origin, 5.5, 0.5, 4.0, 1.0, 1.0, 1.0, Color::rgb(0.85, 0.1, 0.1));
-        self.static_boxes.push(BoxSpec { center: origin + Vec3::new(3.0, 0.6, 5.5), size: Vec3::new(0.8, 1.2, 0.8), color: Color::rgb(0.1, 0.25, 0.85), cylinder: true });
+        self.static_boxes
+            .push(BoxSpec { center: origin + Vec3::new(3.0, 0.6, 5.5), size: Vec3::new(0.8, 1.2, 0.8), color: Color::rgb(0.1, 0.25, 0.85), cylinder: true });
         self.push_box(origin, 23.3, 0.45, 6.3, 0.9, 0.9, 0.9, Color::rgb(0.9, 0.75, 0.1));
-        self.static_boxes.push(BoxSpec { center: origin + Vec3::new(24.0, 0.3, 17.0), size: Vec3::new(1.2, 0.6, 1.2), color: Color::rgb(0.3, 0.6, 0.25), cylinder: true });
+        self.static_boxes
+            .push(BoxSpec { center: origin + Vec3::new(24.0, 0.3, 17.0), size: Vec3::new(1.2, 0.6, 1.2), color: Color::rgb(0.3, 0.6, 0.25), cylinder: true });
+
         self.push_box(origin, 19.5, 0.25, 23.5, 1.0, 0.5, 1.0, Color::rgb(0.6, 0.45, 0.3));
     }
 
     fn add_moving_boxes(&mut self, origin: Vec3, rng: &mut Rng) {
         let movers = [
-            MovingBox {
-                size: Vec3::splat(1.0),
-                color: Color::rgb(0.9, 0.15, 0.1),
-                path: BoxPath::Slide { from: origin + Vec3::new(10.5, 0.0, 19.5), to: origin + Vec3::new(15.5, 0.0, 19.5) },
-                period: 8.0,
-                phase: 0.0,
-                spin: 0.6,
-            },
-            MovingBox {
-                size: Vec3::splat(0.9),
-                color: Color::rgb(0.15, 0.8, 0.2),
-                path: BoxPath::Orbit { center: origin + Vec3::new(13.0, 0.0, 12.0), radius: 2.0 },
-                period: 12.0,
-                phase: 0.0,
-                spin: -0.8,
-            },
-            MovingBox {
-                size: Vec3::splat(0.8),
-                color: Color::rgb(0.15, 0.3, 0.9),
-                path: BoxPath::Slide { from: origin + Vec3::new(22.0, 0.0, 17.5), to: origin + Vec3::new(22.0, 0.0, 23.5) },
-                period: 10.0,
-                phase: 0.0,
-                spin: 1.0,
-            },
+            MovingBox { size: Vec3::splat(1.0), color: Color::rgb(0.9, 0.15, 0.1), path: BoxPath::Slide { from: origin + Vec3::new(10.5, 0.0, 19.5), to: origin + Vec3::new(15.5, 0.0, 19.5) }, period: 8.0, phase: 0.0, spin: 0.6 },
+            MovingBox { size: Vec3::splat(0.9), color: Color::rgb(0.15, 0.8, 0.2), path: BoxPath::Orbit { center: origin + Vec3::new(13.0, 0.0, 12.0), radius: 2.0 }, period: 12.0, phase: 0.0, spin: -0.8 },
+            MovingBox { size: Vec3::splat(0.8), color: Color::rgb(0.15, 0.3, 0.9), path: BoxPath::Slide { from: origin + Vec3::new(22.0, 0.0, 17.5), to: origin + Vec3::new(22.0, 0.0, 23.5) }, period: 10.0, phase: 0.0, spin: 1.0 },
         ];
         self.moving_boxes.extend(movers.into_iter().map(|mut mover| {
             mover.phase = rng.range(mover.period);
@@ -241,18 +240,22 @@ impl Building {
 
     fn wall_run(&mut self, along_x: bool, line: f32, from: f32, to: f32, openings: &[Opening], origin: Vec3, color: Color) {
         let mut cursor = from;
+
         for opening in openings {
             if opening.from > cursor {
                 self.wall_piece(along_x, line, cursor, opening.from, 0.0, ROOM_HEIGHT, origin, color);
             }
+
             if opening.sill > 0.0 {
                 self.wall_piece(along_x, line, opening.from, opening.to, 0.0, opening.sill, origin, color);
             }
+
             if opening.head < ROOM_HEIGHT {
                 self.wall_piece(along_x, line, opening.from, opening.to, opening.head, ROOM_HEIGHT, origin, color);
             }
             cursor = opening.to;
         }
+
         if to > cursor {
             self.wall_piece(along_x, line, cursor, to, 0.0, ROOM_HEIGHT, origin, color);
         }
@@ -262,6 +265,7 @@ impl Building {
         let span = (end - start).abs();
         let center = if along_x { Vec3::new((start + end) * 0.5, (base + top) * 0.5, line) } else { Vec3::new(line, (base + top) * 0.5, (start + end) * 0.5) };
         let size = if along_x { Vec3::new(span, top - base, WALL_THICKNESS) } else { Vec3::new(WALL_THICKNESS, top - base, span) };
+
         self.static_boxes.push(BoxSpec { center: origin + center, size, color, cylinder: false });
     }
 
@@ -300,6 +304,7 @@ fn lamp_slots(rng: &mut Rng) -> Vec<LampSlot> {
         lamp(12.5, 4.5, LampMotion::Sway { axis: x_axis, amplitude: 2.0, rate: 0.5 }, Color::rgb(0.8, 0.88, 1.0)),
     ];
     let tall = tall_rects();
+
     while slots.len() < LOCAL_LAMP_SLOTS {
         let home = Vec3::new(rng.range_between(0.6, SECTION_SIZE - 0.6), LAMP_HEIGHT, rng.range_between(0.6, SECTION_SIZE - 0.6));
         let rate = rng.range_between(0.4, 1.2) * if rng.unit() < 0.5 { -1.0 } else { 1.0 };
@@ -315,25 +320,14 @@ fn lamp_slots(rng: &mut Rng) -> Vec<LampSlot> {
         let tint = if slots.len() % 3 == 1 { cool } else { warm };
         slots.push(LampSlot { home, motion, tint });
     }
+
     slots
 }
 
 fn tall_rects() -> Vec<[f32; 4]> {
     // Full-height inner-wall footprints used to keep generated lamp paths clear.
-    vec![
-        [7.85, 0.0, 8.15, 8.0],
-        [0.0, 7.85, 1.0, 8.15],
-        [7.0, 7.85, 8.0, 8.15],
-        [0.0, 10.35, 9.0, 10.65],
-        [16.85, 0.0, 17.15, 2.0],
-        [16.85, 3.4, 17.15, 8.0],
-        [17.0, 7.85, 20.0, 8.15],
-        [21.6, 7.85, 25.0, 8.15],
-        [17.0, 15.85, 19.0, 16.15],
-        [20.4, 15.85, 25.0, 16.15],
-        [16.85, 16.0, 17.15, 19.0],
-        [16.85, 23.0, 17.15, 25.0],
-    ]
+
+    vec![[7.85, 0.0, 8.15, 8.0], [0.0, 7.85, 1.0, 8.15], [7.0, 7.85, 8.0, 8.15], [0.0, 10.35, 9.0, 10.65], [16.85, 0.0, 17.15, 2.0], [16.85, 3.4, 17.15, 8.0], [17.0, 7.85, 20.0, 8.15], [21.6, 7.85, 25.0, 8.15], [17.0, 15.85, 19.0, 16.15], [20.4, 15.85, 25.0, 16.15], [16.85, 16.0, 17.15, 19.0], [16.85, 23.0, 17.15, 25.0]]
 }
 
 fn lamp_path_is_clear(home: Vec3, motion: LampMotion, tall: &[[f32; 4]]) -> bool {
@@ -368,6 +362,7 @@ fn segment_hits(a: [f32; 2], b: [f32; 2], rect: [f32; 4]) -> bool {
     let hi = [rect[2], rect[3]];
     let mut t0 = 0.0f32;
     let mut t1 = 1.0f32;
+
     for axis in 0..2 {
         let delta = b[axis] - a[axis];
         if delta.abs() < 1.0e-6 {
@@ -386,6 +381,7 @@ fn segment_hits(a: [f32; 2], b: [f32; 2], rect: [f32; 4]) -> bool {
             }
         }
     }
+
     true
 }
 
@@ -397,6 +393,7 @@ impl Rng {
         let mut value = self.0;
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+
         value ^ (value >> 31)
     }
 

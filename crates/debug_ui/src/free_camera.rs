@@ -14,6 +14,7 @@ impl FreeCamera {
 
     pub fn from_rotation(rotation: Quat) -> Self {
         let forward = rotation * Vec3::NEG_Z;
+
         Self::new((-forward.x).atan2(-forward.z), forward.y.asin())
     }
 
@@ -58,6 +59,7 @@ impl FreeCamera {
         let speed = if context.input.is_key_down(KeyCode::ShiftLeft) { 20.0 } else { 5.0 };
         camera.transform.rotation = rotation;
         camera.transform.translate(movement.normalize_or_zero() * speed * delta_seconds);
+
         Ok(())
     }
 }

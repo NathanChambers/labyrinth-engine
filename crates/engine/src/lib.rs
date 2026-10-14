@@ -35,9 +35,8 @@ pub use logging::init_logging;
 pub use math::{Camera, Color, DirectionalLight, Easing, EulerRot, Light, Mat2, Mat3, Mat4, PointLight, Quat, SpotLight, Transform, Vec2, Vec3, Vec4, ease, lerp, lerp_vec3, ping_pong, slerp_quat};
 pub use mesh::{Material, Mesh, MeshInstance, MeshVertex, Texture};
 pub use renderer::{
-    GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldCellSize, RenderDebugMode, RenderSettings,
-    RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceAngularSegment, RendererRadianceFieldGrid,
-    RendererRadianceProbeDebug, RendererRadianceSurfaceCandidate, RendererRadianceSurfaceInspection, RendererSdfGrid, RendererSdfVoxelDebug, RendererSkyLighting, RendererViewportPick, ShadowQuality,
+    GraphicsApi, RADIANCE_FIELD_MAX_ANGULAR_SEGMENTS, RADIANCE_FIELD_RAY_COUNT, RADIANCE_SURFACE_CANDIDATE_COUNT, RadianceAngularResolution, RadianceFieldCellSize, RenderDebugMode, RenderSettings, RendererGiRayDiagnostic, RendererGiTraceDebugMode, RendererGizmoVertex, RendererIrradianceVolume, RendererPerformanceStats, RendererRadianceAngularSegment,
+    RendererRadianceFieldGrid, RendererRadianceProbeDebug, RendererRadianceSurfaceCandidate, RendererRadianceSurfaceInspection, RendererSdfGrid, RendererSdfVoxelDebug, RendererSkyLighting, RendererViewportPick, ShadowQuality,
 };
 pub use scene::{CameraId, LightId, MeshId, Scene};
 pub use time::{Time, TimeScaleId};
@@ -178,7 +177,11 @@ fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection:
         let logical_position = Vec3::from_array(grid.minimum) + (grid_position + Vec3::splat(0.5)) * cell_size;
         let probe = if candidate.probe_valid { Vec3::from_array(candidate.probe_position) } else { logical_position };
         let color = if candidate.probe_valid {
-            Color::rgb(display_radiance(candidate.contribution_radiance[0]), display_radiance(candidate.contribution_radiance[1]), display_radiance(candidate.contribution_radiance[2]))
+            Color::rgb(
+                display_radiance(candidate.contribution_radiance[0]),
+                display_radiance(candidate.contribution_radiance[1]),
+                display_radiance(candidate.contribution_radiance[2]),
+            )
         } else {
             Color::rgb(1.0, 0.25, 0.18)
         };
@@ -202,8 +205,13 @@ fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection:
         } else {
             gizmos.line(ray_start, probe, ray_color);
         }
+
         if candidate.has_occupied_voxel_after_start && (candidate.final_weight > 0.001 || candidate.triangle_occluded) {
-            gizmos.wire_box(Vec3::from_array(candidate.first_occupied_after_start_minimum), Vec3::from_array(candidate.first_occupied_after_start_maximum), Color::rgba(1.0, 0.52, 0.08, 0.62));
+            gizmos.wire_box(
+                Vec3::from_array(candidate.first_occupied_after_start_minimum),
+                Vec3::from_array(candidate.first_occupied_after_start_maximum),
+                Color::rgba(1.0, 0.52, 0.08, 0.62),
+            );
         }
         gizmos.dot(probe, 0.06 + candidate.final_weight.sqrt() * 0.24, color);
     }
@@ -211,6 +219,7 @@ fn draw_radiance_surface_inspection_gizmos(gizmos: &mut GizmoCanvas, inspection:
 
 fn display_radiance(value: f32) -> f32 {
     let value = value.max(0.0);
+
     value / (1.0 + value)
 }
 
@@ -267,20 +276,7 @@ pub fn run<A: Application + 'static>(settings: WindowSettings, mut application: 
         context.debug_capture = Some(DebugCapture::from_script(&source, settings.debug_capture_root.clone())?);
     }
     let mcp_requests = mcp_debug::start_from_env()?;
-    let mut runner = Runner {
-        settings,
-        application,
-        context,
-        fallback_camera: Camera::default(),
-        last_frame: Instant::now(),
-        window: None,
-        renderer: None,
-        mcp_requests,
-        mcp_profiler: mcp_debug::McpProfiler::default(),
-        mcp_paused: false,
-        completed_frame_id: 0,
-        failure: None,
-    };
+    let mut runner = Runner { settings, application, context, fallback_camera: Camera::default(), last_frame: Instant::now(), window: None, renderer: None, mcp_requests, mcp_profiler: mcp_debug::McpProfiler::default(), mcp_paused: false, completed_frame_id: 0, failure: None };
     let event_loop_result = event_loop.run_app(&mut runner).map_err(|error| error.to_string());
     runner.release_cursor();
     runner.application.cleanup(&mut runner.context);
@@ -314,12 +310,7 @@ fn renderer_irradiance_volumes(volumes: &IrradianceVolumes, mode: IrradianceMode
             .iter()
             .filter(|(_, volume)| volume.desc.enabled)
             .take(authored_limit)
-            .map(|(_, volume)| RendererIrradianceVolume {
-                minimum: volume.desc.minimum.to_array(),
-                maximum: volume.desc.maximum.to_array(),
-                resolution: volume.desc.resolution,
-                enabled: volume.desc.enabled,
-            })
+            .map(|(_, volume)| RendererIrradianceVolume { minimum: volume.desc.minimum.to_array(), maximum: volume.desc.maximum.to_array(), resolution: volume.desc.resolution, enabled: volume.desc.enabled })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -329,6 +320,7 @@ fn renderer_irradiance_volumes(volumes: &IrradianceVolumes, mode: IrradianceMode
             renderer_volumes.push(RendererIrradianceVolume { minimum: volume.minimum.to_array(), maximum: volume.maximum.to_array(), resolution: volume.resolution, enabled: true });
         }
     }
+
     renderer_volumes
 }
 
@@ -350,6 +342,7 @@ impl<A> Runner<A> {
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, message: String) {
         self.failure = Some(message);
+
         event_loop.exit();
     }
 
@@ -378,6 +371,7 @@ impl<A> Runner<A> {
             self.context.input.set_left_mouse_down(false);
             self.release_cursor();
         }
+
         if was_paused && !self.mcp_paused {
             self.last_frame = Instant::now();
             if let Some(window) = &self.window {
@@ -398,7 +392,9 @@ where
         }
 
         info!(window_title:? = self.settings.title; "Creating window");
-        let attributes = Window::default_attributes().with_title(self.settings.title.clone()).with_inner_size(LogicalSize::new(self.settings.width, self.settings.height));
+        let attributes = Window::default_attributes()
+            .with_title(self.settings.title.clone())
+            .with_inner_size(LogicalSize::new(self.settings.width, self.settings.height));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => return self.fail(event_loop, error.to_string()),
@@ -431,6 +427,7 @@ where
         };
         info!("Renderer ready");
         window.request_redraw();
+
         self.renderer = Some(renderer);
     }
 
@@ -451,6 +448,7 @@ where
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.release_cursor();
         self.renderer = None;
+
         self.window = None;
     }
 
@@ -470,6 +468,7 @@ where
         if window.id() != window_id {
             return;
         }
+
         if self.mcp_paused && !matches!(&event, WindowEvent::CloseRequested | WindowEvent::Focused(false) | WindowEvent::Resized(_) | WindowEvent::RedrawRequested) {
             return;
         }
@@ -482,12 +481,7 @@ where
                 self.context.input.set_cursor_captured(false);
                 self.apply_cursor_mode(window);
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
-                if !self.context.input.cursor_captured()
-                    && !self.context.input.alt_held()
-                    && self.context.cursor_capture_on_scene_click
-                    && !self.context.ui.pointer_over_ui(self.context.input.cursor_position(), window.inner_size().width, window.inner_size().height) =>
-            {
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !self.context.input.cursor_captured() && !self.context.input.alt_held() && self.context.cursor_capture_on_scene_click && !self.context.ui.pointer_over_ui(self.context.input.cursor_position(), window.inner_size().width, window.inner_size().height) => {
                 self.context.input.set_left_mouse_down(true);
                 self.context.input.set_cursor_captured(true);
                 self.apply_cursor_mode(window);
@@ -505,10 +499,12 @@ where
                         self.context.input.set_cursor_captured(false);
                         self.apply_cursor_mode(window);
                     }
+
                     if matches!(key, KeyCode::AltLeft | KeyCode::AltRight) {
                         self.context.input.set_cursor_captured(!self.context.input.alt_held() && self.context.cursor_capture_on_scene_click);
                         self.apply_cursor_mode(window);
                     }
+
                     if key == KeyCode::F11 && event.state == ElementState::Pressed && !event.repeat {
                         let next_mode = match self.settings.mode {
                             WindowMode::Windowed => WindowMode::Borderless,
@@ -517,6 +513,7 @@ where
                         };
                         self.set_mode(next_mode);
                     }
+
                     if key == KeyCode::F1 && event.state == ElementState::Pressed && !event.repeat {
                         self.context.ui.set_debug_ui_visible(!self.context.ui.debug_ui_visible());
                     }
@@ -551,12 +548,15 @@ where
                         self.context.render_settings = RenderSettings { shadows_enabled, irradiance_enabled, ..self.context.render_settings };
                         self.context.gizmos_enabled = gizmos_enabled;
                     }
+
                     if let Some(ambient_occlusion_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::ambient_occlusion) {
                         self.context.render_settings.ambient_occlusion_enabled = ambient_occlusion_enabled;
                     }
+
                     if let Some(direct_light_visibility_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::direct_light_visibility) {
                         self.context.render_settings.direct_light_visibility_enabled = direct_light_visibility_enabled;
                     }
+
                     if let Some(triangle_probe_occlusion_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::triangle_probe_occlusion) {
                         self.context.render_settings.triangle_probe_occlusion_enabled = triangle_probe_occlusion_enabled;
                     }
@@ -571,6 +571,7 @@ where
                         };
                         self.context.render_settings = self.context.render_settings.with_shadow_quality(quality);
                     }
+
                     if let Some(mode) = self.context.debug_capture.as_ref().and_then(DebugCapture::render_mode) {
                         self.context.render_debug_mode = match mode {
                             scripting::CaptureRenderMode::Lit => RenderDebugMode::LitMaterials,
@@ -581,6 +582,7 @@ where
                             scripting::CaptureRenderMode::GiSupport => RenderDebugMode::GiSupport,
                         };
                     }
+
                     if let Some(ui_enabled) = self.context.debug_capture.as_ref().and_then(DebugCapture::ui_enabled) {
                         self.context.ui_enabled = ui_enabled;
                     }
@@ -598,26 +600,42 @@ where
                     self.context.gizmos.clear();
                     let camera = self.context.active_camera.and_then(|id| self.context.scene.get_camera(id));
                     let clipmaps = camera
-                        .map(|camera| self.context.irradiance_clipmap.volumes_at(camera.transform.position).into_iter().take(self.context.irradiance_clipmap.active_level_count()).collect::<Vec<_>>())
+                        .map(|camera| {
+                            self.context
+                                .irradiance_clipmap
+                                .volumes_at(camera.transform.position)
+                                .into_iter()
+                                .take(self.context.irradiance_clipmap.active_level_count())
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default();
                     if !capture_without_gizmos && self.context.gizmos_enabled {
                         if self.context.gi_global_gizmos_enabled {
                             self.context.irradiance_volumes.draw_debug_gizmos_for_mode(&mut self.context.gizmos, self.context.irradiance_mode, &clipmaps);
                         }
+
                         if self.context.light_gizmos_enabled {
                             self.context.gizmos.lights(self.context.scene.lights());
                         }
+
                         if self.context.normal_gizmos_enabled {
                             self.context.gizmos.mesh_normals(self.context.scene.instances(), 0.18);
                         }
                     }
+
                     if !capture_without_gizmos && self.context.gi_surface_inspector_enabled {
                         draw_radiance_surface_inspection_gizmos(&mut self.context.gizmos, self.context.gi_surface_inspection, self.context.gi_radiance_field_grid);
                     }
-                    let gizmo_vertices =
-                        self.context.gizmos.vertices().iter().map(|vertex| RendererGizmoVertex { position: vertex.position.to_array(), color: vertex.color.to_array() }).collect::<Vec<_>>();
-                    let irradiance_volumes =
-                        camera.map(|camera| renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera)).unwrap_or_default();
+                    let gizmo_vertices = self
+                        .context
+                        .gizmos
+                        .vertices()
+                        .iter()
+                        .map(|vertex| RendererGizmoVertex { position: vertex.position.to_array(), color: vertex.color.to_array() })
+                        .collect::<Vec<_>>();
+                    let irradiance_volumes = camera
+                        .map(|camera| renderer_irradiance_volumes(&self.context.irradiance_volumes, self.context.irradiance_mode, self.context.irradiance_clipmap, camera))
+                        .unwrap_or_default();
                     let irradiance_available = self.context.has_irradiance_source();
                     let mut render_settings = self.context.render_settings;
                     render_settings.irradiance_enabled &= irradiance_available;
@@ -675,10 +693,12 @@ where
                             renderer.update_gpu_timestamps()?;
                             self.context.performance_stats = renderer.performance_stats();
                         }
+
                         if capture_report_requested {
                             renderer.read_triangle_bvh_diagnostics()?;
                             self.context.performance_stats = renderer.performance_stats();
                         }
+
                         if let Some(capture) = &mut self.context.debug_capture {
                             let camera = match self.context.active_camera {
                                 Some(id) => self.context.scene.get_camera(id).ok_or("active camera was removed before capture")?,
@@ -687,6 +707,7 @@ where
                             capture.capture_pending(renderer, camera)?;
                             capture.report_pending(renderer)?;
                         }
+
                         if let Some(requests) = &self.mcp_requests {
                             let camera = match self.context.active_camera {
                                 Some(id) => self.context.scene.get_camera(id).ok_or("active camera was removed before MCP capture")?,
@@ -743,6 +764,7 @@ fn apply_window_mode(window: &Window, mode: WindowMode) {
             })
         }
     };
+
     window.set_fullscreen(fullscreen);
 }
 

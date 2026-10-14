@@ -1,2 +1,15 @@
-max_width = 200
+# Allow longer lines
+max_width = 360
+
+# Keep expressions on one line when they fit
 use_small_heuristics = "Max"
+
+# Allow longer function calls and method chains
+fn_call_width = 140
+chain_width = 140
+
+# Allow compact if-else expressions
+single_line_if_else_max_width = 140
+
+# Keep the 2024 formatting style
+style_edition = "2024"
